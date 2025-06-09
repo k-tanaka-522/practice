@@ -1,0 +1,473 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS X-Ray Distributed Tracing and Application Performance Monitoring'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: apm-system
+    Description: Project name for resource naming
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch Logs retention period
+
+  AlertEmail:
+    Type: String
+    Description: Email address for performance alerts
+
+Resources:
+  # X-Ray Service Map
+  XRayServiceMap:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt XRaySetupFunction.Arn
+      TracingConfig:
+        Mode: Active
+      SamplingRate: 0.1
+
+  # Lambda Function for X-Ray Setup
+  XRaySetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-xray-setup'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt XRaySetupRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  xray = boto3.client('xray')
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # Create sampling rule
+                      sampling_rule = {
+                          'rule_name': 'DefaultSamplingRule',
+                          'priority': 9000,
+                          'fixed_rate': 0.05,
+                          'reservoir_size': 1,
+                          'service_name': '*',
+                          'service_type': '*',
+                          'host': '*',
+                          'method': '*',
+                          'url_path': '*',
+                          'version': 1
+                      }
+                      
+                      try:
+                          xray.create_sampling_rule(SamplingRule=sampling_rule)
+                      except xray.exceptions.RuleAlreadyExistsException:
+                          print("Sampling rule already exists")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # IAM Role for X-Ray Setup Function
+  XRaySetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: XRaySetupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:CreateSamplingRule
+                  - xray:UpdateSamplingRule
+                  - xray:DeleteSamplingRule
+                  - xray:GetSamplingRules
+                Resource: '*'
+
+  # CloudWatch Dashboard for APM
+  APMDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${EnvironmentName}-APM-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/X-Ray", "ResponseTime", "ServiceName", "${ProjectName}-${EnvironmentName}" ],
+                  [ "AWS/X-Ray", "TracesReceived", "ServiceName", "${ProjectName}-${EnvironmentName}" ],
+                  [ "AWS/X-Ray", "ErrorRate", "ServiceName", "${ProjectName}-${EnvironmentName}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "X-Ray Service Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-${EnvironmentName}-api" ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-${EnvironmentName}-api" ],
+                  [ "AWS/Lambda", "Throttles", "FunctionName", "${ProjectName}-${EnvironmentName}-api" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Latency", "ApiName", "${ProjectName}-${EnvironmentName}-api" ],
+                  [ "AWS/ApiGateway", "4XXError", "ApiName", "${ProjectName}-${EnvironmentName}-api" ],
+                  [ "AWS/ApiGateway", "5XXError", "ApiName", "${ProjectName}-${EnvironmentName}-api" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-${EnvironmentName}-api'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # SNS Topic for Alerts
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-performance-alerts'
+      DisplayName: 'Performance Alerts'
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # CloudWatch Alarms
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-HighLatency'
+      AlarmDescription: 'API Gateway latency is too high'
+      MetricName: Latency
+      Namespace: AWS/ApiGateway
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-${EnvironmentName}-api'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-HighErrorRate'
+      AlarmDescription: 'Error rate is too high'
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-${EnvironmentName}-api'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-LambdaThrottles'
+      AlarmDescription: 'Lambda function is being throttled'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '${ProjectName}-${EnvironmentName}-api'
+      AlarmActions:
+        - !Ref AlertsTopic
+      TreatMissingData: notBreaching
+
+  # Application Insights
+  ApplicationInsights:
+    Type: AWS::ApplicationInsights::Application
+    Properties:
+      ResourceGroupName: !Ref ResourceGroup
+      AutoConfigurationEnabled: true
+      CWEMonitorEnabled: true
+      AutoCreate: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Resource Group for Application Insights
+  ResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-resources'
+      Description: 'Resource group for APM monitoring'
+      ResourceQuery:
+        Type: TAG_FILTERS_1_0
+        Query:
+          ResourceTypeFilters:
+            - AWS::Lambda::Function
+            - AWS::ApiGateway::RestApi
+            - AWS::DynamoDB::Table
+            - AWS::RDS::DBInstance
+          TagFilters:
+            - Key: Project
+              Values: [!Ref ProjectName]
+            - Key: Environment
+              Values: [!Ref EnvironmentName]
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Custom Metrics Lambda Function
+  CustomMetricsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-custom-metrics'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt CustomMetricsRole.Arn
+      Timeout: 60
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          from datetime import datetime
+          import os
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def handler(event, context):
+              try:
+                  # Custom business metrics
+                  send_custom_metrics()
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Custom metrics sent successfully')
+                  }
+              except Exception as e:
+                  print(f"Error sending custom metrics: {str(e)}")
+                  raise
+          
+          def send_custom_metrics():
+              environment = os.environ['ENVIRONMENT_NAME']
+              project = os.environ['PROJECT_NAME']
+              
+              # Example: Business transaction metrics
+              cloudwatch.put_metric_data(
+                  Namespace=f'{project}/Business',
+                  MetricData=[
+                      {
+                          'MetricName': 'TransactionCount',
+                          'Value': 1,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {
+                                  'Name': 'Environment',
+                                  'Value': environment
+                              }
+                          ]
+                      },
+                      {
+                          'MetricName': 'TransactionValue',
+                          'Value': 100.0,
+                          'Unit': 'None',
+                          'Dimensions': [
+                              {
+                                  'Name': 'Environment',
+                                  'Value': environment
+                              }
+                          ]
+                      }
+                  ]
+              )
+              
+              # Performance metrics
+              start_time = time.time()
+              # Simulate some work
+              time.sleep(0.1)
+              duration = (time.time() - start_time) * 1000
+              
+              cloudwatch.put_metric_data(
+                  Namespace=f'{project}/Performance',
+                  MetricData=[
+                      {
+                          'MetricName': 'CustomProcessingTime',
+                          'Value': duration,
+                          'Unit': 'Milliseconds',
+                          'Dimensions': [
+                              {
+                                  'Name': 'Environment',
+                                  'Value': environment
+                              }
+                          ]
+                      }
+                  ]
+              )
+
+  # IAM Role for Custom Metrics Function
+  CustomMetricsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: CustomMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # EventBridge Rule for Regular Metrics Collection
+  MetricsSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger custom metrics collection every 5 minutes'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CustomMetricsFunction.Arn
+          Id: CustomMetricsTarget
+
+  # Permission for EventBridge to invoke Lambda
+  MetricsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CustomMetricsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MetricsSchedule.Arn
+
+  # CloudWatch Log Groups
+  XRaySetupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${XRaySetupFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+  CustomMetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CustomMetricsFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+Outputs:
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}-APM-Dashboard'
+
+  XRayServiceMapURL:
+    Description: X-Ray Service Map URL
+    Value: !Sub 'https://console.aws.amazon.com/xray/home?region=${AWS::Region}#/service-map'
+
+  ApplicationInsightsURL:
+    Description: Application Insights URL
+    Value: !Sub 'https://console.aws.amazon.com/systems-manager/appinsights/applications/${ApplicationInsights}'
+
+  AlertsTopicArn:
+    Description: SNS Topic ARN for Alerts
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertsTopic'
+
+  ResourceGroupName:
+    Description: Resource Group Name
+    Value: !Ref ResourceGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceGroup'

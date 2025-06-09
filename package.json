@@ -1,0 +1,27 @@
+{
+  "name": "ai-driven-development-practice",
+  "version": "1.0.0",
+  "description": "AI駆動開発実践プロジェクト - AWS×GitHub CI/CDを活用したクラウドネイティブ開発実践",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USERNAME/ai-driven-development-practice.git"
+  },
+  "scripts": {
+    "setup": "bash scripts/setup/validate-environment.sh",
+    "clean": "bash scripts/cleanup/delete-all-stacks.sh",
+    "deploy:dev": "npm run deploy -- --env dev",
+    "deploy:staging": "npm run deploy -- --env staging",
+    "deploy:prod": "npm run deploy -- --env prod"
+  },
+  "keywords": [
+    "aws",
+    "github-actions",
+    "cicd",
+    "cloudformation",
+    "ai",
+    "bedrock",
+    "learning"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}

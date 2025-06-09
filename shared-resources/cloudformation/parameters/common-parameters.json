@@ -1,0 +1,42 @@
+{
+  "Parameters": {
+    "EnvironmentName": {
+      "Type": "String",
+      "Default": "dev",
+      "AllowedValues": ["dev", "staging", "prod"],
+      "Description": "Environment name for resource tagging and naming"
+    },
+    "ProjectName": {
+      "Type": "String",
+      "Default": "aws-learning",
+      "Description": "Project name for resource identification",
+      "MinLength": "1",
+      "MaxLength": "50",
+      "AllowedPattern": "^[a-zA-Z0-9-]+$",
+      "ConstraintDescription": "Must contain only alphanumeric characters and hyphens"
+    },
+    "CostCenter": {
+      "Type": "String",
+      "Default": "learning",
+      "Description": "Cost center for billing and cost allocation tags"
+    },
+    "Owner": {
+      "Type": "String",
+      "Default": "devops-team",
+      "Description": "Owner of the resources for contact and responsibility"
+    },
+    "Region": {
+      "Type": "String",
+      "Default": "ap-northeast-1",
+      "AllowedValues": [
+        "us-east-1",
+        "us-west-2",
+        "eu-west-1",
+        "eu-central-1",
+        "ap-northeast-1",
+        "ap-southeast-1"
+      ],
+      "Description": "AWS Region for deployment"
+    }
+  }
+}

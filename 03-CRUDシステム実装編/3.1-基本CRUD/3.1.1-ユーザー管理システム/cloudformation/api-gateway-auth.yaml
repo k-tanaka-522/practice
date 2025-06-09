@@ -1,0 +1,884 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'API Gateway with Cognito Authorizer and Lambda Authentication Endpoints'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: crud-system
+    Description: Project name for resource naming
+
+  UserPoolId:
+    Type: String
+    Description: Cognito User Pool ID
+    Default: ''
+
+  WebAppClientId:
+    Type: String
+    Description: Cognito Web App Client ID
+    Default: ''
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda function code
+    Default: ''
+
+Resources:
+  # API Gateway REST API
+  AuthAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-auth-api'
+      Description: Authentication API with Cognito integration
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Cognito Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-cognito-authorizer'
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref AuthAPI
+      ProviderARNs:
+        - !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}'
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-auth-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: CognitoPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminInitiateAuth
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminUpdateUserAttributes
+                  - cognito-idp:AdminRespondToAuthChallenge
+                  - cognito-idp:AdminConfirmSignUp
+                  - cognito-idp:AdminDeleteUser
+                  - cognito-idp:ListUsers
+                Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}'
+        - PolicyName: DynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${EnvironmentName}-user-profiles'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${EnvironmentName}-user-profiles/*'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${EnvironmentName}-login-history'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${EnvironmentName}-login-history/*'
+        - PolicyName: SecretsManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref AppClientSecret
+
+  # Secrets Manager for App Client Secret
+  AppClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-app-client-secret'
+      Description: Cognito App Client Secret
+      SecretString: !Sub |
+        {
+          "clientId": "${WebAppClientId}",
+          "userPoolId": "${UserPoolId}"
+        }
+
+  # Sign Up Lambda Function
+  SignUpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-signup'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPoolId
+          CLIENT_ID: !Ref WebAppClientId
+          USER_TABLE_NAME: !Sub '${ProjectName}-${EnvironmentName}-user-profiles'
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const cognito = new AWS.CognitoIdentityServiceProvider();
+          
+          exports.handler = async (event) => {
+            console.log('Sign Up Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            };
+            
+            try {
+              const body = JSON.parse(event.body);
+              const { email, password, name, familyName, givenName } = body;
+              
+              // Validate input
+              if (!email || !password || !name) {
+                return {
+                  statusCode: 400,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    error: 'Missing required fields: email, password, name'
+                  })
+                };
+              }
+              
+              // Sign up user
+              const params = {
+                ClientId: process.env.CLIENT_ID,
+                Username: email,
+                Password: password,
+                UserAttributes: [
+                  { Name: 'email', Value: email },
+                  { Name: 'name', Value: name }
+                ]
+              };
+              
+              if (familyName) {
+                params.UserAttributes.push({ Name: 'family_name', Value: familyName });
+              }
+              if (givenName) {
+                params.UserAttributes.push({ Name: 'given_name', Value: givenName });
+              }
+              
+              const result = await cognito.signUp(params).promise();
+              
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  message: 'User registered successfully',
+                  userSub: result.UserSub,
+                  userConfirmed: result.UserConfirmed
+                })
+              };
+              
+            } catch (error) {
+              console.error('Sign up error:', error);
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # Sign In Lambda Function
+  SignInFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-signin'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPoolId
+          CLIENT_ID: !Ref WebAppClientId
+          LOGIN_HISTORY_TABLE: !Sub '${ProjectName}-${EnvironmentName}-login-history'
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const cognito = new AWS.CognitoIdentityServiceProvider();
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            console.log('Sign In Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            };
+            
+            try {
+              const body = JSON.parse(event.body);
+              const { email, password } = body;
+              
+              // Validate input
+              if (!email || !password) {
+                return {
+                  statusCode: 400,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    error: 'Missing required fields: email, password'
+                  })
+                };
+              }
+              
+              // Initiate auth
+              const params = {
+                AuthFlow: 'USER_PASSWORD_AUTH',
+                ClientId: process.env.CLIENT_ID,
+                AuthParameters: {
+                  USERNAME: email,
+                  PASSWORD: password
+                }
+              };
+              
+              const result = await cognito.initiateAuth(params).promise();
+              
+              // Handle different challenge types
+              if (result.ChallengeName) {
+                return {
+                  statusCode: 200,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    challengeName: result.ChallengeName,
+                    session: result.Session,
+                    challengeParameters: result.ChallengeParameters
+                  })
+                };
+              }
+              
+              // Log successful login
+              if (result.AuthenticationResult) {
+                const idToken = result.AuthenticationResult.IdToken;
+                const decoded = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString());
+                
+                try {
+                  await dynamodb.put({
+                    TableName: process.env.LOGIN_HISTORY_TABLE,
+                    Item: {
+                      userId: decoded.sub,
+                      timestamp: new Date().toISOString(),
+                      eventType: 'LOGIN_SUCCESS',
+                      sourceIp: event.requestContext?.identity?.sourceIp || 'unknown',
+                      userAgent: event.headers?.['User-Agent'] || 'unknown',
+                      ttl: Math.floor(Date.now() / 1000) + (90 * 24 * 60 * 60) // 90 days
+                    }
+                  }).promise();
+                } catch (logError) {
+                  console.error('Failed to log login:', logError);
+                }
+              }
+              
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  message: 'Authentication successful',
+                  authenticationResult: result.AuthenticationResult
+                })
+              };
+              
+            } catch (error) {
+              console.error('Sign in error:', error);
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # Verify Email Lambda Function
+  VerifyEmailFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-verify-email'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPoolId
+          CLIENT_ID: !Ref WebAppClientId
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const cognito = new AWS.CognitoIdentityServiceProvider();
+          
+          exports.handler = async (event) => {
+            console.log('Verify Email Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            };
+            
+            try {
+              const body = JSON.parse(event.body);
+              const { email, code } = body;
+              
+              // Validate input
+              if (!email || !code) {
+                return {
+                  statusCode: 400,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    error: 'Missing required fields: email, code'
+                  })
+                };
+              }
+              
+              // Confirm sign up
+              const params = {
+                ClientId: process.env.CLIENT_ID,
+                Username: email,
+                ConfirmationCode: code
+              };
+              
+              await cognito.confirmSignUp(params).promise();
+              
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  message: 'Email verified successfully'
+                })
+              };
+              
+            } catch (error) {
+              console.error('Verify email error:', error);
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # Refresh Token Lambda Function
+  RefreshTokenFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-refresh-token'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPoolId
+          CLIENT_ID: !Ref WebAppClientId
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const cognito = new AWS.CognitoIdentityServiceProvider();
+          
+          exports.handler = async (event) => {
+            console.log('Refresh Token Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            };
+            
+            try {
+              const body = JSON.parse(event.body);
+              const { refreshToken } = body;
+              
+              // Validate input
+              if (!refreshToken) {
+                return {
+                  statusCode: 400,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    error: 'Missing required field: refreshToken'
+                  })
+                };
+              }
+              
+              // Refresh tokens
+              const params = {
+                AuthFlow: 'REFRESH_TOKEN_AUTH',
+                ClientId: process.env.CLIENT_ID,
+                AuthParameters: {
+                  REFRESH_TOKEN: refreshToken
+                }
+              };
+              
+              const result = await cognito.initiateAuth(params).promise();
+              
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  message: 'Token refreshed successfully',
+                  authenticationResult: result.AuthenticationResult
+                })
+              };
+              
+            } catch (error) {
+              console.error('Refresh token error:', error);
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # User Profile Lambda Function
+  UserProfileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-user-profile'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          USER_TABLE_NAME: !Sub '${ProjectName}-${EnvironmentName}-user-profiles'
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            console.log('User Profile Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'GET,PUT,OPTIONS'
+            };
+            
+            try {
+              // Get user ID from authorizer context
+              const userId = event.requestContext.authorizer.claims.sub;
+              
+              if (event.httpMethod === 'GET') {
+                // Get user profile
+                const result = await dynamodb.get({
+                  TableName: process.env.USER_TABLE_NAME,
+                  Key: { userId }
+                }).promise();
+                
+                if (!result.Item) {
+                  return {
+                    statusCode: 404,
+                    headers: corsHeaders,
+                    body: JSON.stringify({
+                      error: 'User profile not found'
+                    })
+                  };
+                }
+                
+                return {
+                  statusCode: 200,
+                  headers: corsHeaders,
+                  body: JSON.stringify(result.Item)
+                };
+                
+              } else if (event.httpMethod === 'PUT') {
+                // Update user profile
+                const body = JSON.parse(event.body);
+                const updateExpression = [];
+                const expressionAttributeNames = {};
+                const expressionAttributeValues = {};
+                
+                // Build update expression dynamically
+                Object.keys(body).forEach((key, index) => {
+                  if (key !== 'userId' && key !== 'email') { // Don't allow updating userId or email
+                    updateExpression.push(`#attr${index} = :val${index}`);
+                    expressionAttributeNames[`#attr${index}`] = key;
+                    expressionAttributeValues[`:val${index}`] = body[key];
+                  }
+                });
+                
+                if (updateExpression.length === 0) {
+                  return {
+                    statusCode: 400,
+                    headers: corsHeaders,
+                    body: JSON.stringify({
+                      error: 'No valid fields to update'
+                    })
+                  };
+                }
+                
+                // Add updatedAt
+                updateExpression.push('#updatedAt = :updatedAt');
+                expressionAttributeNames['#updatedAt'] = 'updatedAt';
+                expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+                
+                await dynamodb.update({
+                  TableName: process.env.USER_TABLE_NAME,
+                  Key: { userId },
+                  UpdateExpression: `SET ${updateExpression.join(', ')}`,
+                  ExpressionAttributeNames: expressionAttributeNames,
+                  ExpressionAttributeValues: expressionAttributeValues,
+                  ReturnValues: 'ALL_NEW'
+                }).promise();
+                
+                return {
+                  statusCode: 200,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    message: 'Profile updated successfully'
+                  })
+                };
+              }
+              
+            } catch (error) {
+              console.error('User profile error:', error);
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # API Gateway Resources
+  AuthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ParentId: !GetAtt AuthAPI.RootResourceId
+      PathPart: auth
+
+  SignUpResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ParentId: !Ref AuthResource
+      PathPart: signup
+
+  SignInResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ParentId: !Ref AuthResource
+      PathPart: signin
+
+  VerifyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ParentId: !Ref AuthResource
+      PathPart: verify
+
+  RefreshResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ParentId: !Ref AuthResource
+      PathPart: refresh
+
+  ProfileResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ParentId: !GetAtt AuthAPI.RootResourceId
+      PathPart: profile
+
+  # API Gateway Methods
+  SignUpMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ResourceId: !Ref SignUpResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SignUpFunction.Arn}/invocations'
+
+  SignInMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ResourceId: !Ref SignInResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SignInFunction.Arn}/invocations'
+
+  VerifyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ResourceId: !Ref VerifyResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VerifyEmailFunction.Arn}/invocations'
+
+  RefreshMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ResourceId: !Ref RefreshResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RefreshTokenFunction.Arn}/invocations'
+
+  ProfileGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ResourceId: !Ref ProfileResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserProfileFunction.Arn}/invocations'
+
+  ProfilePutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ResourceId: !Ref ProfileResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserProfileFunction.Arn}/invocations'
+
+  # OPTIONS Methods for CORS
+  SignUpOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AuthAPI
+      ResourceId: !Ref SignUpResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions
+  SignUpLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SignUpFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AuthAPI}/*/*'
+
+  SignInLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SignInFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AuthAPI}/*/*'
+
+  VerifyEmailLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VerifyEmailFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AuthAPI}/*/*'
+
+  RefreshTokenLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RefreshTokenFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AuthAPI}/*/*'
+
+  UserProfileLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UserProfileFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AuthAPI}/*/*'
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SignUpMethod
+      - SignInMethod
+      - VerifyMethod
+      - RefreshMethod
+      - ProfileGetMethod
+      - ProfilePutMethod
+    Properties:
+      RestApiId: !Ref AuthAPI
+      Description: Initial deployment
+
+  # API Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref AuthAPI
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref EnvironmentName
+      Description: !Sub '${EnvironmentName} stage'
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for API Gateway
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${EnvironmentName}-auth-api'
+      RetentionInDays: 30
+
+  # API Gateway Account (for CloudWatch logging)
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # IAM Role for API Gateway CloudWatch logging
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${AuthAPI}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ApiEndpoint'
+
+  ApiId:
+    Description: API Gateway ID
+    Value: !Ref AuthAPI
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ApiId'
+
+  SignUpUrl:
+    Description: Sign Up endpoint URL
+    Value: !Sub 'https://${AuthAPI}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/auth/signup'
+
+  SignInUrl:
+    Description: Sign In endpoint URL
+    Value: !Sub 'https://${AuthAPI}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/auth/signin'
+
+  VerifyUrl:
+    Description: Verify Email endpoint URL
+    Value: !Sub 'https://${AuthAPI}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/auth/verify'
+
+  RefreshUrl:
+    Description: Refresh Token endpoint URL
+    Value: !Sub 'https://${AuthAPI}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/auth/refresh'
+
+  ProfileUrl:
+    Description: User Profile endpoint URL
+    Value: !Sub 'https://${AuthAPI}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/profile'

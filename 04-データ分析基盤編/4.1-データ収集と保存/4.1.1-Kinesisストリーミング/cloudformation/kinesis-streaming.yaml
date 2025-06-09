@@ -1,0 +1,627 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Kinesis Data Streaming platform with real-time analytics'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: data-platform
+    Description: Project name for resource naming
+
+  ShardCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of shards for Kinesis stream
+
+  RetentionHours:
+    Type: Number
+    Default: 168
+    MinValue: 24
+    MaxValue: 8760
+    Description: Data retention period in hours
+
+Resources:
+  # Kinesis Data Stream
+  DataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-data-stream'
+      ShardCount: !Ref ShardCount
+      RetentionPeriodHours: !Ref RetentionHours
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !Ref StreamEncryptionKey
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key for Stream Encryption
+  StreamEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS Key for Kinesis Stream encryption'
+      KeyPolicy:
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Kinesis Service
+            Effect: Allow
+            Principal:
+              Service: kinesis.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key Alias
+  StreamEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${EnvironmentName}-kinesis-key'
+      TargetKeyId: !Ref StreamEncryptionKey
+
+  # S3 Bucket for Raw Data Storage
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-raw-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldData
+            Status: Enabled
+            Transitions:
+              - Days: 30
+                StorageClass: STANDARD_IA
+              - Days: 90
+                StorageClass: GLACIER
+              - Days: 365
+                StorageClass: DEEP_ARCHIVE
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for Processed Data
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-processed-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Kinesis Firehose
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: FirehoseDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub '${RawDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt DataStream.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt StreamEncryptionKey.Arn
+
+  # Kinesis Data Firehose Delivery Stream
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-${EnvironmentName}-delivery-stream'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt DataStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt RawDataBucket.Arn
+        BufferingHints:
+          SizeInMBs: 128
+          IntervalInSeconds: 60
+        CompressionFormat: GZIP
+        Prefix: 'year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/'
+        ErrorOutputPrefix: 'errors/'
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt DataTransformFunction.Arn
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}-${EnvironmentName}'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt DataStream.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${ProcessedDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt StreamEncryptionKey.Arn
+
+  # Lambda Function for Data Transformation
+  DataTransformFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-data-transform'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedDataBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import gzip
+          from datetime import datetime
+          import os
+          
+          def lambda_handler(event, context):
+              output = []
+              
+              for record in event['records']:
+                  # Decode the data
+                  payload = base64.b64decode(record['data'])
+                  
+                  try:
+                      # Parse JSON data
+                      data = json.loads(payload)
+                      
+                      # Add processing timestamp
+                      data['processed_at'] = datetime.utcnow().isoformat()
+                      
+                      # Data validation and transformation
+                      if validate_record(data):
+                          transformed_data = transform_record(data)
+                          
+                          # Encode back to base64
+                          output_record = {
+                              'recordId': record['recordId'],
+                              'result': 'Ok',
+                              'data': base64.b64encode(
+                                  json.dumps(transformed_data).encode('utf-8')
+                              ).decode('utf-8')
+                          }
+                      else:
+                          # Mark as processing failure
+                          output_record = {
+                              'recordId': record['recordId'],
+                              'result': 'ProcessingFailed'
+                          }
+                      
+                  except Exception as e:
+                      print(f"Error processing record: {str(e)}")
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'ProcessingFailed'
+                      }
+                  
+                  output.append(output_record)
+              
+              return {'records': output}
+          
+          def validate_record(data):
+              """Validate data record"""
+              required_fields = ['timestamp', 'user_id', 'event_type']
+              return all(field in data for field in required_fields)
+          
+          def transform_record(data):
+              """Transform data record"""
+              # Add computed fields
+              if 'amount' in data:
+                  data['amount'] = float(data['amount'])
+              
+              # Normalize event_type
+              if 'event_type' in data:
+                  data['event_type'] = data['event_type'].lower()
+              
+              # Add metadata
+              data['record_version'] = '1.0'
+              
+              return data
+
+  # Lambda Function for Real-time Processing
+  RealtimeProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-realtime-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          OUTPUT_STREAM: !Ref DataStream
+          PROCESSED_BUCKET: !Ref ProcessedDataBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          from datetime import datetime
+          import os
+          
+          kinesis = boto3.client('kinesis')
+          s3 = boto3.client('s3')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              processed_count = 0
+              error_count = 0
+              
+              for record in event['Records']:
+                  try:
+                      # Decode Kinesis data
+                      payload = base64.b64decode(record['kinesis']['data'])
+                      data = json.loads(payload)
+                      
+                      # Real-time processing logic
+                      result = process_event(data)
+                      
+                      if result:
+                          processed_count += 1
+                      else:
+                          error_count += 1
+                          
+                  except Exception as e:
+                      print(f"Error processing record: {str(e)}")
+                      error_count += 1
+              
+              # Send custom metrics
+              send_metrics(processed_count, error_count)
+              
+              return {
+                  'statusCode': 200,
+                  'processed': processed_count,
+                  'errors': error_count
+              }
+          
+          def process_event(data):
+              """Process individual event"""
+              try:
+                  # Example: Anomaly detection
+                  if 'amount' in data and float(data['amount']) > 10000:
+                      # High-value transaction alert
+                      send_alert(data)
+                  
+                  # Store aggregated data
+                  store_aggregation(data)
+                  
+                  return True
+              except Exception as e:
+                  print(f"Processing error: {str(e)}")
+                  return False
+          
+          def send_alert(data):
+              """Send high-value transaction alert"""
+              # In real implementation, you would send to SNS
+              print(f"HIGH VALUE ALERT: {data}")
+          
+          def store_aggregation(data):
+              """Store aggregated metrics"""
+              # Example: hourly aggregations
+              hour_key = datetime.now().strftime('%Y/%m/%d/%H')
+              
+              # In real implementation, you would update DynamoDB or similar
+              print(f"Aggregating data for hour: {hour_key}")
+          
+          def send_metrics(processed, errors):
+              """Send custom CloudWatch metrics"""
+              try:
+                  cloudwatch.put_metric_data(
+                      Namespace='DataPlatform/Kinesis',
+                      MetricData=[
+                          {
+                              'MetricName': 'ProcessedRecords',
+                              'Value': processed,
+                              'Unit': 'Count'
+                          },
+                          {
+                              'MetricName': 'ErrorRecords',
+                              'Value': errors,
+                              'Unit': 'Count'
+                          }
+                      ]
+                  )
+              except Exception as e:
+                  print(f"Error sending metrics: {str(e)}")
+
+  # Event Source Mapping for Lambda
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DataStream.Arn
+      FunctionName: !Ref RealtimeProcessorFunction
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 2
+
+  # Lambda Permission for Firehose
+  FirehoseLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataTransformFunction
+      Action: lambda:InvokeFunction
+      Principal: firehose.amazonaws.com
+      SourceArn: !GetAtt DeliveryStream.Arn
+
+  # CloudWatch Log Groups
+  DataTransformLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataTransformFunction}'
+      RetentionInDays: 30
+
+  RealtimeProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${RealtimeProcessorFunction}'
+      RetentionInDays: 30
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${ProjectName}-${EnvironmentName}'
+      RetentionInDays: 30
+
+  # CloudWatch Alarms
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-HighErrorRate'
+      AlarmDescription: 'High error rate in data processing'
+      MetricName: ErrorRecords
+      Namespace: DataPlatform/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  LowThroughputAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-LowThroughput'
+      AlarmDescription: 'Low throughput in data processing'
+      MetricName: ProcessedRecords
+      Namespace: DataPlatform/Kinesis
+      Statistic: Sum
+      Period: 600
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+
+  # Data Generator Lambda Function (for testing)
+  DataGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-data-generator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref DataStream
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import random
+          import uuid
+          from datetime import datetime
+          import os
+          
+          kinesis = boto3.client('kinesis')
+          
+          def lambda_handler(event, context):
+              stream_name = os.environ['STREAM_NAME']
+              
+              # Generate sample data
+              for i in range(10):
+                  record = {
+                      'user_id': str(uuid.uuid4()),
+                      'event_type': random.choice(['login', 'purchase', 'view', 'logout']),
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'amount': round(random.uniform(10, 1000), 2),
+                      'session_id': str(uuid.uuid4()),
+                      'user_agent': 'test-client/1.0'
+                  }
+                  
+                  # Put record to Kinesis
+                  kinesis.put_record(
+                      StreamName=stream_name,
+                      Data=json.dumps(record),
+                      PartitionKey=record['user_id']
+                  )
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Generated 10 test records')
+              }
+
+  # EventBridge Rule for Data Generation (every 5 minutes)
+  DataGeneratorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger data generator every 5 minutes'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: DISABLED  # Enable manually for testing
+      Targets:
+        - Arn: !GetAtt DataGeneratorFunction.Arn
+          Id: DataGeneratorTarget
+
+  # Permission for EventBridge to invoke Lambda
+  DataGeneratorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataGeneratorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataGeneratorSchedule.Arn
+
+Outputs:
+  StreamName:
+    Description: Kinesis Stream Name
+    Value: !Ref DataStream
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamName'
+
+  StreamArn:
+    Description: Kinesis Stream ARN
+    Value: !GetAtt DataStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamArn'
+
+  RawDataBucketName:
+    Description: Raw Data S3 Bucket Name
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucketName:
+    Description: Processed Data S3 Bucket Name
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  DeliveryStreamName:
+    Description: Kinesis Firehose Delivery Stream Name
+    Value: !Ref DeliveryStream
+    Export:
+      Name: !Sub '${AWS::StackName}-DeliveryStreamName'
+
+  DataGeneratorFunctionName:
+    Description: Data Generator Function Name (for testing)
+    Value: !Ref DataGeneratorFunction

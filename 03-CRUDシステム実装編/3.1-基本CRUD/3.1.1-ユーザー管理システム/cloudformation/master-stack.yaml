@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Master stack for User Authentication System with Cognito'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: crud-system
+    Description: Project name for resource naming
+
+  SESVerifiedEmail:
+    Type: String
+    Description: SES verified email address for sending emails
+    Default: 'noreply@example.com'
+
+  EnableMFA:
+    Type: String
+    Default: 'OPTIONAL'
+    AllowedValues: ['OFF', 'OPTIONAL', 'ON']
+    Description: MFA configuration
+
+  # VPC Parameters (from existing infrastructure)
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID from existing infrastructure
+    Default: ''
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs for Lambda functions
+    Default: ''
+
+  # GitHub Repository
+  GitHubRepository:
+    Type: String
+    Description: GitHub repository name (owner/repo)
+    Default: 'your-org/your-repo'
+
+Resources:
+  # Cognito User Pool Stack
+  CognitoStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ./cognito-user-pool.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ProjectName: !Ref ProjectName
+        SESVerifiedEmail: !Ref SESVerifiedEmail
+        EnableMFA: !Ref EnableMFA
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: Authentication
+
+  # API Gateway and Lambda Stack
+  APIStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: CognitoStack
+    Properties:
+      TemplateURL: ./api-gateway-auth.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ProjectName: !Ref ProjectName
+        UserPoolId: !GetAtt CognitoStack.Outputs.UserPoolId
+        WebAppClientId: !GetAtt CognitoStack.Outputs.WebAppClientId
+        LambdaCodeBucket: !Ref DeploymentBucket
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: API
+
+  # S3 Bucket for Lambda Deployment
+  DeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-deployment-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard
+  AuthenticationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${EnvironmentName}-auth-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Cognito", "SignIn_Successes", {"stat": "Sum"}],
+                  [".", "SignIn_Failures", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Authentication Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum"}],
+                  [".", "Errors", {"stat": "Sum"}],
+                  [".", "Duration", {"stat": "Average"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Performance"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", {"stat": "Sum"}],
+                  [".", "4XXError", {"stat": "Sum"}],
+                  [".", "5XXError", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            }
+          ]
+        }
+
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-auth-alerts'
+      DisplayName: Authentication System Alerts
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarms
+  HighFailedLoginAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-high-failed-logins'
+      AlarmDescription: Alert when login failures exceed threshold
+      MetricName: SignIn_Failures
+      Namespace: AWS/Cognito
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-lambda-errors'
+      AlarmDescription: Alert when Lambda errors occur
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # Systems Manager Parameter Store for configuration
+  UserPoolIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${EnvironmentName}/auth/user-pool-id'
+      Type: String
+      Value: !GetAtt CognitoStack.Outputs.UserPoolId
+      Description: Cognito User Pool ID
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  WebAppClientIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${EnvironmentName}/auth/web-app-client-id'
+      Type: String
+      Value: !GetAtt CognitoStack.Outputs.WebAppClientId
+      Description: Cognito Web App Client ID
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  ApiEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${EnvironmentName}/auth/api-endpoint'
+      Type: String
+      Value: !GetAtt APIStack.Outputs.ApiEndpoint
+      Description: Authentication API Endpoint
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !GetAtt CognitoStack.Outputs.UserPoolId
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-UserPoolId'
+
+  UserPoolArn:
+    Description: Cognito User Pool ARN
+    Value: !GetAtt CognitoStack.Outputs.UserPoolArn
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-UserPoolArn'
+
+  WebAppClientId:
+    Description: Web App Client ID
+    Value: !GetAtt CognitoStack.Outputs.WebAppClientId
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-WebAppClientId'
+
+  ServerAppClientId:
+    Description: Server App Client ID
+    Value: !GetAtt CognitoStack.Outputs.ServerAppClientId
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ServerAppClientId'
+
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !GetAtt APIStack.Outputs.ApiEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ApiEndpoint'
+
+  SignUpUrl:
+    Description: Sign Up endpoint URL
+    Value: !GetAtt APIStack.Outputs.SignUpUrl
+
+  SignInUrl:
+    Description: Sign In endpoint URL
+    Value: !GetAtt APIStack.Outputs.SignInUrl
+
+  VerifyUrl:
+    Description: Verify Email endpoint URL
+    Value: !GetAtt APIStack.Outputs.VerifyUrl
+
+  RefreshUrl:
+    Description: Refresh Token endpoint URL
+    Value: !GetAtt APIStack.Outputs.RefreshUrl
+
+  ProfileUrl:
+    Description: User Profile endpoint URL
+    Value: !GetAtt APIStack.Outputs.ProfileUrl
+
+  UserProfileTableName:
+    Description: User Profile DynamoDB Table Name
+    Value: !GetAtt CognitoStack.Outputs.UserProfileTableName
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-UserProfileTableName'
+
+  LoginHistoryTableName:
+    Description: Login History DynamoDB Table Name
+    Value: !GetAtt CognitoStack.Outputs.LoginHistoryTableName
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-LoginHistoryTableName'
+
+  DeploymentBucketName:
+    Description: S3 bucket for Lambda deployment
+    Value: !Ref DeploymentBucket
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-DeploymentBucket'
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}-auth-dashboard'
+
+  AlertTopicArn:
+    Description: SNS Topic ARN for alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-AlertTopic'

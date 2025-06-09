@@ -1,0 +1,29 @@
+[project]
+name = "AI-Driven Development Practice"
+description = """
+AIとAWS/GitHub CI/CDを組み合わせたクラウドネイティブ開発を実践形式で学ぶプロジェクトです。
+AWSインフラ構築・フルスタック開発・AI統合・CI/CD・IaC を一貫して体験し、即戦力スキルを習得します。
+"""
+
+[goals]
+1 = "AWSインフラの設計と構築（VPC, EC2, ECS, RDS など）"
+2 = "Web三層構成のアプリ開発（React + API + DB）"
+3 = "GitHub Actions によるCI/CDパイプライン実装"
+4 = "Amazon BedrockによるAI統合（RAG・チャットボットなど）"
+5 = "CloudFormationによるIaC設計と再利用性向上"
+
+[instructions]
+- Claudeは、各ディレクトリの内容を把握し、AWS公式ドキュメント、ベストプラクティスに沿って関連コードやドキュメントを自動的に生成・更新してください。
+- Claudeは、`/modules/`配下の各モジュールに対応する学習手順、サンプルコード、READMEを生成してください。
+- Claudeは、ユーザーの学習進捗に応じて、次に着手すべきタスクを提案してください。
+- Claudeは、プロンプト生成やRAG実装について、`/ai/`配下のスクリプトと連動した形でコード支援を行ってください。
+- Claudeは、IaCテンプレートの最適化と再利用性を考慮してCloudFormationテンプレートをレビュー・改善してください。
+
+[tools]
+vscode = true
+aws_cli = true
+docker = true
+bedrock = true
+
+[language]
+default = "ja"

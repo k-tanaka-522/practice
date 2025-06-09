@@ -1,0 +1,351 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudTrail and monitoring configuration for IAM activity tracking'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource tagging
+
+  ProjectName:
+    Type: String
+    Default: aws-learning
+    Description: Project name for resource identification
+
+  CloudTrailBucketName:
+    Type: String
+    Description: S3 bucket name for CloudTrail logs
+
+  EnableLogFileValidation:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudTrail log file validation
+
+  RetentionInDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+    Description: CloudWatch Logs retention period
+
+Conditions:
+  EnableValidation: !Equals [!Ref EnableLogFileValidation, 'true']
+
+Resources:
+  # S3 Bucket for CloudTrail
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref CloudTrailBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CloudTrailLogs
+
+  # Bucket Policy for CloudTrail
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+  # CloudWatch Log Group for CloudTrail
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/cloudtrail/${ProjectName}-${EnvironmentName}
+      RetentionInDays: !Ref RetentionInDays
+
+  # IAM Role for CloudTrail to CloudWatch Logs
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-CloudTrailLogsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  # CloudTrail
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub ${ProjectName}-${EnvironmentName}-IAMActivityTrail
+      S3BucketName: !Ref CloudTrailBucket
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: !If [EnableValidation, true, false]
+      EventSelectors:
+        - IncludeManagementEvents: true
+          ReadWriteType: All
+          DataResources:
+            - Type: AWS::IAM::Role
+              Values: ["arn:aws:iam::*"]
+            - Type: AWS::IAM::User
+              Values: ["arn:aws:iam::*"]
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for IAM Alerts
+  IAMAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${EnvironmentName}-IAMAlerts
+      DisplayName: IAM Security Alerts
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarms for IAM Activities
+  UnauthorizedAPICallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-UnauthorizedAPICalls
+      AlarmDescription: Alert on unauthorized API calls
+      MetricName: UnauthorizedAPICalls
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref IAMAlertTopic
+      TreatMissingData: notBreaching
+
+  # Metric Filter for Unauthorized API Calls
+  UnauthorizedAPICallsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
+      MetricTransformations:
+        - MetricName: UnauthorizedAPICalls
+          MetricNamespace: CloudTrailMetrics
+          MetricValue: '1'
+
+  # Root Account Usage Alarm
+  RootAccountUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-RootAccountUsage
+      AlarmDescription: Alert when root account is used
+      MetricName: RootAccountUsage
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref IAMAlertTopic
+      TreatMissingData: notBreaching
+
+  # Metric Filter for Root Account Usage
+  RootAccountUsageMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: '{ $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS && $.eventType != "AwsServiceEvent" }'
+      MetricTransformations:
+        - MetricName: RootAccountUsage
+          MetricNamespace: CloudTrailMetrics
+          MetricValue: '1'
+
+  # IAM Policy Changes Alarm
+  IAMPolicyChangesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-IAMPolicyChanges
+      AlarmDescription: Alert on IAM policy changes
+      MetricName: IAMPolicyChanges
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref IAMAlertTopic
+      TreatMissingData: notBreaching
+
+  # Metric Filter for IAM Policy Changes
+  IAMPolicyChangesMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: |
+        {
+          ($.eventName=DeleteGroupPolicy) ||
+          ($.eventName=DeleteRolePolicy) ||
+          ($.eventName=DeleteUserPolicy) ||
+          ($.eventName=PutGroupPolicy) ||
+          ($.eventName=PutRolePolicy) ||
+          ($.eventName=PutUserPolicy) ||
+          ($.eventName=CreatePolicy) ||
+          ($.eventName=DeletePolicy) ||
+          ($.eventName=CreatePolicyVersion) ||
+          ($.eventName=DeletePolicyVersion) ||
+          ($.eventName=AttachRolePolicy) ||
+          ($.eventName=DetachRolePolicy) ||
+          ($.eventName=AttachUserPolicy) ||
+          ($.eventName=DetachUserPolicy) ||
+          ($.eventName=AttachGroupPolicy) ||
+          ($.eventName=DetachGroupPolicy)
+        }
+      MetricTransformations:
+        - MetricName: IAMPolicyChanges
+          MetricNamespace: CloudTrailMetrics
+          MetricValue: '1'
+
+  # Console Sign-In Failures Alarm
+  ConsoleSignInFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${EnvironmentName}-ConsoleSignInFailures
+      AlarmDescription: Alert on multiple console sign-in failures
+      MetricName: ConsoleSignInFailures
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref IAMAlertTopic
+      TreatMissingData: notBreaching
+
+  # Metric Filter for Console Sign-In Failures
+  ConsoleSignInFailuresMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: '{ ($.eventName = ConsoleLogin) && ($.errorMessage = "Failed authentication") }'
+      MetricTransformations:
+        - MetricName: ConsoleSignInFailures
+          MetricNamespace: CloudTrailMetrics
+          MetricValue: '1'
+
+  # AWS Config Rule for MFA on Root Account
+  RootAccountMFAEnabledRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub ${ProjectName}-${EnvironmentName}-root-account-mfa-enabled
+      Description: Checks whether MFA is enabled for the root account
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCOUNT_MFA_ENABLED
+
+  # AWS Config Rule for IAM Password Policy
+  IAMPasswordPolicyRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub ${ProjectName}-${EnvironmentName}-iam-password-policy
+      Description: Checks whether the IAM password policy meets requirements
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_PASSWORD_POLICY
+      InputParameters: |
+        {
+          "RequireUppercaseCharacters": "true",
+          "RequireLowercaseCharacters": "true",
+          "RequireSymbols": "true",
+          "RequireNumbers": "true",
+          "MinimumPasswordLength": "14",
+          "PasswordReusePrevention": "12",
+          "MaxPasswordAge": "90"
+        }
+
+Outputs:
+  CloudTrailName:
+    Description: Name of the CloudTrail
+    Value: !Ref CloudTrail
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudTrailName
+
+  CloudTrailBucketName:
+    Description: S3 bucket for CloudTrail logs
+    Value: !Ref CloudTrailBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudTrailBucketName
+
+  CloudTrailLogGroupName:
+    Description: CloudWatch Log Group for CloudTrail
+    Value: !Ref CloudTrailLogGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudTrailLogGroupName
+
+  IAMAlertTopicArn:
+    Description: SNS Topic for IAM alerts
+    Value: !Ref IAMAlertTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-IAMAlertTopicArn

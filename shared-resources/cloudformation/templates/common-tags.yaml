@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Common tags mapping for consistent resource tagging across all stacks'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource tagging
+
+  ProjectName:
+    Type: String
+    Default: aws-learning
+    Description: Project name for resource identification
+
+  CostCenter:
+    Type: String
+    Default: learning
+    Description: Cost center for billing
+
+  Owner:
+    Type: String
+    Default: devops-team
+    Description: Owner of the resources
+
+  ManagedBy:
+    Type: String
+    Default: CloudFormation
+    Description: Tool or team managing the resources
+
+Resources:
+  # Dummy resource to satisfy CloudFormation requirement
+  DummyWaitCondition:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+Mappings:
+  EnvironmentConfig:
+    dev:
+      RetentionDays: 7
+      BackupEnabled: false
+      MonitoringLevel: basic
+    staging:
+      RetentionDays: 30
+      BackupEnabled: true
+      MonitoringLevel: enhanced
+    prod:
+      RetentionDays: 90
+      BackupEnabled: true
+      MonitoringLevel: detailed
+
+Outputs:
+  StandardTags:
+    Description: Standard tags to be applied to all resources
+    Value: !Sub |
+      Environment: ${EnvironmentName}
+      Project: ${ProjectName}
+      CostCenter: ${CostCenter}
+      Owner: ${Owner}
+      ManagedBy: ${ManagedBy}
+      CreatedDate: ${AWS::StackName}
+    Export:
+      Name: !Sub ${AWS::StackName}-StandardTags
+
+  EnvironmentRetentionDays:
+    Description: Log retention days based on environment
+    Value: !FindInMap [EnvironmentConfig, !Ref EnvironmentName, RetentionDays]
+    Export:
+      Name: !Sub ${AWS::StackName}-RetentionDays
+
+  BackupEnabled:
+    Description: Whether backups are enabled for this environment
+    Value: !FindInMap [EnvironmentConfig, !Ref EnvironmentName, BackupEnabled]
+    Export:
+      Name: !Sub ${AWS::StackName}-BackupEnabled
+
+  MonitoringLevel:
+    Description: Monitoring level for the environment
+    Value: !FindInMap [EnvironmentConfig, !Ref EnvironmentName, MonitoringLevel]
+    Export:
+      Name: !Sub ${AWS::StackName}-MonitoringLevel

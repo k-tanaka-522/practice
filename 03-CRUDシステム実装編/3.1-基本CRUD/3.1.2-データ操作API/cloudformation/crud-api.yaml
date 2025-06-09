@@ -1,0 +1,848 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CRUD API with DynamoDB integration and Cognito authentication'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: crud-system
+    Description: Project name for resource naming
+
+  UserPoolId:
+    Type: String
+    Description: Cognito User Pool ID for authentication
+
+  UserPoolArn:
+    Type: String
+    Description: Cognito User Pool ARN for authentication
+
+Resources:
+  # DynamoDB Table for Items
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-items'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: itemType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: userId-createdAt-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: userId-itemType-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: itemType
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API Gateway REST API
+  CrudAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-crud-api'
+      Description: CRUD API with authentication
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Cognito Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-crud-authorizer'
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref CrudAPI
+      ProviderARNs:
+        - !Ref UserPoolArn
+
+  # Lambda Execution Role
+  CrudLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-crud-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ItemsTable.Arn
+                  - !Sub '${ItemsTable.Arn}/index/*'
+
+  # Create Item Lambda Function
+  CreateItemFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-create-item'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt CrudLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const { v4: uuidv4 } = require('uuid');
+          
+          exports.handler = async (event) => {
+            console.log('Create Item Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            };
+            
+            try {
+              // Get user ID from authorizer
+              const userId = event.requestContext.authorizer.claims.sub;
+              const body = JSON.parse(event.body);
+              
+              // Validate required fields
+              if (!body.title || !body.itemType) {
+                return {
+                  statusCode: 400,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    error: 'Missing required fields: title, itemType'
+                  })
+                };
+              }
+              
+              // Create item
+              const item = {
+                userId: userId,
+                itemId: uuidv4(),
+                title: body.title,
+                description: body.description || '',
+                itemType: body.itemType,
+                status: body.status || 'ACTIVE',
+                tags: body.tags || [],
+                metadata: body.metadata || {},
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                createdBy: event.requestContext.authorizer.claims.email
+              };
+              
+              // Save to DynamoDB
+              await dynamodb.put({
+                TableName: process.env.TABLE_NAME,
+                Item: item
+              }).promise();
+              
+              return {
+                statusCode: 201,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  message: 'Item created successfully',
+                  item: item
+                })
+              };
+              
+            } catch (error) {
+              console.error('Create item error:', error);
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # Get Item Lambda Function
+  GetItemFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-get-item'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt CrudLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            console.log('Get Item Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'GET,OPTIONS'
+            };
+            
+            try {
+              const userId = event.requestContext.authorizer.claims.sub;
+              const itemId = event.pathParameters.itemId;
+              
+              // Get item from DynamoDB
+              const result = await dynamodb.get({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  userId: userId,
+                  itemId: itemId
+                }
+              }).promise();
+              
+              if (!result.Item) {
+                return {
+                  statusCode: 404,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    error: 'Item not found'
+                  })
+                };
+              }
+              
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify(result.Item)
+              };
+              
+            } catch (error) {
+              console.error('Get item error:', error);
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # List Items Lambda Function
+  ListItemsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-list-items'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt CrudLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            console.log('List Items Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'GET,OPTIONS'
+            };
+            
+            try {
+              const userId = event.requestContext.authorizer.claims.sub;
+              const queryParams = event.queryStringParameters || {};
+              
+              // Build query parameters
+              const params = {
+                TableName: process.env.TABLE_NAME,
+                KeyConditionExpression: 'userId = :userId',
+                ExpressionAttributeValues: {
+                  ':userId': userId
+                }
+              };
+              
+              // Add filtering by itemType if provided
+              if (queryParams.itemType) {
+                params.IndexName = 'userId-itemType-index';
+                params.KeyConditionExpression += ' AND itemType = :itemType';
+                params.ExpressionAttributeValues[':itemType'] = queryParams.itemType;
+              } else if (queryParams.sortBy === 'createdAt') {
+                params.IndexName = 'userId-createdAt-index';
+                params.ScanIndexForward = queryParams.order !== 'desc';
+              }
+              
+              // Add limit if provided
+              if (queryParams.limit) {
+                params.Limit = parseInt(queryParams.limit);
+              }
+              
+              // Add pagination token if provided
+              if (queryParams.nextToken) {
+                params.ExclusiveStartKey = JSON.parse(Buffer.from(queryParams.nextToken, 'base64').toString());
+              }
+              
+              // Query items
+              const result = await dynamodb.query(params).promise();
+              
+              // Build response
+              const response = {
+                items: result.Items,
+                count: result.Count
+              };
+              
+              // Add pagination token if there are more items
+              if (result.LastEvaluatedKey) {
+                response.nextToken = Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64');
+              }
+              
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify(response)
+              };
+              
+            } catch (error) {
+              console.error('List items error:', error);
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # Update Item Lambda Function
+  UpdateItemFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-update-item'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt CrudLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            console.log('Update Item Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'PUT,OPTIONS'
+            };
+            
+            try {
+              const userId = event.requestContext.authorizer.claims.sub;
+              const itemId = event.pathParameters.itemId;
+              const body = JSON.parse(event.body);
+              
+              // Build update expression
+              const updateExpression = [];
+              const expressionAttributeNames = {};
+              const expressionAttributeValues = {};
+              
+              // Allowed fields to update
+              const allowedFields = ['title', 'description', 'status', 'tags', 'metadata'];
+              
+              Object.keys(body).forEach((key, index) => {
+                if (allowedFields.includes(key)) {
+                  updateExpression.push(`#attr${index} = :val${index}`);
+                  expressionAttributeNames[`#attr${index}`] = key;
+                  expressionAttributeValues[`:val${index}`] = body[key];
+                }
+              });
+              
+              if (updateExpression.length === 0) {
+                return {
+                  statusCode: 400,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    error: 'No valid fields to update'
+                  })
+                };
+              }
+              
+              // Add updatedAt
+              updateExpression.push('#updatedAt = :updatedAt');
+              expressionAttributeNames['#updatedAt'] = 'updatedAt';
+              expressionAttributeValues[':updatedAt'] = new Date().toISOString();
+              
+              // Add updatedBy
+              updateExpression.push('#updatedBy = :updatedBy');
+              expressionAttributeNames['#updatedBy'] = 'updatedBy';
+              expressionAttributeValues[':updatedBy'] = event.requestContext.authorizer.claims.email;
+              
+              // Update item
+              const result = await dynamodb.update({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  userId: userId,
+                  itemId: itemId
+                },
+                UpdateExpression: `SET ${updateExpression.join(', ')}`,
+                ExpressionAttributeNames: expressionAttributeNames,
+                ExpressionAttributeValues: expressionAttributeValues,
+                ReturnValues: 'ALL_NEW',
+                ConditionExpression: 'attribute_exists(userId) AND attribute_exists(itemId)'
+              }).promise();
+              
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  message: 'Item updated successfully',
+                  item: result.Attributes
+                })
+              };
+              
+            } catch (error) {
+              console.error('Update item error:', error);
+              
+              if (error.code === 'ConditionalCheckFailedException') {
+                return {
+                  statusCode: 404,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    error: 'Item not found'
+                  })
+                };
+              }
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # Delete Item Lambda Function
+  DeleteItemFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-delete-item'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt CrudLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ItemsTable
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            console.log('Delete Item Request:', JSON.stringify(event, null, 2));
+            
+            const corsHeaders = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+              'Access-Control-Allow-Methods': 'DELETE,OPTIONS'
+            };
+            
+            try {
+              const userId = event.requestContext.authorizer.claims.sub;
+              const itemId = event.pathParameters.itemId;
+              
+              // Delete item (soft delete by updating status)
+              const result = await dynamodb.update({
+                TableName: process.env.TABLE_NAME,
+                Key: {
+                  userId: userId,
+                  itemId: itemId
+                },
+                UpdateExpression: 'SET #status = :status, #deletedAt = :deletedAt, #deletedBy = :deletedBy',
+                ExpressionAttributeNames: {
+                  '#status': 'status',
+                  '#deletedAt': 'deletedAt',
+                  '#deletedBy': 'deletedBy'
+                },
+                ExpressionAttributeValues: {
+                  ':status': 'DELETED',
+                  ':deletedAt': new Date().toISOString(),
+                  ':deletedBy': event.requestContext.authorizer.claims.email
+                },
+                ConditionExpression: 'attribute_exists(userId) AND attribute_exists(itemId)',
+                ReturnValues: 'ALL_NEW'
+              }).promise();
+              
+              return {
+                statusCode: 200,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  message: 'Item deleted successfully'
+                })
+              };
+              
+            } catch (error) {
+              console.error('Delete item error:', error);
+              
+              if (error.code === 'ConditionalCheckFailedException') {
+                return {
+                  statusCode: 404,
+                  headers: corsHeaders,
+                  body: JSON.stringify({
+                    error: 'Item not found'
+                  })
+                };
+              }
+              
+              return {
+                statusCode: error.statusCode || 500,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                  error: error.message || 'Internal server error'
+                })
+              };
+            }
+          };
+
+  # API Gateway Resources
+  ItemsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CrudAPI
+      ParentId: !GetAtt CrudAPI.RootResourceId
+      PathPart: items
+
+  ItemIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CrudAPI
+      ParentId: !Ref ItemsResource
+      PathPart: '{itemId}'
+
+  # API Gateway Methods
+  CreateItemMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CrudAPI
+      ResourceId: !Ref ItemsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateItemFunction.Arn}/invocations'
+
+  ListItemsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CrudAPI
+      ResourceId: !Ref ItemsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.querystring.itemType: false
+        method.request.querystring.sortBy: false
+        method.request.querystring.order: false
+        method.request.querystring.limit: false
+        method.request.querystring.nextToken: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListItemsFunction.Arn}/invocations'
+
+  GetItemMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CrudAPI
+      ResourceId: !Ref ItemIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.itemId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetItemFunction.Arn}/invocations'
+
+  UpdateItemMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CrudAPI
+      ResourceId: !Ref ItemIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.itemId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateItemFunction.Arn}/invocations'
+
+  DeleteItemMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CrudAPI
+      ResourceId: !Ref ItemIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      RequestParameters:
+        method.request.path.itemId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteItemFunction.Arn}/invocations'
+
+  # OPTIONS Methods for CORS
+  ItemsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CrudAPI
+      ResourceId: !Ref ItemsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ItemIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CrudAPI
+      ResourceId: !Ref ItemIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions
+  CreateItemLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateItemFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CrudAPI}/*/*'
+
+  GetItemLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetItemFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CrudAPI}/*/*'
+
+  ListItemsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListItemsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CrudAPI}/*/*'
+
+  UpdateItemLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdateItemFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CrudAPI}/*/*'
+
+  DeleteItemLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteItemFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CrudAPI}/*/*'
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreateItemMethod
+      - ListItemsMethod
+      - GetItemMethod
+      - UpdateItemMethod
+      - DeleteItemMethod
+    Properties:
+      RestApiId: !Ref CrudAPI
+      Description: Initial deployment
+
+  # API Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref CrudAPI
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref EnvironmentName
+      Description: !Sub '${EnvironmentName} stage'
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for API Gateway
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${EnvironmentName}-crud-api'
+      RetentionInDays: 30
+
+Outputs:
+  CrudApiEndpoint:
+    Description: CRUD API Gateway endpoint URL
+    Value: !Sub 'https://${CrudAPI}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-CrudApiEndpoint'
+
+  CrudApiId:
+    Description: CRUD API Gateway ID
+    Value: !Ref CrudAPI
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-CrudApiId'
+
+  ItemsTableName:
+    Description: Items DynamoDB Table Name
+    Value: !Ref ItemsTable
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ItemsTableName'
+
+  ItemsTableArn:
+    Description: Items DynamoDB Table ARN
+    Value: !GetAtt ItemsTable.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ItemsTableArn'
+
+  ItemsTableStreamArn:
+    Description: Items DynamoDB Table Stream ARN
+    Value: !GetAtt ItemsTable.StreamArn
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ItemsTableStreamArn'

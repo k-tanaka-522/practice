@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Claude Code Bedrock Integration IAM Setup'
+
+Resources:
+  ClaudeCodeBedrockPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: ClaudeCodeBedrockPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+            Resource:
+              - arn:aws:bedrock:*:*:model/anthropic.claude-3-7-sonnet*
+              - arn:aws:bedrock:*:*:model/anthropic.claude-3-5-haiku*
+              - arn:aws:bedrock:*:*:model/anthropic.claude-opus-4*
+              - arn:aws:bedrock:*:*:model/anthropic.claude-sonnet-4*
+          - Effect: Allow
+            Action:
+              - bedrock:ListFoundationModels
+              - bedrock:GetFoundationModel
+            Resource: '*'
+
+  ClaudeCodeBedrockRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ClaudeCodeBedrockRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref ClaudeCodeBedrockPolicy
+
+  ClaudeCodeBedrockUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: claude-code-bedrock-user
+      ManagedPolicyArns:
+        - !Ref ClaudeCodeBedrockPolicy
+
+  ClaudeCodeBedrockAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref ClaudeCodeBedrockUser
+
+Outputs:
+  AccessKeyId:
+    Description: Access Key ID for Claude Code
+    Value: !Ref ClaudeCodeBedrockAccessKey
+  SecretAccessKey:
+    Description: Secret Access Key for Claude Code (Store securely!)
+    Value: !GetAtt ClaudeCodeBedrockAccessKey.SecretAccessKey
+  UserArn:
+    Description: ARN of the IAM User
+    Value: !GetAtt ClaudeCodeBedrockUser.Arn
+  PolicyArn:
+    Description: ARN of the IAM Policy
+    Value: !Ref ClaudeCodeBedrockPolicy

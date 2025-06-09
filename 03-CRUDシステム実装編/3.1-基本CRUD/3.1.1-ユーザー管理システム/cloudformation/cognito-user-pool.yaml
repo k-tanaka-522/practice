@@ -1,0 +1,541 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cognito User Pool with best practices for user authentication'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: crud-system
+    Description: Project name for resource naming
+
+  SESVerifiedEmail:
+    Type: String
+    Description: SES verified email address for sending emails
+    Default: 'noreply@example.com'
+
+  EnableMFA:
+    Type: String
+    Default: 'OPTIONAL'
+    AllowedValues: ['OFF', 'OPTIONAL', 'ON']
+    Description: MFA configuration
+
+Resources:
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-${EnvironmentName}-user-pool'
+      
+      # Username attributes
+      UsernameAttributes:
+        - email
+      
+      # Auto-verified attributes
+      AutoVerifiedAttributes:
+        - email
+      
+      # Password policy (ベストプラクティス)
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      
+      # Account recovery
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      
+      # MFA configuration
+      MfaConfiguration: !Ref EnableMFA
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      
+      # Email configuration
+      EmailConfiguration:
+        EmailSendingAccount: DEVELOPER
+        From: !Ref SESVerifiedEmail
+        SourceArn: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${SESVerifiedEmail}'
+      
+      # Email verification
+      EmailVerificationSubject: 'Verify your email for ${ProjectName}'
+      EmailVerificationMessage: |
+        Your verification code is {####}
+        
+        This code expires in 24 hours.
+      
+      # User attributes
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: given_name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: phone_number
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+        - Name: preferred_username
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+          
+      # Advanced security
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+      
+      # Device tracking
+      DeviceConfiguration:
+        ChallengeRequiredOnNewDevice: true
+        DeviceOnlyRememberedOnUserPrompt: true
+      
+      # Lambda triggers
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpLambda.Arn
+        PostConfirmation: !GetAtt PostConfirmationLambda.Arn
+        PreAuthentication: !GetAtt PreAuthenticationLambda.Arn
+        PostAuthentication: !GetAtt PostAuthenticationLambda.Arn
+        
+      # Tags
+      UserPoolTags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+        ManagedBy: CloudFormation
+
+  # User Pool Domain
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${ProjectName}-${EnvironmentName}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  # App Client for Web
+  WebAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-${EnvironmentName}-web-client'
+      UserPoolId: !Ref UserPool
+      
+      # OAuth flows
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - aws.cognito.signin.user.admin
+      AllowedOAuthFlowsUserPoolClient: true
+      
+      # Callback URLs
+      CallbackURLs:
+        - http://localhost:3000/callback
+        - https://localhost:3000/callback
+      LogoutURLs:
+        - http://localhost:3000/logout
+        - https://localhost:3000/logout
+      
+      # Security settings
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      EnablePropagateAdditionalUserContextData: false
+      
+      # Token validity
+      AccessTokenValidity: 60 # 60 minutes
+      IdTokenValidity: 60 # 60 minutes
+      RefreshTokenValidity: 30 # 30 days
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      
+      # Auth flows
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      
+      # Read/Write attributes
+      ReadAttributes:
+        - email
+        - name
+        - family_name
+        - given_name
+        - phone_number
+        - preferred_username
+        - email_verified
+        - phone_number_verified
+      WriteAttributes:
+        - email
+        - name
+        - family_name
+        - given_name
+        - phone_number
+        - preferred_username
+
+  # App Client for Server/Backend
+  ServerAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-${EnvironmentName}-server-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      
+      # Security settings
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      
+      # Token validity (shorter for server)
+      AccessTokenValidity: 30 # 30 minutes
+      IdTokenValidity: 30 # 30 minutes
+      RefreshTokenValidity: 7 # 7 days
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      
+      # Auth flows (server-side only)
+      ExplicitAuthFlows:
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-cognito-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminUpdateUserAttributes
+                Resource: !GetAtt UserPool.Arn
+
+  # Pre Sign-up Lambda
+  PreSignUpLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-pre-signup'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('Pre Sign-up trigger:', JSON.stringify(event, null, 2));
+            
+            // Email domain validation
+            const email = event.request.userAttributes.email;
+            const allowedDomains = process.env.ALLOWED_EMAIL_DOMAINS?.split(',') || [];
+            
+            if (allowedDomains.length > 0) {
+              const domain = email.split('@')[1];
+              if (!allowedDomains.includes(domain)) {
+                throw new Error('Email domain not allowed');
+              }
+            }
+            
+            // Auto-confirm for specific domains (development only)
+            if (process.env.AUTO_CONFIRM_DOMAINS) {
+              const autoConfirmDomains = process.env.AUTO_CONFIRM_DOMAINS.split(',');
+              const domain = email.split('@')[1];
+              if (autoConfirmDomains.includes(domain)) {
+                event.response.autoConfirmUser = true;
+                event.response.autoVerifyEmail = true;
+              }
+            }
+            
+            return event;
+          };
+      Environment:
+        Variables:
+          ALLOWED_EMAIL_DOMAINS: ''
+          AUTO_CONFIRM_DOMAINS: ''
+
+  # Post Confirmation Lambda
+  PostConfirmationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-post-confirmation'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            console.log('Post Confirmation trigger:', JSON.stringify(event, null, 2));
+            
+            const tableName = process.env.USER_TABLE_NAME;
+            const userId = event.request.userAttributes.sub;
+            const email = event.request.userAttributes.email;
+            
+            // Create user profile in DynamoDB
+            try {
+              await dynamodb.put({
+                TableName: tableName,
+                Item: {
+                  userId: userId,
+                  email: email,
+                  username: event.userName,
+                  createdAt: new Date().toISOString(),
+                  status: 'ACTIVE',
+                  emailVerified: true,
+                  attributes: event.request.userAttributes
+                }
+              }).promise();
+              
+              console.log('User profile created successfully');
+            } catch (error) {
+              console.error('Error creating user profile:', error);
+              // Don't throw error to prevent user creation failure
+            }
+            
+            return event;
+          };
+      Environment:
+        Variables:
+          USER_TABLE_NAME: !Ref UserProfileTable
+
+  # Pre Authentication Lambda
+  PreAuthenticationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-pre-authentication'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('Pre Authentication trigger:', JSON.stringify(event, null, 2));
+            
+            // Check for suspicious login patterns
+            const userPoolId = event.userPoolId;
+            const userName = event.userName;
+            
+            // Example: Check login attempts, IP address patterns, etc.
+            // This is where you'd implement additional security checks
+            
+            return event;
+          };
+
+  # Post Authentication Lambda
+  PostAuthenticationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-post-authentication'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+            console.log('Post Authentication trigger:', JSON.stringify(event, null, 2));
+            
+            const tableName = process.env.LOGIN_HISTORY_TABLE;
+            const userId = event.request.userAttributes.sub;
+            
+            // Log successful authentication
+            try {
+              await dynamodb.put({
+                TableName: tableName,
+                Item: {
+                  userId: userId,
+                  timestamp: new Date().toISOString(),
+                  eventType: 'LOGIN',
+                  sourceIp: event.request.userContextData?.sourceIp || 'unknown',
+                  deviceKey: event.request.deviceKey || 'unknown',
+                  userAgent: event.request.userContextData?.userAgent || 'unknown'
+                }
+              }).promise();
+            } catch (error) {
+              console.error('Error logging authentication:', error);
+            }
+            
+            return event;
+          };
+      Environment:
+        Variables:
+          LOGIN_HISTORY_TABLE: !Ref LoginHistoryTable
+
+  # Lambda Permissions
+  PreSignUpLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreSignUpLambda
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  PostConfirmationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PostConfirmationLambda
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  PreAuthenticationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreAuthenticationLambda
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  PostAuthenticationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PostAuthenticationLambda
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  # DynamoDB Table for User Profiles
+  UserProfileTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-user-profiles'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DynamoDB Table for Login History
+  LoginHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-login-history'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-UserPoolId'
+
+  UserPoolArn:
+    Description: Cognito User Pool ARN
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-UserPoolArn'
+
+  WebAppClientId:
+    Description: Web App Client ID
+    Value: !Ref WebAppClient
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-WebAppClientId'
+
+  ServerAppClientId:
+    Description: Server App Client ID
+    Value: !Ref ServerAppClient
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ServerAppClientId'
+
+  UserPoolDomain:
+    Description: Cognito User Pool Domain
+    Value: !Ref UserPoolDomain
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-UserPoolDomain'
+
+  UserProfileTableName:
+    Description: User Profile DynamoDB Table Name
+    Value: !Ref UserProfileTable
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-UserProfileTableName'
+
+  LoginHistoryTableName:
+    Description: Login History DynamoDB Table Name
+    Value: !Ref LoginHistoryTable
+    Export:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-LoginHistoryTableName'

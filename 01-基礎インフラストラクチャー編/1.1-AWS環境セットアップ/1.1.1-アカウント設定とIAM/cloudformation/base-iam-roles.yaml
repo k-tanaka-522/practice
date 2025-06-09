@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Base IAM roles and policies including MFA enforcement and security best practices'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource tagging
+
+  ProjectName:
+    Type: String
+    Default: aws-learning
+    Description: Project name for resource identification
+
+  EnableMFAEnforcement:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to enforce MFA for all users
+
+Conditions:
+  ShouldEnforceMFA: !Equals [!Ref EnableMFAEnforcement, 'true']
+
+Resources:
+  # MFA Enforcement Policy - Denies access without MFA
+  MFAEnforcementPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: ShouldEnforceMFA
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-${EnvironmentName}-MFAEnforcement
+      Description: Enforces MFA for all actions except those needed to set up MFA
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow users to view account information
+          - Sid: AllowViewAccountInfo
+            Effect: Allow
+            Action:
+              - iam:GetAccountPasswordPolicy
+              - iam:ListVirtualMFADevices
+            Resource: '*'
+          
+          # Allow users to manage their own credentials and MFA
+          - Sid: AllowManageOwnVirtualMFADevice
+            Effect: Allow
+            Action:
+              - iam:CreateVirtualMFADevice
+              - iam:EnableMFADevice
+              - iam:ResyncMFADevice
+              - iam:DeleteVirtualMFADevice
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:mfa/${!aws:username}
+              - !Sub arn:aws:iam::${AWS::AccountId}:user/${!aws:username}
+          
+          # Allow users to manage their own access keys and passwords
+          - Sid: AllowManageOwnAccessKeys
+            Effect: Allow
+            Action:
+              - iam:CreateAccessKey
+              - iam:DeleteAccessKey
+              - iam:ListAccessKeys
+              - iam:UpdateAccessKey
+              - iam:ChangePassword
+              - iam:GetUser
+              - iam:ListMFADevices
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:user/${!aws:username}
+          
+          # Deny all other operations without MFA
+          - Sid: DenyAllExceptListedIfNoMFA
+            Effect: Deny
+            NotAction:
+              - iam:CreateVirtualMFADevice
+              - iam:EnableMFADevice
+              - iam:GetUser
+              - iam:ListMFADevices
+              - iam:ListVirtualMFADevices
+              - iam:ResyncMFADevice
+              - sts:GetSessionToken
+              - iam:ChangePassword
+              - iam:GetAccountPasswordPolicy
+            Resource: '*'
+            Condition:
+              BoolIfExists:
+                'aws:MultiFactorAuthPresent': 'false'
+
+  # Base Security Audit Role
+  SecurityAuditRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-SecurityAuditRole
+      Description: Role for security auditing and compliance checks
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+            Condition:
+              Bool:
+                'aws:MultiFactorAuthPresent': 'true'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecurityAudit
+        - arn:aws:iam::aws:policy/CloudWatchLogsReadOnlyAccess
+      Policies:
+        - PolicyName: AdditionalAuditPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                  - config:Describe*
+                  - config:Get*
+                  - config:List*
+                  - guardduty:Get*
+                  - guardduty:List*
+                  - securityhub:Get*
+                  - securityhub:List*
+                  - access-analyzer:Get*
+                  - access-analyzer:List*
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Organization Admin Role (for cross-account access)
+  OrganizationAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-OrganizationAdminRole
+      Description: Role for organization-level administrative tasks
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+            Condition:
+              Bool:
+                'aws:MultiFactorAuthPresent': 'true'
+              IpAddress:
+                'aws:SourceIp':
+                  - 10.0.0.0/8    # Internal network range
+                  - 172.16.0.0/12 # Internal network range
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Emergency Break Glass Role
+  EmergencyAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-EmergencyAccessRole
+      Description: Emergency access role for critical situations
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ProjectName}-emergency-${AWS::AccountId}'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: EmergencyAccess
+
+  # CloudFormation Deployment Role
+  CloudFormationDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-CloudFormationDeploymentRole
+      Description: Role for CloudFormation stack deployments
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: IAMManagementForCFN
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/${ProjectName}-*
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  MFAEnforcementPolicyArn:
+    Description: ARN of the MFA enforcement policy
+    Value: !If
+      - ShouldEnforceMFA
+      - !Ref MFAEnforcementPolicy
+      - 'MFA not enforced'
+    Export:
+      Name: !Sub ${AWS::StackName}-MFAEnforcementPolicyArn
+
+  SecurityAuditRoleArn:
+    Description: ARN of the security audit role
+    Value: !GetAtt SecurityAuditRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityAuditRoleArn
+
+  OrganizationAdminRoleArn:
+    Description: ARN of the organization admin role
+    Value: !GetAtt OrganizationAdminRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-OrganizationAdminRoleArn
+
+  CloudFormationDeploymentRoleArn:
+    Description: ARN of the CloudFormation deployment role
+    Value: !GetAtt CloudFormationDeploymentRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFormationDeploymentRoleArn
+
+  EmergencyAccessRoleArn:
+    Description: ARN of the emergency access role
+    Value: !GetAtt EmergencyAccessRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-EmergencyAccessRoleArn
