@@ -1,0 +1,1079 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Bedrock チャットボットシステム - 対話型AI基盤
+  
+  このテンプレートは以下のリソースを作成します：
+  - Lambda関数（チャット処理・セッション管理）
+  - API Gateway（WebSocket・REST API）
+  - DynamoDB（チャット履歴・セッション管理）
+  - S3（チャット履歴エクスポート・添付ファイル）
+  - CloudWatch（監視・ログ・メトリクス）
+  - SQS（非同期処理・キュー管理）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本機能）
+      - staging: ステージング環境（負荷テスト対応）
+      - prod: 本番環境（高性能・高可用性）
+
+  ProjectName:
+    Type: String
+    Default: chatbot
+    Description: リソース命名に使用するプロジェクト名
+
+  # BedrockセットアップからのImport
+  BedrockStackName:
+    Type: String
+    Description: |
+      Bedrockセットアップスタック名
+      bedrock-setup.yamlで作成されたスタック名
+
+  # チャットボット設定
+  ChatbotName:
+    Type: String
+    Default: AIAssistant
+    Description: |
+      チャットボット名
+      ユーザーとの対話で表示される名前
+
+  DefaultModel:
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    AllowedValues: 
+      - anthropic.claude-3-sonnet-20240229-v1:0
+      - anthropic.claude-3-haiku-20240307-v1:0
+      - amazon.titan-text-express-v1
+    Description: |
+      デフォルトAIモデル
+      - Claude 3 Sonnet: 高品質・バランス型
+      - Claude 3 Haiku: 高速・軽量型
+      - Titan Express: Amazon製・汎用型
+
+  # セッション設定
+  SessionTimeoutMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 1440
+    Description: |
+      セッション有効期限（分）
+      非アクティブ時間後の自動終了
+
+  MaxMessagesPerSession:
+    Type: Number
+    Default: 100
+    MinValue: 10
+    MaxValue: 1000
+    Description: |
+      セッション当たりの最大メッセージ数
+      制限を超えると新セッションを開始
+
+  # パフォーマンス設定
+  ConnectionLimit:
+    Type: Number
+    Default: 1000
+    MinValue: 10
+    MaxValue: 10000
+    Description: |
+      同時接続数制限
+      WebSocket接続の上限
+
+  MessageRateLimit:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: |
+      メッセージレート制限（件/分）
+      ユーザー当たりの送信制限
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+
+Resources:
+  # ========================================
+  # DynamoDB テーブル（チャット管理）
+  # ========================================
+  # チャットセッションテーブル
+  ChatSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-chat-sessions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserSessionsIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ConnectionIndex
+          KeySchema:
+            - AttributeName: connectionId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # チャットメッセージテーブル
+  ChatMessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-chat-messages'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: messageId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+        - AttributeName: messageId
+          KeyType: RANGE
+      LocalSecondaryIndexes:
+        - IndexName: TimestampIndex
+          KeySchema:
+            - AttributeName: sessionId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # WebSocket接続管理テーブル
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-connections'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserConnectionsIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # SQS キュー（非同期処理）
+  # ========================================
+  # チャット処理キュー
+  ChatProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${EnvironmentName}-chat-processing.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeoutSeconds: 300  # 5分
+      MessageRetentionPeriod: 1209600  # 14日
+      DeadLetterTargetArn: !GetAtt ChatProcessingDLQ.Arn
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ChatProcessingDLQ.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # デッドレターキュー
+  ChatProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${EnvironmentName}-chat-processing-dlq.fifo'
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600  # 14日
+      KmsMasterKeyId: alias/aws/sqs
+
+  # ========================================
+  # Lambda関数群
+  # ========================================
+  # WebSocket接続管理Lambda
+  WebSocketConnectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-websocket-connection'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ChatbotLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          SESSIONS_TABLE: !Ref ChatSessionsTable
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+          CONNECTION_LIMIT: !Ref ConnectionLimit
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              """WebSocket接続・切断管理"""
+              
+              try:
+                  route_key = event['requestContext']['routeKey']
+                  connection_id = event['requestContext']['connectionId']
+                  
+                  connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+                  
+                  if route_key == '$connect':
+                      return handle_connect(connections_table, connection_id, event)
+                  elif route_key == '$disconnect':
+                      return handle_disconnect(connections_table, connection_id)
+                  else:
+                      return {'statusCode': 400, 'body': 'Unsupported route'}
+                      
+              except Exception as e:
+                  print(f"Error in WebSocket connection handler: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+          
+          def handle_connect(connections_table, connection_id, event):
+              """接続処理"""
+              
+              try:
+                  # 接続数制限チェック
+                  connection_limit = int(os.environ['CONNECTION_LIMIT'])
+                  response = connections_table.scan(
+                      Select='COUNT',
+                      FilterExpression='attribute_exists(connectionId)'
+                  )
+                  
+                  if response['Count'] >= connection_limit:
+                      return {'statusCode': 429, 'body': 'Connection limit exceeded'}
+                  
+                  # クエリパラメータから情報取得
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  user_id = query_params.get('userId', 'anonymous')
+                  
+                  # 接続情報を保存
+                  ttl = int((datetime.utcnow() + timedelta(hours=24)).timestamp())
+                  
+                  connections_table.put_item(
+                      Item={
+                          'connectionId': connection_id,
+                          'userId': user_id,
+                          'connectedAt': datetime.utcnow().isoformat(),
+                          'ttl': ttl,
+                          'status': 'connected'
+                      }
+                  )
+                  
+                  print(f"Connection established: {connection_id} for user: {user_id}")
+                  return {'statusCode': 200, 'body': 'Connected'}
+                  
+              except Exception as e:
+                  print(f"Error in handle_connect: {str(e)}")
+                  raise e
+          
+          def handle_disconnect(connections_table, connection_id):
+              """切断処理"""
+              
+              try:
+                  # 接続情報を削除
+                  connections_table.delete_item(
+                      Key={'connectionId': connection_id}
+                  )
+                  
+                  print(f"Connection closed: {connection_id}")
+                  return {'statusCode': 200, 'body': 'Disconnected'}
+                  
+              except Exception as e:
+                  print(f"Error in handle_disconnect: {str(e)}")
+                  # 切断エラーは無視（接続が既に切れている可能性）
+                  return {'statusCode': 200, 'body': 'Disconnected'}
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # チャットメッセージ処理Lambda
+  ChatMessageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-chat-message'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ChatbotLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          SESSIONS_TABLE: !Ref ChatSessionsTable
+          MESSAGES_TABLE: !Ref ChatMessagesTable
+          PROCESSING_QUEUE: !Ref ChatProcessingQueue
+          DEFAULT_MODEL: !Ref DefaultModel
+          CHATBOT_NAME: !Ref ChatbotName
+          MAX_MESSAGES: !Ref MaxMessagesPerSession
+          SESSION_TIMEOUT: !Ref SessionTimeoutMinutes
+          MESSAGE_RATE_LIMIT: !Ref MessageRateLimit
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime, timedelta
+          
+          dynamodb = boto3.resource('dynamodb')
+          sqs = boto3.client('sqs')
+          apigateway = boto3.client('apigatewaymanagementapi',
+                                   endpoint_url=f"https://{os.environ.get('API_GATEWAY_ENDPOINT', '')}")
+          
+          def lambda_handler(event, context):
+              """チャットメッセージ処理"""
+              
+              try:
+                  route_key = event['requestContext']['routeKey']
+                  connection_id = event['requestContext']['connectionId']
+                  
+                  if route_key == 'sendMessage':
+                      return handle_send_message(connection_id, event)
+                  else:
+                      return {'statusCode': 400, 'body': 'Unsupported route'}
+                      
+              except Exception as e:
+                  print(f"Error in chat message handler: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+          
+          def handle_send_message(connection_id, event):
+              """メッセージ送信処理"""
+              
+              try:
+                  # メッセージデータの解析
+                  body = json.loads(event.get('body', '{}'))
+                  message = body.get('message', '')
+                  session_id = body.get('sessionId')
+                  user_id = body.get('userId', 'anonymous')
+                  
+                  if not message.strip():
+                      return send_websocket_response(connection_id, {
+                          'type': 'error',
+                          'message': 'Empty message not allowed'
+                      })
+                  
+                  # レート制限チェック
+                  if not check_rate_limit(user_id):
+                      return send_websocket_response(connection_id, {
+                          'type': 'error',
+                          'message': 'Rate limit exceeded'
+                      })
+                  
+                  # セッション管理
+                  if not session_id:
+                      session_id = create_new_session(user_id, connection_id)
+                  else:
+                      update_session(session_id, connection_id)
+                  
+                  # ユーザーメッセージを保存
+                  message_id = str(uuid.uuid4())
+                  save_message(session_id, message_id, 'user', message, user_id)
+                  
+                  # 非同期処理キューに送信
+                  queue_message = {
+                      'sessionId': session_id,
+                      'messageId': message_id,
+                      'connectionId': connection_id,
+                      'userMessage': message,
+                      'userId': user_id,
+                      'timestamp': datetime.utcnow().isoformat()
+                  }
+                  
+                  sqs.send_message(
+                      QueueUrl=os.environ['PROCESSING_QUEUE'],
+                      MessageBody=json.dumps(queue_message),
+                      MessageGroupId=session_id,
+                      MessageDeduplicationId=message_id
+                  )
+                  
+                  # 即座に受信確認を送信
+                  return send_websocket_response(connection_id, {
+                      'type': 'messageReceived',
+                      'sessionId': session_id,
+                      'messageId': message_id,
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+                  
+              except Exception as e:
+                  print(f"Error in handle_send_message: {str(e)}")
+                  return send_websocket_response(connection_id, {
+                      'type': 'error',
+                      'message': f'Error processing message: {str(e)}'
+                  })
+          
+          def check_rate_limit(user_id):
+              """レート制限チェック（簡易実装）"""
+              # 実装：DynamoDBまたはElastiCacheでレート制限管理
+              return True
+          
+          def create_new_session(user_id, connection_id):
+              """新しいセッション作成"""
+              session_id = str(uuid.uuid4())
+              sessions_table = dynamodb.Table(os.environ['SESSIONS_TABLE'])
+              
+              timeout_minutes = int(os.environ['SESSION_TIMEOUT'])
+              ttl = int((datetime.utcnow() + timedelta(minutes=timeout_minutes)).timestamp())
+              
+              sessions_table.put_item(
+                  Item={
+                      'sessionId': session_id,
+                      'userId': user_id,
+                      'connectionId': connection_id,
+                      'createdAt': datetime.utcnow().isoformat(),
+                      'lastActivity': datetime.utcnow().isoformat(),
+                      'messageCount': 0,
+                      'status': 'active',
+                      'ttl': ttl
+                  }
+              )
+              
+              return session_id
+          
+          def update_session(session_id, connection_id):
+              """セッション更新"""
+              sessions_table = dynamodb.Table(os.environ['SESSIONS_TABLE'])
+              
+              timeout_minutes = int(os.environ['SESSION_TIMEOUT'])
+              ttl = int((datetime.utcnow() + timedelta(minutes=timeout_minutes)).timestamp())
+              
+              sessions_table.update_item(
+                  Key={'sessionId': session_id},
+                  UpdateExpression='SET lastActivity = :timestamp, connectionId = :conn, #ttl = :ttl ADD messageCount :inc',
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={
+                      ':timestamp': datetime.utcnow().isoformat(),
+                      ':conn': connection_id,
+                      ':ttl': ttl,
+                      ':inc': 1
+                  }
+              )
+          
+          def save_message(session_id, message_id, role, content, user_id):
+              """メッセージ保存"""
+              messages_table = dynamodb.Table(os.environ['MESSAGES_TABLE'])
+              
+              # メッセージ保持期間（30日）
+              ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+              
+              messages_table.put_item(
+                  Item={
+                      'sessionId': session_id,
+                      'messageId': message_id,
+                      'role': role,  # user or assistant
+                      'content': content,
+                      'userId': user_id,
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'ttl': ttl
+                  }
+              )
+          
+          def send_websocket_response(connection_id, data):
+              """WebSocketレスポンス送信"""
+              try:
+                  if 'API_GATEWAY_ENDPOINT' in os.environ:
+                      apigateway.post_to_connection(
+                          ConnectionId=connection_id,
+                          Data=json.dumps(data)
+                      )
+              except Exception as e:
+                  print(f"Error sending WebSocket response: {str(e)}")
+              
+              return {'statusCode': 200, 'body': 'Message processed'}
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # AI応答生成Lambda
+  ChatAIResponseFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-ai-response'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ChatbotLambdaRole.Arn
+      Timeout: 900  # 15分
+      MemorySize: 2048
+      ReservedConcurrencyLimit: !If [IsProduction, 50, 10]
+      Environment:
+        Variables:
+          MESSAGES_TABLE: !Ref ChatMessagesTable
+          DEFAULT_MODEL: !Ref DefaultModel
+          CHATBOT_NAME: !Ref ChatbotName
+          OUTPUT_BUCKET: 
+            Fn::ImportValue: !Sub '${BedrockStackName}-BedrockOutputBucket'
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime, timedelta
+          
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          dynamodb = boto3.resource('dynamodb')
+          apigateway = boto3.client('apigatewaymanagementapi',
+                                   endpoint_url=f"https://{os.environ.get('API_GATEWAY_ENDPOINT', '')}")
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """SQSトリガーによるAI応答生成"""
+              
+              try:
+                  for record in event['Records']:
+                      message_data = json.loads(record['body'])
+                      session_id = message_data['sessionId']
+                      connection_id = message_data['connectionId']
+                      user_message = message_data['userMessage']
+                      user_id = message_data['userId']
+                      
+                      print(f"Processing AI response for session: {session_id}")
+                      
+                      # チャット履歴取得
+                      chat_history = get_chat_history(session_id)
+                      
+                      # AI応答生成
+                      ai_response = generate_ai_response(chat_history, user_message)
+                      
+                      # 応答をデータベースに保存
+                      response_message_id = str(uuid.uuid4())
+                      save_message(session_id, response_message_id, 'assistant', ai_response, user_id)
+                      
+                      # WebSocket経由で応答送信
+                      send_websocket_response(connection_id, {
+                          'type': 'aiResponse',
+                          'sessionId': session_id,
+                          'messageId': response_message_id,
+                          'message': ai_response,
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'chatbotName': os.environ['CHATBOT_NAME']
+                      })
+                      
+                      print(f"AI response sent for session: {session_id}")
+                  
+                  return {'statusCode': 200, 'body': 'AI responses processed successfully'}
+                  
+              except Exception as e:
+                  print(f"Error in AI response generation: {str(e)}")
+                  raise e
+          
+          def get_chat_history(session_id, limit=10):
+              """チャット履歴取得"""
+              messages_table = dynamodb.Table(os.environ['MESSAGES_TABLE'])
+              
+              response = messages_table.query(
+                  KeyConditionExpression='sessionId = :sid',
+                  ExpressionAttributeValues={':sid': session_id},
+                  ScanIndexForward=False,  # 新しい順
+                  Limit=limit * 2  # user + assistant のペア
+              )
+              
+              # 古い順にソート
+              messages = sorted(response['Items'], key=lambda x: x['timestamp'])
+              
+              return [{'role': msg['role'], 'content': msg['content']} for msg in messages]
+          
+          def generate_ai_response(chat_history, user_message):
+              """AI応答生成"""
+              
+              try:
+                  model_id = os.environ['DEFAULT_MODEL']
+                  chatbot_name = os.environ['CHATBOT_NAME']
+                  
+                  # システムプロンプト
+                  system_prompt = f"""あなたは{chatbot_name}という名前のAIアシスタントです。
+                  以下の特徴を持って対話してください：
+                  - 親しみやすく、礼儀正しい
+                  - 質問に対して具体的で役立つ回答を提供
+                  - 不明な点は素直に「わからない」と伝える
+                  - 日本語で自然な会話を心がける
+                  
+                  チャット履歴を参考にして、適切な返答をしてください。"""
+                  
+                  # メッセージ履歴を構築
+                  messages = [{"role": "user", "content": system_prompt}]
+                  messages.extend(chat_history)
+                  messages.append({"role": "user", "content": user_message})
+                  
+                  if model_id.startswith('anthropic.claude'):
+                      return generate_with_claude(model_id, messages)
+                  elif model_id.startswith('amazon.titan'):
+                      return generate_with_titan(model_id, user_message)
+                  else:
+                      return "申し訳ございません。現在、応答を生成できません。"
+                      
+              except Exception as e:
+                  print(f"Error generating AI response: {str(e)}")
+                  return f"申し訳ございません。エラーが発生しました: {str(e)}"
+          
+          def generate_with_claude(model_id, messages):
+              """Claude モデルで応答生成"""
+              
+              request_body = {
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 1000,
+                  "messages": messages[1:],  # システムプロンプトを除く
+                  "system": messages[0]["content"],  # システムプロンプト
+                  "temperature": 0.7,
+                  "top_p": 0.9
+              }
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId=model_id,
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              return response_body.get('content', [{}])[0].get('text', 'エラーが発生しました。')
+          
+          def generate_with_titan(model_id, user_message):
+              """Titan モデルで応答生成"""
+              
+              request_body = {
+                  "inputText": f"ユーザー: {user_message}\n\nAIアシスタント:",
+                  "textGenerationConfig": {
+                      "maxTokenCount": 1000,
+                      "temperature": 0.7,
+                      "topP": 0.9,
+                      "stopSequences": ["\nユーザー:"]
+                  }
+              }
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId=model_id,
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              return response_body.get('results', [{}])[0].get('outputText', 'エラーが発生しました。')
+          
+          def save_message(session_id, message_id, role, content, user_id):
+              """メッセージ保存"""
+              messages_table = dynamodb.Table(os.environ['MESSAGES_TABLE'])
+              
+              ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+              
+              messages_table.put_item(
+                  Item={
+                      'sessionId': session_id,
+                      'messageId': message_id,
+                      'role': role,
+                      'content': content,
+                      'userId': user_id,
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'ttl': ttl
+                  }
+              )
+          
+          def send_websocket_response(connection_id, data):
+              """WebSocketレスポンス送信"""
+              try:
+                  if 'API_GATEWAY_ENDPOINT' in os.environ:
+                      apigateway.post_to_connection(
+                          ConnectionId=connection_id,
+                          Data=json.dumps(data)
+                      )
+              except Exception as e:
+                  print(f"Error sending WebSocket response: {str(e)}")
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SQSトリガー設定
+  ChatAIResponseEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ChatProcessingQueue.Arn
+      FunctionName: !Ref ChatAIResponseFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+
+  # ========================================
+  # API Gateway WebSocket
+  # ========================================
+  # WebSocket API
+  ChatbotWebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-chatbot-websocket'
+      Description: Chatbot WebSocket API
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  # WebSocket ステージ
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ChatbotWebSocketApi
+      StageName: !Ref EnvironmentName
+      Description: !Sub '${EnvironmentName} stage for chatbot WebSocket'
+      DefaultRouteSettings:
+        ThrottlingRateLimit: !Ref MessageRateLimit
+        ThrottlingBurstLimit: !Ref ConnectionLimit
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  # WebSocket ルート設定
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatbotWebSocketApi
+      RouteKey: $connect
+      Target: !Sub 'integrations/${ConnectIntegration}'
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatbotWebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub 'integrations/${DisconnectIntegration}'
+
+  SendMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ChatbotWebSocketApi
+      RouteKey: sendMessage
+      Target: !Sub 'integrations/${SendMessageIntegration}'
+
+  # WebSocket インテグレーション
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatbotWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketConnectionFunction.Arn}/invocations'
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatbotWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketConnectionFunction.Arn}/invocations'
+
+  SendMessageIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ChatbotWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatMessageFunction.Arn}/invocations'
+
+  # Lambda実行権限
+  WebSocketConnectionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebSocketConnectionFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatbotWebSocketApi}/*'
+
+  ChatMessagePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ChatMessageFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatbotWebSocketApi}/*'
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  ChatbotLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ChatbotLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ChatSessionsTable.Arn
+                  - !Sub '${ChatSessionsTable.Arn}/index/*'
+                  - !GetAtt ChatMessagesTable.Arn
+                  - !Sub '${ChatMessagesTable.Arn}/index/*'
+                  - !GetAtt ConnectionsTable.Arn
+                  - !Sub '${ConnectionsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                Resource: 
+                  - !GetAtt ChatProcessingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: 
+                  - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatbotWebSocketApi}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: 
+                  Fn::Sub:
+                    - '${BucketArn}/*'
+                    - BucketArn: 
+                        Fn::ImportValue: !Sub '${BedrockStackName}-BedrockOutputBucket'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: 
+                  Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKeyArn'
+
+  # ========================================
+  # CloudWatch 監視
+  # ========================================
+  # Lambda ログ
+  WebSocketConnectionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-websocket-connection'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  ChatMessageLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-chat-message'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  ChatAIResponseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-ai-response'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # 高エラー率アラーム
+  ChatbotErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-chatbot-errors'
+      AlarmDescription: Chatbot Lambda error rate is high
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ChatAIResponseFunction
+
+  # 高接続数アラーム
+  HighConnectionCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-high-connection-count'
+      AlarmDescription: WebSocket connection count is high
+      MetricName: ConnectCount
+      Namespace: AWS/ApiGatewayV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ConnectionLimit
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref ChatbotWebSocketApi
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # WebSocket API情報
+  WebSocketApiId:
+    Description: WebSocket API ID
+    Value: !Ref ChatbotWebSocketApi
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketApiId'
+
+  WebSocketEndpoint:
+    Description: WebSocket API エンドポイント
+    Value: !Sub 'wss://${ChatbotWebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketEndpoint'
+
+  # Lambda関数
+  WebSocketConnectionFunctionArn:
+    Description: WebSocket接続管理Lambda関数ARN
+    Value: !GetAtt WebSocketConnectionFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketConnectionFunction'
+
+  ChatMessageFunctionArn:
+    Description: チャットメッセージ処理Lambda関数ARN
+    Value: !GetAtt ChatMessageFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ChatMessageFunction'
+
+  ChatAIResponseFunctionArn:
+    Description: AI応答生成Lambda関数ARN
+    Value: !GetAtt ChatAIResponseFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ChatAIResponseFunction'
+
+  # DynamoDB テーブル
+  ChatSessionsTableName:
+    Description: チャットセッションテーブル名
+    Value: !Ref ChatSessionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ChatSessionsTable'
+
+  ChatMessagesTableName:
+    Description: チャットメッセージテーブル名
+    Value: !Ref ChatMessagesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ChatMessagesTable'
+
+  ConnectionsTableName:
+    Description: WebSocket接続テーブル名
+    Value: !Ref ConnectionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectionsTable'
+
+  # SQS キュー
+  ChatProcessingQueueUrl:
+    Description: チャット処理キューURL
+    Value: !Ref ChatProcessingQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ChatProcessingQueue'
+
+  # 使用例
+  ChatbotUsageExample:
+    Description: チャットボット接続使用例
+    Value: !Sub |
+      WebSocketチャットボット接続例：
+      
+      const ws = new WebSocket('wss://${ChatbotWebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}?userId=user123');
+      
+      // メッセージ送信
+      ws.send(JSON.stringify({
+        action: 'sendMessage',
+        message: 'こんにちは',
+        sessionId: null  // 新規セッションの場合
+      }));
+      
+      // レスポンス受信
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        console.log('AI Response:', data.message);
+      };
+
+  # 設定概要
+  ChatbotConfiguration:
+    Description: チャットボット設定概要
+    Value: !Sub |
+      Chatbot System:
+      - WebSocket API: wss://${ChatbotWebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}
+      - Chatbot Name: ${ChatbotName}
+      - AI Model: ${DefaultModel}
+      - Session Timeout: ${SessionTimeoutMinutes} minutes
+      - Max Messages: ${MaxMessagesPerSession}
+      - Connection Limit: ${ConnectionLimit}
+      - Message Rate Limit: ${MessageRateLimit}/min

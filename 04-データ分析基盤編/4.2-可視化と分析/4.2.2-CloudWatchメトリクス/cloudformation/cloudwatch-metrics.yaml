@@ -1,0 +1,1045 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudWatch カスタムメトリクス・ダッシュボード - 運用監視基盤
+  
+  このテンプレートは以下のリソースを作成します：
+  - CloudWatch カスタムメトリクス（ビジネスKPI）
+  - CloudWatch ダッシュボード（運用・ビジネス監視）
+  - CloudWatch アラーム（閾値監視・異常検知）
+  - Lambda関数（メトリクス収集・分析）
+  - SNS通知（アラート配信）
+  - CloudWatch Insights（ログ分析）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本監視）
+      - staging: ステージング環境（詳細監視）
+      - prod: 本番環境（高度監視・アラート）
+
+  ProjectName:
+    Type: String
+    Default: cloudwatch-metrics
+    Description: リソース命名に使用するプロジェクト名
+
+  # 監視対象設定
+  ApplicationName:
+    Type: String
+    Default: web-application
+    Description: 監視対象アプリケーション名
+
+  # メトリクス収集設定
+  MetricsCollectionInterval:
+    Type: Number
+    Default: 300
+    AllowedValues: [60, 300, 900, 3600]
+    Description: |
+      メトリクス収集間隔（秒）
+      - 60: 1分間隔（高頻度監視）
+      - 300: 5分間隔（標準）
+      - 900: 15分間隔（低頻度）
+      - 3600: 1時間間隔（長期監視）
+
+  # アラート設定
+  AlertEmail:
+    Type: String
+    Default: admin@example.com
+    Description: アラート通知用メールアドレス
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ""
+    Description: |
+      Slack Webhook URL（任意）
+      Slack通知を使用する場合に設定
+
+  # 監視レベル設定
+  MonitoringLevel:
+    Type: String
+    Default: standard
+    AllowedValues: [basic, standard, advanced, enterprise]
+    Description: |
+      監視レベル
+      - basic: 基本的なメトリクス
+      - standard: 詳細なメトリクス
+      - advanced: カスタムメトリクス
+      - enterprise: AI/ML異常検知
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # 監視レベル判定
+  IsStandardMonitoring: !Or
+    - !Equals [!Ref MonitoringLevel, 'standard']
+    - !Equals [!Ref MonitoringLevel, 'advanced']
+    - !Equals [!Ref MonitoringLevel, 'enterprise']
+  
+  IsAdvancedMonitoring: !Or
+    - !Equals [!Ref MonitoringLevel, 'advanced']
+    - !Equals [!Ref MonitoringLevel, 'enterprise']
+  
+  IsEnterpriseMonitoring: !Equals [!Ref MonitoringLevel, 'enterprise']
+  
+  # Slack通知を使用するか
+  UseSlackNotification: !Not [!Equals [!Ref SlackWebhookUrl, ""]]
+
+Resources:
+  # ========================================
+  # CloudWatch ダッシュボード
+  # ========================================
+  # システム運用ダッシュボード
+  SystemOperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${EnvironmentName}-system-operations'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Application", "RequestCount", "Application", "${ApplicationName}", "Environment", "${EnvironmentName}" ],
+                  [ ".", "ErrorRate", ".", ".", ".", "." ],
+                  [ ".", "ResponseTime", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "アプリケーション基本メトリクス",
+                "period": ${MetricsCollectionInterval},
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization" ],
+                  [ "AWS/ApplicationELB", "TargetResponseTime" ],
+                  [ "AWS/Lambda", "Duration" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "インフラストラクチャメトリクス",
+                "period": ${MetricsCollectionInterval}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Business", "ActiveUsers", "Application", "${ApplicationName}" ],
+                  [ ".", "NewSignups", ".", "." ],
+                  [ ".", "Revenue", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ビジネスKPIメトリクス",
+                "period": ${MetricsCollectionInterval}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Security", "FailedLogins", "Application", "${ApplicationName}" ],
+                  [ ".", "SuspiciousActivity", ".", "." ],
+                  [ ".", "ApiRateLimit", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "セキュリティメトリクス",
+                "period": ${MetricsCollectionInterval}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Performance", "DatabaseConnections", "Application", "${ApplicationName}" ],
+                  [ ".", "CacheHitRatio", ".", "." ],
+                  [ ".", "QueueLength", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "パフォーマンスメトリクス",
+                "period": ${MetricsCollectionInterval}
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-${EnvironmentName}' | fields @timestamp, @message\\n| filter @message like /ERROR/\\n| sort @timestamp desc\\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "最新エラーログ",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ビジネスKPIダッシュボード
+  BusinessKPIDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsStandardMonitoring
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${EnvironmentName}-business-kpi'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Business", "ActiveUsers", "Application", "${ApplicationName}" ]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "アクティブユーザー数",
+                "period": ${MetricsCollectionInterval},
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 6,
+              "y": 0,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Business", "Revenue", "Application", "${ApplicationName}" ]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "売上（日次）",
+                "period": ${MetricsCollectionInterval},
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Business", "ConversionRate", "Application", "${ApplicationName}" ]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "コンバージョン率（%）",
+                "period": ${MetricsCollectionInterval},
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 18,
+              "y": 0,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Business", "CustomerSatisfaction", "Application", "${ApplicationName}" ]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "顧客満足度",
+                "period": ${MetricsCollectionInterval},
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Business", "ActiveUsers", "Application", "${ApplicationName}" ],
+                  [ ".", "NewSignups", ".", "." ],
+                  [ ".", "ChurnRate", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ユーザー関連KPI推移",
+                "period": 3600
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${ProjectName}/Business", "Revenue", "Application", "${ApplicationName}" ],
+                  [ ".", "AverageOrderValue", ".", "." ],
+                  [ ".", "TransactionCount", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "売上関連KPI推移",
+                "period": 3600
+              }
+            }
+          ]
+        }
+
+  # ========================================
+  # Lambda関数（メトリクス収集）
+  # ========================================
+  # ビジネスメトリクス収集Lambda
+  BusinessMetricsCollector:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-business-metrics'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt MetricsCollectorRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import random
+          from datetime import datetime, timedelta
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              """ビジネスメトリクスの収集と送信"""
+              
+              try:
+                  application_name = os.environ['APPLICATION_NAME']
+                  environment = os.environ['ENVIRONMENT']
+                  project_name = os.environ['PROJECT_NAME']
+                  
+                  # ダミーデータ生成（実際の環境では、データベースやAPIから取得）
+                  metrics_data = {
+                      'ActiveUsers': generate_active_users(),
+                      'NewSignups': generate_new_signups(),
+                      'Revenue': generate_revenue(),
+                      'ConversionRate': generate_conversion_rate(),
+                      'CustomerSatisfaction': generate_customer_satisfaction(),
+                      'ChurnRate': generate_churn_rate(),
+                      'AverageOrderValue': generate_average_order_value(),
+                      'TransactionCount': generate_transaction_count()
+                  }
+                  
+                  # CloudWatchメトリクスに送信
+                  metric_data = []
+                  timestamp = datetime.utcnow()
+                  
+                  for metric_name, value in metrics_data.items():
+                      metric_data.append({
+                          'MetricName': metric_name,
+                          'Value': value,
+                          'Unit': 'Count' if metric_name in ['ActiveUsers', 'NewSignups', 'TransactionCount'] else 'Percent' if 'Rate' in metric_name or 'Satisfaction' in metric_name else 'None',
+                          'Timestamp': timestamp,
+                          'Dimensions': [
+                              {
+                                  'Name': 'Application',
+                                  'Value': application_name
+                              },
+                              {
+                                  'Name': 'Environment',
+                                  'Value': environment
+                              }
+                          ]
+                      })
+                  
+                  # メトリクスをバッチで送信
+                  for i in range(0, len(metric_data), 20):  # CloudWatchの制限：20個ずつ
+                      batch = metric_data[i:i+20]
+                      cloudwatch.put_metric_data(
+                          Namespace=f'{project_name}/Business',
+                          MetricData=batch
+                      )
+                  
+                  print(f"Successfully sent {len(metric_data)} business metrics")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Business metrics collected successfully',
+                          'metrics_count': len(metric_data),
+                          'timestamp': timestamp.isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error collecting business metrics: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+          
+          def generate_active_users():
+              """アクティブユーザー数を生成（ダミー）"""
+              base = 1000
+              variation = random.randint(-100, 200)
+              return max(0, base + variation)
+          
+          def generate_new_signups():
+              """新規登録数を生成（ダミー）"""
+              return random.randint(10, 50)
+          
+          def generate_revenue():
+              """売上を生成（ダミー）"""
+              return round(random.uniform(5000, 15000), 2)
+          
+          def generate_conversion_rate():
+              """コンバージョン率を生成（ダミー）"""
+              return round(random.uniform(2.0, 8.0), 2)
+          
+          def generate_customer_satisfaction():
+              """顧客満足度を生成（ダミー）"""
+              return round(random.uniform(3.5, 4.8), 1)
+          
+          def generate_churn_rate():
+              """チャーン率を生成（ダミー）"""
+              return round(random.uniform(1.0, 5.0), 2)
+          
+          def generate_average_order_value():
+              """平均注文額を生成（ダミー）"""
+              return round(random.uniform(50, 200), 2)
+          
+          def generate_transaction_count():
+              """取引数を生成（ダミー）"""
+              return random.randint(100, 500)
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # アプリケーションメトリクス収集Lambda
+  ApplicationMetricsCollector:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-app-metrics'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt MetricsCollectorRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import random
+          from datetime import datetime
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              """アプリケーションメトリクスの収集と送信"""
+              
+              try:
+                  application_name = os.environ['APPLICATION_NAME']
+                  environment = os.environ['ENVIRONMENT']
+                  project_name = os.environ['PROJECT_NAME']
+                  
+                  # アプリケーションメトリクス生成
+                  metrics_data = {
+                      'RequestCount': generate_request_count(),
+                      'ErrorRate': generate_error_rate(),
+                      'ResponseTime': generate_response_time(),
+                      'DatabaseConnections': generate_db_connections(),
+                      'CacheHitRatio': generate_cache_hit_ratio(),
+                      'QueueLength': generate_queue_length(),
+                      'FailedLogins': generate_failed_logins(),
+                      'SuspiciousActivity': generate_suspicious_activity(),
+                      'ApiRateLimit': generate_api_rate_limit()
+                  }
+                  
+                  # メトリクス送信
+                  timestamp = datetime.utcnow()
+                  
+                  # アプリケーションメトリクス
+                  app_metrics = ['RequestCount', 'ErrorRate', 'ResponseTime']
+                  app_metric_data = []
+                  
+                  for metric_name in app_metrics:
+                      app_metric_data.append({
+                          'MetricName': metric_name,
+                          'Value': metrics_data[metric_name],
+                          'Unit': 'Count' if metric_name == 'RequestCount' else 'Percent' if metric_name == 'ErrorRate' else 'Milliseconds',
+                          'Timestamp': timestamp,
+                          'Dimensions': [
+                              {
+                                  'Name': 'Application',
+                                  'Value': application_name
+                              },
+                              {
+                                  'Name': 'Environment',
+                                  'Value': environment
+                              }
+                          ]
+                      })
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace=f'{project_name}/Application',
+                      MetricData=app_metric_data
+                  )
+                  
+                  # パフォーマンスメトリクス
+                  perf_metrics = ['DatabaseConnections', 'CacheHitRatio', 'QueueLength']
+                  perf_metric_data = []
+                  
+                  for metric_name in perf_metrics:
+                      perf_metric_data.append({
+                          'MetricName': metric_name,
+                          'Value': metrics_data[metric_name],
+                          'Unit': 'Count' if metric_name in ['DatabaseConnections', 'QueueLength'] else 'Percent',
+                          'Timestamp': timestamp,
+                          'Dimensions': [
+                              {
+                                  'Name': 'Application',
+                                  'Value': application_name
+                              }
+                          ]
+                      })
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace=f'{project_name}/Performance',
+                      MetricData=perf_metric_data
+                  )
+                  
+                  # セキュリティメトリクス
+                  sec_metrics = ['FailedLogins', 'SuspiciousActivity', 'ApiRateLimit']
+                  sec_metric_data = []
+                  
+                  for metric_name in sec_metrics:
+                      sec_metric_data.append({
+                          'MetricName': metric_name,
+                          'Value': metrics_data[metric_name],
+                          'Unit': 'Count',
+                          'Timestamp': timestamp,
+                          'Dimensions': [
+                              {
+                                  'Name': 'Application',
+                                  'Value': application_name
+                              }
+                          ]
+                      })
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace=f'{project_name}/Security',
+                      MetricData=sec_metric_data
+                  )
+                  
+                  print(f"Successfully sent application metrics")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Application metrics collected successfully',
+                          'timestamp': timestamp.isoformat()
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error collecting application metrics: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+          
+          def generate_request_count():
+              return random.randint(500, 2000)
+          
+          def generate_error_rate():
+              return round(random.uniform(0.1, 2.0), 2)
+          
+          def generate_response_time():
+              return random.randint(50, 500)
+          
+          def generate_db_connections():
+              return random.randint(10, 50)
+          
+          def generate_cache_hit_ratio():
+              return round(random.uniform(80, 95), 1)
+          
+          def generate_queue_length():
+              return random.randint(0, 20)
+          
+          def generate_failed_logins():
+              return random.randint(0, 10)
+          
+          def generate_suspicious_activity():
+              return random.randint(0, 5)
+          
+          def generate_api_rate_limit():
+              return random.randint(0, 100)
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CloudWatch アラーム
+  # ========================================
+  # 高エラー率アラーム
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-high-error-rate'
+      AlarmDescription: アプリケーションエラー率が高い
+      MetricName: ErrorRate
+      Namespace: !Sub '${ProjectName}/Application'
+      Statistic: Average
+      Period: !Ref MetricsCollectionInterval
+      EvaluationPeriods: 2
+      Threshold: !If [IsProduction, 1.0, 5.0]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Application
+          Value: !Ref ApplicationName
+        - Name: Environment
+          Value: !Ref EnvironmentName
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # 高レスポンス時間アラーム
+  HighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-high-response-time'
+      AlarmDescription: アプリケーションレスポンス時間が長い
+      MetricName: ResponseTime
+      Namespace: !Sub '${ProjectName}/Application'
+      Statistic: Average
+      Period: !Ref MetricsCollectionInterval
+      EvaluationPeriods: 3
+      Threshold: !If [IsProduction, 1000, 2000]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Application
+          Value: !Ref ApplicationName
+        - Name: Environment
+          Value: !Ref EnvironmentName
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # ビジネスKPIアラーム（低コンバージョン率）
+  LowConversionRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsStandardMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-low-conversion-rate'
+      AlarmDescription: コンバージョン率が低下
+      MetricName: ConversionRate
+      Namespace: !Sub '${ProjectName}/Business'
+      Statistic: Average
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: 2.0
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Application
+          Value: !Ref ApplicationName
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # セキュリティアラーム（不審なアクティビティ）
+  SuspiciousActivityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-suspicious-activity'
+      AlarmDescription: 不審なアクティビティを検出
+      MetricName: SuspiciousActivity
+      Namespace: !Sub '${ProjectName}/Security'
+      Statistic: Sum
+      Period: !Ref MetricsCollectionInterval
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Application
+          Value: !Ref ApplicationName
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # ========================================
+  # 異常検知（Enterprise監視レベル）
+  # ========================================
+  # 異常検知器（リクエスト数）
+  RequestCountAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Condition: IsEnterpriseMonitoring
+    Properties:
+      MetricName: RequestCount
+      Namespace: !Sub '${ProjectName}/Application'
+      Stat: Average
+      Dimensions:
+        - Name: Application
+          Value: !Ref ApplicationName
+        - Name: Environment
+          Value: !Ref EnvironmentName
+
+  # 異常検知アラーム
+  RequestCountAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsEnterpriseMonitoring
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-request-count-anomaly'
+      AlarmDescription: リクエスト数の異常を検知
+      ComparisonOperator: LessThanLowerOrGreaterThanUpperThreshold
+      EvaluationPeriods: 2
+      Metrics:
+        - Id: m1
+          ReturnData: true
+          MetricStat:
+            Metric:
+              MetricName: RequestCount
+              Namespace: !Sub '${ProjectName}/Application'
+              Dimensions:
+                - Name: Application
+                  Value: !Ref ApplicationName
+                - Name: Environment
+                  Value: !Ref EnvironmentName
+            Period: !Ref MetricsCollectionInterval
+            Stat: Average
+        - Id: ad1
+          AnomalyDetector:
+            MetricName: RequestCount
+            Namespace: !Sub '${ProjectName}/Application'
+            Stat: Average
+            Dimensions:
+              - Name: Application
+                Value: !Ref ApplicationName
+              - Name: Environment
+                Value: !Ref EnvironmentName
+      ThresholdMetricId: ad1
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # ========================================
+  # イベントスケジューリング
+  # ========================================
+  # ビジネスメトリクス収集スケジュール
+  BusinessMetricsSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: ビジネスメトリクス定期収集
+      ScheduleExpression: !Sub 'rate(${MetricsCollectionInterval} seconds)'
+      Targets:
+        - Arn: !GetAtt BusinessMetricsCollector.Arn
+          Id: BusinessMetricsTarget
+
+  BusinessMetricsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BusinessMetricsCollector
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BusinessMetricsSchedule.Arn
+
+  # アプリケーションメトリクス収集スケジュール
+  ApplicationMetricsSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: アプリケーションメトリクス定期収集
+      ScheduleExpression: !Sub 'rate(${MetricsCollectionInterval} seconds)'
+      Targets:
+        - Arn: !GetAtt ApplicationMetricsCollector.Arn
+          Id: ApplicationMetricsTarget
+
+  ApplicationMetricsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApplicationMetricsCollector
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ApplicationMetricsSchedule.Arn
+
+  # ========================================
+  # 通知設定
+  # ========================================
+  # SNSアラートトピック
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-alerts'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} アラート'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # メール通知サブスクリプション
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref AlertEmail
+
+  # Slack通知Lambda（オプション）
+  SlackNotificationFunction:
+    Type: AWS::Lambda::Function
+    Condition: UseSlackNotification
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-slack-notification'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SlackNotificationRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import os
+          
+          http = urllib3.PoolManager()
+          
+          def lambda_handler(event, context):
+              """SNSメッセージをSlackに転送"""
+              
+              try:
+                  webhook_url = os.environ['SLACK_WEBHOOK_URL']
+                  
+                  for record in event['Records']:
+                      sns_message = json.loads(record['Sns']['Message'])
+                      
+                      # Slackメッセージ作成
+                      slack_message = {
+                          'text': f"🚨 *CloudWatch Alert*",
+                          'attachments': [
+                              {
+                                  'color': 'danger' if 'ALARM' in record['Sns']['Subject'] else 'good',
+                                  'fields': [
+                                      {
+                                          'title': 'Alert Name',
+                                          'value': sns_message.get('AlarmName', 'Unknown'),
+                                          'short': True
+                                      },
+                                      {
+                                          'title': 'Status',
+                                          'value': sns_message.get('NewStateValue', 'Unknown'),
+                                          'short': True
+                                      },
+                                      {
+                                          'title': 'Reason',
+                                          'value': sns_message.get('NewStateReason', 'No details'),
+                                          'short': False
+                                      }
+                                  ]
+                              }
+                          ]
+                      }
+                      
+                      # Slackに送信
+                      response = http.request(
+                          'POST',
+                          webhook_url,
+                          body=json.dumps(slack_message),
+                          headers={'Content-Type': 'application/json'}
+                      )
+                      
+                      print(f"Slack notification sent: {response.status}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Notifications sent successfully')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error sending Slack notification: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Slack通知サブスクリプション
+  SlackSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: UseSlackNotification
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref AlertTopic
+      Endpoint: !GetAtt SlackNotificationFunction.Arn
+
+  SlackNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Condition: UseSlackNotification
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SlackNotificationFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  # メトリクス収集Lambda用ロール
+  MetricsCollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MetricsCollectorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # Slack通知Lambda用ロール
+  SlackNotificationRole:
+    Type: AWS::IAM::Role
+    Condition: UseSlackNotification
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # ダッシュボードURL
+  SystemOperationsDashboardURL:
+    Description: システム運用ダッシュボードURL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}-system-operations'
+    Export:
+      Name: !Sub '${AWS::StackName}-SystemDashboard-URL'
+
+  BusinessKPIDashboardURL:
+    Condition: IsStandardMonitoring
+    Description: ビジネスKPIダッシュボードURL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}-business-kpi'
+    Export:
+      Name: !Sub '${AWS::StackName}-BusinessDashboard-URL'
+
+  # Lambda関数ARN
+  BusinessMetricsCollectorArn:
+    Description: ビジネスメトリクス収集Lambda関数ARN
+    Value: !GetAtt BusinessMetricsCollector.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BusinessMetricsCollector'
+
+  ApplicationMetricsCollectorArn:
+    Description: アプリケーションメトリクス収集Lambda関数ARN
+    Value: !GetAtt ApplicationMetricsCollector.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationMetricsCollector'
+
+  # 通知トピック
+  AlertTopicArn:
+    Description: アラート通知SNSトピックARN
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopic'
+
+  # 監視設定情報
+  MonitoringConfiguration:
+    Description: 監視設定概要
+    Value: !Sub |
+      CloudWatch監視基盤:
+      - 監視レベル: ${MonitoringLevel}
+      - メトリクス収集間隔: ${MetricsCollectionInterval}秒
+      - システムダッシュボード: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}-system-operations
+      - アラート通知: ${AlertEmail}
+      - 異常検知: ${IsEnterpriseMonitoring}
+      - 管理コンソール: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}

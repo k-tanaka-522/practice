@@ -1,0 +1,1212 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  APM (Application Performance Monitoring) 実装 - 包括的アプリケーション監視
+  
+  このテンプレートは以下のリソースを作成します：
+  - X-Ray（分散トレーシング・サービスマップ）
+  - CloudWatch（メトリクス・ログ・ダッシュボード）
+  - Lambda関数（カスタムメトリクス・アラート処理）
+  - DynamoDB（パフォーマンスデータ・アラート履歴）
+  - SNS（アラート通知・エスカレーション）
+  - EventBridge（イベント駆動監視）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本監視）
+      - staging: ステージング環境（詳細監視）
+      - prod: 本番環境（フル監視・アラート）
+
+  ProjectName:
+    Type: String
+    Default: apm-implementation
+    Description: リソース命名に使用するプロジェクト名
+
+  # 監視対象設定
+  ApplicationName:
+    Type: String
+    Default: web-application
+    Description: 監視対象アプリケーション名
+
+  # トレーシング設定
+  XRayTracingConfig:
+    Type: String
+    Default: Active
+    AllowedValues: [Active, PassThrough]
+    Description: |
+      X-Rayトレーシング設定
+      - Active: アクティブトレーシング
+      - PassThrough: パッシブトレーシング
+
+  TracingSamplingRate:
+    Type: Number
+    Default: 0.1
+    MinValue: 0.01
+    MaxValue: 1.0
+    Description: |
+      トレーシングサンプリング率（0.01-1.0）
+      コストと詳細度のバランス
+
+  # メトリクス設定
+  MetricsRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [7, 14, 30, 90, 180, 365]
+    Description: |
+      メトリクス保持期間（日数）
+      長期トレンド分析用
+
+  CustomMetricsNamespace:
+    Type: String
+    Default: Custom/APM
+    Description: |
+      カスタムメトリクス名前空間
+      独自メトリクスの分類
+
+  # アラート設定
+  ErrorRateThreshold:
+    Type: Number
+    Default: 5.0
+    MinValue: 0.1
+    MaxValue: 50.0
+    Description: |
+      エラー率閾値（%）
+      アラート発生基準
+
+  ResponseTimeThreshold:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 10000
+    Description: |
+      レスポンス時間閾値（ミリ秒）
+      パフォーマンスアラート基準
+
+  MemoryUtilizationThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 50
+    MaxValue: 95
+    Description: |
+      メモリ使用率閾値（%）
+      リソースアラート基準
+
+  # 通知設定
+  PrimaryNotificationEmail:
+    Type: String
+    Default: ops-team@example.com
+    Description: |
+      プライマリ通知メールアドレス
+      重要アラートの通知先
+
+  SecondaryNotificationEmail:
+    Type: String
+    Default: dev-team@example.com
+    Description: |
+      セカンダリ通知メールアドレス
+      一般アラートの通知先
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ""
+    Description: |
+      Slack Webhook URL（任意）
+      チーム通知用
+
+  PagerDutyIntegrationKey:
+    Type: String
+    Default: ""
+    Description: |
+      PagerDuty統合キー（任意）
+      クリティカルアラート用
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # Slack通知を使用するか
+  UseSlackNotification: !Not [!Equals [!Ref SlackWebhookUrl, ""]]
+  
+  # PagerDuty統合を使用するか
+  UsePagerDutyIntegration: !Not [!Equals [!Ref PagerDutyIntegrationKey, ""]]
+
+Resources:
+  # ========================================
+  # DynamoDB テーブル（APMデータ管理）
+  # ========================================
+  # パフォーマンスメトリクステーブル
+  PerformanceMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-performance-metrics'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: metricId
+          AttributeType: S
+        - AttributeName: applicationName
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: metricType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metricId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ApplicationMetricsIndex
+          KeySchema:
+            - AttributeName: applicationName
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: MetricTypeIndex
+          KeySchema:
+            - AttributeName: metricType
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # アラート履歴テーブル
+  AlertHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-alert-history'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alertId
+          AttributeType: S
+        - AttributeName: alertType
+          AttributeType: S
+        - AttributeName: triggeredAt
+          AttributeType: S
+        - AttributeName: severity
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alertId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AlertTypeIndex
+          KeySchema:
+            - AttributeName: alertType
+              KeyType: HASH
+            - AttributeName: triggeredAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: SeverityIndex
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+            - AttributeName: triggeredAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # Lambda関数（APMデータ処理）
+  # ========================================
+  # カスタムメトリクス収集Lambda
+  CustomMetricsCollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-metrics-collector'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt APMExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      TracingConfig:
+        Mode: !Ref XRayTracingConfig
+      Environment:
+        Variables:
+          PERFORMANCE_METRICS_TABLE: !Ref PerformanceMetricsTable
+          CUSTOM_METRICS_NAMESPACE: !Ref CustomMetricsNamespace
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import time
+          import statistics
+          from datetime import datetime, timedelta
+          from aws_xray_sdk.core import xray_recorder
+          from aws_xray_sdk.core import patch_all
+          
+          # AWS SDK をX-Rayでパッチ
+          patch_all()
+          
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          @xray_recorder.capture('lambda_handler')
+          def lambda_handler(event, context):
+              """カスタムメトリクス収集メインハンドラー"""
+              
+              try:
+                  # イベントソースに応じた処理
+                  if 'source' in event and event['source'] == 'aws.events':
+                      # スケジュール実行
+                      return handle_scheduled_collection(event)
+                  elif 'Records' in event:
+                      # DynamoDB Streams / SQS トリガー
+                      return handle_stream_processing(event)
+                  else:
+                      # API呼び出し
+                      return handle_api_request(event)
+                      
+              except Exception as e:
+                  print(f"Error in metrics collector: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+          
+          @xray_recorder.capture('handle_scheduled_collection')
+          def handle_scheduled_collection(event):
+              """スケジュール収集の処理"""
+              
+              try:
+                  # アプリケーションメトリクス収集
+                  app_metrics = collect_application_metrics()
+                  
+                  # インフラストラクチャメトリクス収集
+                  infra_metrics = collect_infrastructure_metrics()
+                  
+                  # ビジネスメトリクス収集
+                  business_metrics = collect_business_metrics()
+                  
+                  # メトリクスをCloudWatchに送信
+                  send_metrics_to_cloudwatch(app_metrics + infra_metrics + business_metrics)
+                  
+                  # パフォーマンスデータをDynamoDBに保存
+                  save_performance_data(app_metrics + infra_metrics + business_metrics)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Metrics collection completed',
+                          'appMetrics': len(app_metrics),
+                          'infraMetrics': len(infra_metrics),
+                          'businessMetrics': len(business_metrics)
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in scheduled collection: {str(e)}")
+                  raise e
+          
+          @xray_recorder.capture('collect_application_metrics')
+          def collect_application_metrics():
+              """アプリケーションメトリクス収集"""
+              
+              metrics = []
+              timestamp = datetime.utcnow()
+              
+              # Lambda関数メトリクス
+              lambda_metrics = get_lambda_metrics()
+              metrics.extend(lambda_metrics)
+              
+              # API Gatewayメトリクス
+              api_metrics = get_api_gateway_metrics()
+              metrics.extend(api_metrics)
+              
+              # ECSメトリクス（該当する場合）
+              ecs_metrics = get_ecs_metrics()
+              metrics.extend(ecs_metrics)
+              
+              return metrics
+          
+          @xray_recorder.capture('collect_infrastructure_metrics')
+          def collect_infrastructure_metrics():
+              """インフラストラクチャメトリクス収集"""
+              
+              metrics = []
+              timestamp = datetime.utcnow()
+              
+              # EC2メトリクス
+              ec2_metrics = get_ec2_metrics()
+              metrics.extend(ec2_metrics)
+              
+              # RDSメトリクス
+              rds_metrics = get_rds_metrics()
+              metrics.extend(rds_metrics)
+              
+              # ElastiCacheメトリクス
+              cache_metrics = get_elasticache_metrics()
+              metrics.extend(cache_metrics)
+              
+              return metrics
+          
+          @xray_recorder.capture('collect_business_metrics')
+          def collect_business_metrics():
+              """ビジネスメトリクス収集"""
+              
+              metrics = []
+              timestamp = datetime.utcnow()
+              
+              # ダミービジネスメトリクス（実際の実装では、アプリケーションデータから取得）
+              metrics.append({
+                  'MetricName': 'ActiveUsers',
+                  'Value': 1000 + (hash(str(timestamp)) % 200),
+                  'Unit': 'Count',
+                  'Timestamp': timestamp,
+                  'MetricType': 'business'
+              })
+              
+              metrics.append({
+                  'MetricName': 'TransactionVolume',
+                  'Value': 500 + (hash(str(timestamp)) % 100),
+                  'Unit': 'Count',
+                  'Timestamp': timestamp,
+                  'MetricType': 'business'
+              })
+              
+              metrics.append({
+                  'MetricName': 'ConversionRate',
+                  'Value': 2.5 + (hash(str(timestamp)) % 100) / 1000,
+                  'Unit': 'Percent',
+                  'Timestamp': timestamp,
+                  'MetricType': 'business'
+              })
+              
+              return metrics
+          
+          def get_lambda_metrics():
+              """Lambda関数メトリクス取得"""
+              # 実装省略：CloudWatch APIを使用してメトリクス取得
+              return []
+          
+          def get_api_gateway_metrics():
+              """API Gatewayメトリクス取得"""
+              # 実装省略：CloudWatch APIを使用してメトリクス取得
+              return []
+          
+          def get_ecs_metrics():
+              """ECSメトリクス取得"""
+              # 実装省略：CloudWatch APIを使用してメトリクス取得
+              return []
+          
+          def get_ec2_metrics():
+              """EC2メトリクス取得"""
+              # 実装省略：CloudWatch APIを使用してメトリクス取得
+              return []
+          
+          def get_rds_metrics():
+              """RDSメトリクス取得"""
+              # 実装省略：CloudWatch APIを使用してメトリクス取得
+              return []
+          
+          def get_elasticache_metrics():
+              """ElastiCacheメトリクス取得"""
+              # 実装省略：CloudWatch APIを使用してメトリクス取得
+              return []
+          
+          @xray_recorder.capture('send_metrics_to_cloudwatch')
+          def send_metrics_to_cloudwatch(metrics):
+              """CloudWatchメトリクス送信"""
+              
+              namespace = os.environ['CUSTOM_METRICS_NAMESPACE']
+              application_name = os.environ['APPLICATION_NAME']
+              
+              # メトリクスを20個ずつバッチ送信
+              for i in range(0, len(metrics), 20):
+                  batch = metrics[i:i+20]
+                  metric_data = []
+                  
+                  for metric in batch:
+                      metric_data.append({
+                          'MetricName': metric['MetricName'],
+                          'Value': metric['Value'],
+                          'Unit': metric['Unit'],
+                          'Timestamp': metric['Timestamp'],
+                          'Dimensions': [
+                              {
+                                  'Name': 'Application',
+                                  'Value': application_name
+                              },
+                              {
+                                  'Name': 'Environment',
+                                  'Value': os.environ['ENVIRONMENT_NAME']
+                              }
+                          ]
+                      })
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace=namespace,
+                      MetricData=metric_data
+                  )
+          
+          @xray_recorder.capture('save_performance_data')
+          def save_performance_data(metrics):
+              """パフォーマンスデータ保存"""
+              
+              performance_table = dynamodb.Table(os.environ['PERFORMANCE_METRICS_TABLE'])
+              
+              for metric in metrics:
+                  metric_id = str(uuid.uuid4())
+                  ttl = int((datetime.utcnow() + timedelta(days=int(os.environ.get('METRICS_RETENTION_DAYS', '90')))).timestamp())
+                  
+                  performance_table.put_item(
+                      Item={
+                          'metricId': metric_id,
+                          'applicationName': os.environ['APPLICATION_NAME'],
+                          'metricType': metric.get('MetricType', 'application'),
+                          'metricName': metric['MetricName'],
+                          'value': metric['Value'],
+                          'unit': metric['Unit'],
+                          'timestamp': metric['Timestamp'].isoformat(),
+                          'ttl': ttl
+                      }
+                  )
+          
+          def handle_stream_processing(event):
+              """ストリーム処理"""
+              # 実装省略：DynamoDB Streams処理
+              return {'statusCode': 200, 'body': 'Stream processing completed'}
+          
+          def handle_api_request(event):
+              """API リクエスト処理"""
+              # 実装省略：API経由でのメトリクス収集
+              return {'statusCode': 200, 'body': 'API request processed'}
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # アラート処理Lambda
+  AlertProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-alert-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt APMExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      TracingConfig:
+        Mode: !Ref XRayTracingConfig
+      Environment:
+        Variables:
+          ALERT_HISTORY_TABLE: !Ref AlertHistoryTable
+          PRIMARY_NOTIFICATION_TOPIC: !Ref PrimaryNotificationTopic
+          SECONDARY_NOTIFICATION_TOPIC: !Ref SecondaryNotificationTopic
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          PAGERDUTY_INTEGRATION_KEY: !Ref PagerDutyIntegrationKey
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import urllib3
+          from datetime import datetime, timedelta
+          from aws_xray_sdk.core import xray_recorder
+          from aws_xray_sdk.core import patch_all
+          
+          # AWS SDK をX-Rayでパッチ
+          patch_all()
+          
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          http = urllib3.PoolManager()
+          
+          @xray_recorder.capture('lambda_handler')
+          def lambda_handler(event, context):
+              """アラート処理メインハンドラー"""
+              
+              try:
+                  for record in event['Records']:
+                      # SNSメッセージ処理
+                      sns_message = json.loads(record['Sns']['Message'])
+                      alarm_name = sns_message.get('AlarmName', 'Unknown')
+                      new_state = sns_message.get('NewStateValue', 'Unknown')
+                      
+                      # アラート情報を解析
+                      alert_info = parse_alert_info(sns_message)
+                      
+                      # アラート履歴を保存
+                      save_alert_history(alert_info)
+                      
+                      # 重要度に応じた通知処理
+                      process_alert_notifications(alert_info)
+                      
+                      # PagerDuty連携（クリティカルアラートのみ）
+                      if alert_info['severity'] == 'critical' and os.environ.get('PAGERDUTY_INTEGRATION_KEY'):
+                          send_pagerduty_alert(alert_info)
+                      
+                      # Slack通知
+                      if os.environ.get('SLACK_WEBHOOK_URL'):
+                          send_slack_notification(alert_info)
+                  
+                  return {'statusCode': 200, 'body': 'Alert processing completed'}
+                  
+              except Exception as e:
+                  print(f"Error in alert processor: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+          
+          @xray_recorder.capture('parse_alert_info')
+          def parse_alert_info(sns_message):
+              """アラート情報解析"""
+              
+              alarm_name = sns_message.get('AlarmName', 'Unknown')
+              new_state = sns_message.get('NewStateValue', 'Unknown')
+              reason = sns_message.get('NewStateReason', 'No reason provided')
+              
+              # 重要度判定
+              severity = determine_severity(alarm_name, new_state)
+              
+              # アラートタイプ判定
+              alert_type = determine_alert_type(alarm_name)
+              
+              return {
+                  'alertId': str(uuid.uuid4()),
+                  'alarmName': alarm_name,
+                  'state': new_state,
+                  'reason': reason,
+                  'severity': severity,
+                  'alertType': alert_type,
+                  'triggeredAt': datetime.utcnow().isoformat(),
+                  'applicationName': os.environ['APPLICATION_NAME'],
+                  'environment': os.environ['ENVIRONMENT_NAME']
+              }
+          
+          def determine_severity(alarm_name, state):
+              """重要度判定"""
+              
+              if state != 'ALARM':
+                  return 'info'
+              
+              # アラーム名に基づく重要度判定
+              if any(keyword in alarm_name.lower() for keyword in ['critical', 'fatal', 'down']):
+                  return 'critical'
+              elif any(keyword in alarm_name.lower() for keyword in ['error', 'failure', 'high']):
+                  return 'high'
+              elif any(keyword in alarm_name.lower() for keyword in ['warning', 'medium']):
+                  return 'medium'
+              else:
+                  return 'low'
+          
+          def determine_alert_type(alarm_name):
+              """アラートタイプ判定"""
+              
+              if 'error' in alarm_name.lower():
+                  return 'error'
+              elif 'performance' in alarm_name.lower() or 'response' in alarm_name.lower():
+                  return 'performance'
+              elif 'memory' in alarm_name.lower() or 'cpu' in alarm_name.lower():
+                  return 'resource'
+              elif 'availability' in alarm_name.lower() or 'health' in alarm_name.lower():
+                  return 'availability'
+              else:
+                  return 'general'
+          
+          @xray_recorder.capture('save_alert_history')
+          def save_alert_history(alert_info):
+              """アラート履歴保存"""
+              
+              alert_history_table = dynamodb.Table(os.environ['ALERT_HISTORY_TABLE'])
+              
+              # TTL設定（90日後）
+              ttl = int((datetime.utcnow() + timedelta(days=90)).timestamp())
+              
+              alert_history_table.put_item(
+                  Item={
+                      'alertId': alert_info['alertId'],
+                      'alarmName': alert_info['alarmName'],
+                      'state': alert_info['state'],
+                      'reason': alert_info['reason'],
+                      'severity': alert_info['severity'],
+                      'alertType': alert_info['alertType'],
+                      'triggeredAt': alert_info['triggeredAt'],
+                      'applicationName': alert_info['applicationName'],
+                      'environment': alert_info['environment'],
+                      'ttl': ttl
+                  }
+              )
+          
+          @xray_recorder.capture('process_alert_notifications')
+          def process_alert_notifications(alert_info):
+              """アラート通知処理"""
+              
+              severity = alert_info['severity']
+              
+              # 重要度に応じた通知先選択
+              if severity in ['critical', 'high']:
+                  topic_arn = os.environ['PRIMARY_NOTIFICATION_TOPIC']
+              else:
+                  topic_arn = os.environ['SECONDARY_NOTIFICATION_TOPIC']
+              
+              # SNS通知送信
+              message = {
+                  'alertId': alert_info['alertId'],
+                  'severity': severity,
+                  'alarmName': alert_info['alarmName'],
+                  'state': alert_info['state'],
+                  'reason': alert_info['reason'],
+                  'application': alert_info['applicationName'],
+                  'environment': alert_info['environment'],
+                  'triggeredAt': alert_info['triggeredAt']
+              }
+              
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Message=json.dumps(message, indent=2),
+                  Subject=f"[{severity.upper()}] {alert_info['alarmName']} - {alert_info['state']}"
+              )
+          
+          def send_pagerduty_alert(alert_info):
+              """PagerDuty アラート送信"""
+              
+              try:
+                  pagerduty_payload = {
+                      'routing_key': os.environ['PAGERDUTY_INTEGRATION_KEY'],
+                      'event_action': 'trigger',
+                      'payload': {
+                          'summary': f"{alert_info['alarmName']} - {alert_info['state']}",
+                          'source': alert_info['applicationName'],
+                          'severity': 'critical' if alert_info['severity'] == 'critical' else 'error',
+                          'component': alert_info['alertType'],
+                          'group': alert_info['environment'],
+                          'class': 'monitoring',
+                          'custom_details': {
+                              'alertId': alert_info['alertId'],
+                              'reason': alert_info['reason'],
+                              'triggeredAt': alert_info['triggeredAt']
+                          }
+                      }
+                  }
+                  
+                  response = http.request(
+                      'POST',
+                      'https://events.pagerduty.com/v2/enqueue',
+                      body=json.dumps(pagerduty_payload),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  print(f"PagerDuty alert sent: {response.status}")
+                  
+              except Exception as e:
+                  print(f"Error sending PagerDuty alert: {str(e)}")
+          
+          def send_slack_notification(alert_info):
+              """Slack通知送信"""
+              
+              try:
+                  # 重要度に応じた色設定
+                  color_map = {
+                      'critical': 'danger',
+                      'high': 'warning',
+                      'medium': 'warning',
+                      'low': 'good',
+                      'info': 'good'
+                  }
+                  
+                  # 重要度に応じた絵文字設定
+                  emoji_map = {
+                      'critical': ':rotating_light:',
+                      'high': ':warning:',
+                      'medium': ':yellow_circle:',
+                      'low': ':large_blue_circle:',
+                      'info': ':information_source:'
+                  }
+                  
+                  slack_message = {
+                      'text': f"{emoji_map.get(alert_info['severity'], ':bell:')} *APM Alert*",
+                      'attachments': [
+                          {
+                              'color': color_map.get(alert_info['severity'], 'good'),
+                              'fields': [
+                                  {
+                                      'title': 'Alarm',
+                                      'value': alert_info['alarmName'],
+                                      'short': True
+                                  },
+                                  {
+                                      'title': 'State',
+                                      'value': alert_info['state'],
+                                      'short': True
+                                  },
+                                  {
+                                      'title': 'Severity',
+                                      'value': alert_info['severity'].upper(),
+                                      'short': True
+                                  },
+                                  {
+                                      'title': 'Application',
+                                      'value': alert_info['applicationName'],
+                                      'short': True
+                                  },
+                                  {
+                                      'title': 'Reason',
+                                      'value': alert_info['reason'],
+                                      'short': False
+                                  }
+                              ],
+                              'footer': 'APM Monitoring',
+                              'ts': int(datetime.utcnow().timestamp())
+                          }
+                      ]
+                  }
+                  
+                  response = http.request(
+                      'POST',
+                      os.environ['SLACK_WEBHOOK_URL'],
+                      body=json.dumps(slack_message),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  
+                  print(f"Slack notification sent: {response.status}")
+                  
+              except Exception as e:
+                  print(f"Error sending Slack notification: {str(e)}")
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CloudWatch ダッシュボード
+  # ========================================
+  # APM総合ダッシュボード
+  APMDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${EnvironmentName}-apm-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "${CustomMetricsNamespace}", "ActiveUsers", "Application", "${ApplicationName}", "Environment", "${EnvironmentName}" ],
+                  [ ".", "TransactionVolume", ".", ".", ".", "." ],
+                  [ ".", "ConversionRate", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ビジネスメトリクス",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${CustomMetricsCollectorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda パフォーマンス",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/X-Ray", "TracesReceived", "ServiceName", "${ApplicationName}" ],
+                  [ ".", "TracesGenerated", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "X-Ray トレーシング",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ApplicationName}-api" ],
+                  [ ".", "Latency", ".", "." ],
+                  [ ".", "4XXError", ".", "." ],
+                  [ ".", "5XXError", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "API Gateway メトリクス",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${PerformanceMetricsTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "SuccessfulRequestLatency", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB メトリクス",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${CustomMetricsCollectorFunction}' | fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 50",
+                "region": "${AWS::Region}",
+                "title": "最新エラーログ",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ========================================
+  # CloudWatch アラーム
+  # ========================================
+  # エラー率アラーム
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-high-error-rate'
+      AlarmDescription: !Sub 'Application error rate is above ${ErrorRateThreshold}%'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CustomMetricsCollectorFunction
+      AlarmActions:
+        - !Ref PrimaryNotificationTopic
+      OKActions:
+        - !Ref SecondaryNotificationTopic
+
+  # レスポンス時間アラーム
+  HighResponseTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-high-response-time'
+      AlarmDescription: !Sub 'Application response time is above ${ResponseTimeThreshold}ms'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref ResponseTimeThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CustomMetricsCollectorFunction
+      AlarmActions:
+        - !Ref SecondaryNotificationTopic
+
+  # メモリ使用率アラーム
+  HighMemoryUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-high-memory-utilization'
+      AlarmDescription: !Sub 'Memory utilization is above ${MemoryUtilizationThreshold}%'
+      MetricName: MemoryUtilization
+      Namespace: CWAgent
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref MemoryUtilizationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecondaryNotificationTopic
+
+  # ========================================
+  # EventBridge ルール（スケジュール実行）
+  # ========================================
+  # メトリクス収集スケジュール
+  MetricsCollectionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-metrics-collection'
+      Description: APMメトリクス定期収集
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CustomMetricsCollectorFunction.Arn
+          Id: MetricsCollectionTarget
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda実行権限
+  MetricsCollectionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CustomMetricsCollectorFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MetricsCollectionSchedule.Arn
+
+  # ========================================
+  # SNS通知トピック
+  # ========================================
+  # プライマリ通知トピック（重要アラート）
+  PrimaryNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-primary-alerts'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} プライマリアラート'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # セカンダリ通知トピック（一般アラート）
+  SecondaryNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-secondary-alerts'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} セカンダリアラート'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # メール通知サブスクリプション
+  PrimaryEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref PrimaryNotificationTopic
+      Endpoint: !Ref PrimaryNotificationEmail
+
+  SecondaryEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref SecondaryNotificationTopic
+      Endpoint: !Ref SecondaryNotificationEmail
+
+  # アラート処理Lambda サブスクリプション
+  AlertProcessorSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref PrimaryNotificationTopic
+      Endpoint: !GetAtt AlertProcessorFunction.Arn
+
+  AlertProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AlertProcessorFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref PrimaryNotificationTopic
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  APMExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: APMExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt PerformanceMetricsTable.Arn
+                  - !Sub '${PerformanceMetricsTable.Arn}/index/*'
+                  - !GetAtt AlertHistoryTable.Arn
+                  - !Sub '${AlertHistoryTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref PrimaryNotificationTopic
+                  - !Ref SecondaryNotificationTopic
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # ダッシュボード情報
+  APMDashboardURL:
+    Description: APM ダッシュボードURL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${APMDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-APMDashboard-URL'
+
+  # Lambda関数
+  CustomMetricsCollectorFunctionArn:
+    Description: カスタムメトリクス収集Lambda関数ARN
+    Value: !GetAtt CustomMetricsCollectorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomMetricsCollectorFunction'
+
+  AlertProcessorFunctionArn:
+    Description: アラート処理Lambda関数ARN
+    Value: !GetAtt AlertProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertProcessorFunction'
+
+  # DynamoDB テーブル
+  PerformanceMetricsTableName:
+    Description: パフォーマンスメトリクステーブル名
+    Value: !Ref PerformanceMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceMetricsTable'
+
+  AlertHistoryTableName:
+    Description: アラート履歴テーブル名
+    Value: !Ref AlertHistoryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertHistoryTable'
+
+  # 通知トピック
+  PrimaryNotificationTopicArn:
+    Description: プライマリ通知SNSトピックARN
+    Value: !Ref PrimaryNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimaryNotificationTopic'
+
+  SecondaryNotificationTopicArn:
+    Description: セカンダリ通知SNSトピックARN
+    Value: !Ref SecondaryNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SecondaryNotificationTopic'
+
+  # X-Ray情報
+  XRayServiceMapURL:
+    Description: X-RayサービスマップURL
+    Value: !Sub 'https://console.aws.amazon.com/xray/home?region=${AWS::Region}#/service-map'
+
+  # 使用ガイド
+  APMUsageGuide:
+    Description: APM使用ガイド
+    Value: !Sub |
+      APM (Application Performance Monitoring) 使用ガイド:
+      
+      1. ダッシュボード確認:
+      https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${APMDashboard}
+      
+      2. X-Rayトレーシング:
+      https://console.aws.amazon.com/xray/home?region=${AWS::Region}#/service-map
+      
+      3. アラート履歴確認:
+      aws dynamodb scan --table-name ${AlertHistoryTable}
+      
+      4. 手動メトリクス収集:
+      aws lambda invoke --function-name ${CustomMetricsCollectorFunction} response.json
+
+  # 設定概要
+  APMConfiguration:
+    Description: APM設定概要
+    Value: !Sub |
+      APM Configuration:
+      - Application: ${ApplicationName}
+      - X-Ray Tracing: ${XRayTracingConfig}
+      - Sampling Rate: ${TracingSamplingRate}
+      - Custom Namespace: ${CustomMetricsNamespace}
+      - Error Rate Threshold: ${ErrorRateThreshold}%
+      - Response Time Threshold: ${ResponseTimeThreshold}ms
+      - Memory Threshold: ${MemoryUtilizationThreshold}%
+      - Primary Alerts: ${PrimaryNotificationEmail}
+      - Secondary Alerts: ${SecondaryNotificationEmail}

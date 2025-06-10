@@ -1,0 +1,720 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Amazon Bedrock セットアップ - AI/ML基盤構築
+  
+  このテンプレートは以下のリソースを作成します：
+  - Bedrock モデルアクセス設定
+  - IAMロール・ポリシー（Bedrock利用権限）
+  - Lambda関数（Bedrock API呼び出し）
+  - S3バケット（モデル出力・ログ保存）
+  - CloudWatch監視・ログ設定
+  - セキュリティ設定（暗号化・アクセス制御）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本モデル）
+      - staging: ステージング環境（複数モデル）
+      - prod: 本番環境（全モデル・高セキュリティ）
+
+  ProjectName:
+    Type: String
+    Default: bedrock-setup
+    Description: リソース命名に使用するプロジェクト名
+
+  # Bedrockモデル設定
+  EnableClaude3:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Claude 3モデルへのアクセスを有効化
+      高性能なテキスト生成・会話AI
+
+  EnableTitanText:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Amazon Titan Textモデルへのアクセスを有効化
+      テキスト生成・要約・分類
+
+  EnableTitanEmbeddings:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Amazon Titan Embeddingsモデルへのアクセスを有効化
+      ベクトル検索・セマンティック検索
+
+  EnableStableDiffusion:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Stable Diffusion XLモデルへのアクセスを有効化
+      画像生成（高コスト注意）
+
+  # セキュリティ設定
+  EnableLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Bedrock API呼び出しログの有効化
+      セキュリティ監査・使用量分析用
+
+  DataResidencyRegion:
+    Type: String
+    Default: us-east-1
+    AllowedValues: [us-east-1, us-west-2, eu-west-1, ap-northeast-1]
+    Description: |
+      データ保管リージョン
+      コンプライアンス要件に応じて選択
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # 各モデルの有効化
+  UseClaude3: !Equals [!Ref EnableClaude3, 'true']
+  UseTitanText: !Equals [!Ref EnableTitanText, 'true']
+  UseTitanEmbeddings: !Equals [!Ref EnableTitanEmbeddings, 'true']
+  UseStableDiffusion: !Equals [!Ref EnableStableDiffusion, 'true']
+  
+  # ログ機能の有効化
+  LoggingEnabled: !Equals [!Ref EnableLogging, 'true']
+
+Resources:
+  # ========================================
+  # S3バケット（モデル出力・ログ保存）
+  # ========================================
+  # Bedrock出力保存バケット
+  BedrockOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-bedrock-outputs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref BedrockKMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+          - Id: DeleteOldOutputs
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 365, 90]
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: BedrockOutputs
+
+  # Bedrockログ保存バケット
+  BedrockLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: LoggingEnabled
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-bedrock-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref BedrockKMSKey
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2555, 90]  # 7年 or 90日
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: BedrockLogs
+
+  # ========================================
+  # KMS暗号化キー
+  # ========================================
+  BedrockKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${ProjectName} ${EnvironmentName} Bedrock暗号化キー'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Bedrock Service
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:CreateGrant
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  BedrockKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${EnvironmentName}-bedrock'
+      TargetKeyId: !Ref BedrockKMSKey
+
+  # ========================================
+  # IAMロール・ポリシー
+  # ========================================
+  # Bedrock実行ロール
+  BedrockExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-bedrock-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+                - bedrock.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ProjectName}-${EnvironmentName}'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: 
+                  - !If 
+                    - UseClaude3
+                    - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-*'
+                    - !Ref AWS::NoValue
+                  - !If 
+                    - UseTitanText
+                    - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-text-*'
+                    - !Ref AWS::NoValue
+                  - !If 
+                    - UseTitanEmbeddings
+                    - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-*'
+                    - !Ref AWS::NoValue
+                  - !If 
+                    - UseStableDiffusion
+                    - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/stability.stable-diffusion-xl-v*'
+                    - !Ref AWS::NoValue
+              - Effect: Allow
+                Action:
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListFoundationModels
+                Resource: '*'
+        - PolicyName: BedrockS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${BedrockOutputBucket}/*'
+                  - !GetAtt BedrockOutputBucket.Arn
+                  - !If 
+                    - LoggingEnabled
+                    - !Sub '${BedrockLogsBucket}/*'
+                    - !Ref AWS::NoValue
+                  - !If 
+                    - LoggingEnabled
+                    - !GetAtt BedrockLogsBucket.Arn
+                    - !Ref AWS::NoValue
+        - PolicyName: BedrockKMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:CreateGrant
+                Resource: !GetAtt BedrockKMSKey.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ユーザー向けBedrockアクセスポリシー
+  BedrockUserPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${EnvironmentName}-bedrock-user-policy'
+      Description: Bedrockサービス利用のためのユーザーポリシー
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:GetFoundationModel
+              - bedrock:ListFoundationModels
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource: !GetAtt BedrockExecutionRole.Arn
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Sub '${ProjectName}-${EnvironmentName}'
+
+  # ========================================
+  # Lambda関数（Bedrock API テスト）
+  # ========================================
+  BedrockTestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-bedrock-test'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref BedrockOutputBucket
+          KMS_KEY_ID: !Ref BedrockKMSKey
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+          ENABLE_CLAUDE3: !Ref EnableClaude3
+          ENABLE_TITAN_TEXT: !Ref EnableTitanText
+          ENABLE_TITAN_EMBEDDINGS: !Ref EnableTitanEmbeddings
+          ENABLE_STABLE_DIFFUSION: !Ref EnableStableDiffusion
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          import base64
+          
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """Bedrockモデルのテスト実行"""
+              
+              try:
+                  results = {}
+                  output_bucket = os.environ['OUTPUT_BUCKET']
+                  
+                  # Claude 3テスト
+                  if os.environ.get('ENABLE_CLAUDE3') == 'true':
+                      try:
+                          claude_result = test_claude3()
+                          results['claude3'] = claude_result
+                          
+                          # 結果をS3に保存
+                          save_to_s3(output_bucket, 'claude3', claude_result)
+                          
+                      except Exception as e:
+                          results['claude3'] = {'error': str(e)}
+                  
+                  # Titan Textテスト
+                  if os.environ.get('ENABLE_TITAN_TEXT') == 'true':
+                      try:
+                          titan_result = test_titan_text()
+                          results['titan_text'] = titan_result
+                          save_to_s3(output_bucket, 'titan_text', titan_result)
+                          
+                      except Exception as e:
+                          results['titan_text'] = {'error': str(e)}
+                  
+                  # Titan Embeddingsテスト
+                  if os.environ.get('ENABLE_TITAN_EMBEDDINGS') == 'true':
+                      try:
+                          embedding_result = test_titan_embeddings()
+                          results['titan_embeddings'] = {
+                              'vector_dimension': len(embedding_result.get('embedding', [])),
+                              'status': 'success'
+                          }
+                          
+                      except Exception as e:
+                          results['titan_embeddings'] = {'error': str(e)}
+                  
+                  # Stable Diffusionテスト（有効な場合のみ）
+                  if os.environ.get('ENABLE_STABLE_DIFFUSION') == 'true':
+                      try:
+                          image_result = test_stable_diffusion()
+                          results['stable_diffusion'] = image_result
+                          
+                      except Exception as e:
+                          results['stable_diffusion'] = {'error': str(e)}
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Bedrock models tested successfully',
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'results': results
+                      }, indent=2)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error testing Bedrock models: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'timestamp': datetime.utcnow().isoformat()
+                      })
+                  }
+          
+          def test_claude3():
+              """Claude 3モデルのテスト"""
+              request_body = {
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 100,
+                  "messages": [
+                      {
+                          "role": "user",
+                          "content": "Hello! Please introduce yourself and explain what you can do."
+                      }
+                  ]
+              }
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              return {
+                  'model': 'claude-3-sonnet',
+                  'response': response_body.get('content', [{}])[0].get('text', ''),
+                  'usage': response_body.get('usage', {}),
+                  'status': 'success'
+              }
+          
+          def test_titan_text():
+              """Titan Textモデルのテスト"""
+              request_body = {
+                  "inputText": "Explain the benefits of cloud computing in one paragraph.",
+                  "textGenerationConfig": {
+                      "maxTokenCount": 100,
+                      "temperature": 0.7,
+                      "topP": 0.9
+                  }
+              }
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId="amazon.titan-text-express-v1",
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              return {
+                  'model': 'titan-text-express-v1',
+                  'response': response_body.get('results', [{}])[0].get('outputText', ''),
+                  'status': 'success'
+              }
+          
+          def test_titan_embeddings():
+              """Titan Embeddingsモデルのテスト"""
+              request_body = {
+                  "inputText": "This is a test sentence for embedding generation."
+              }
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId="amazon.titan-embed-text-v1",
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              return {
+                  'model': 'titan-embed-text-v1',
+                  'embedding': response_body.get('embedding', []),
+                  'status': 'success'
+              }
+          
+          def test_stable_diffusion():
+              """Stable Diffusionモデルのテスト"""
+              request_body = {
+                  "text_prompts": [
+                      {
+                          "text": "A beautiful sunset over mountains, digital art style",
+                          "weight": 1.0
+                      }
+                  ],
+                  "cfg_scale": 7,
+                  "seed": 42,
+                  "steps": 30,
+                  "width": 512,
+                  "height": 512
+              }
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId="stability.stable-diffusion-xl-v1:0",
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              
+              # 画像をS3に保存
+              if 'artifacts' in response_body and response_body['artifacts']:
+                  image_data = response_body['artifacts'][0]['base64']
+                  image_key = f"stable-diffusion/test-{uuid.uuid4()}.png"
+                  
+                  s3.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=image_key,
+                      Body=base64.b64decode(image_data),
+                      ContentType='image/png'
+                  )
+                  
+                  return {
+                      'model': 'stable-diffusion-xl-v1',
+                      'image_location': f"s3://{os.environ['OUTPUT_BUCKET']}/{image_key}",
+                      'status': 'success'
+                  }
+              
+              return {'model': 'stable-diffusion-xl-v1', 'status': 'no_output'}
+          
+          def save_to_s3(bucket, model_name, data):
+              """結果をS3に保存"""
+              key = f"{model_name}/test-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.json"
+              s3.put_object(
+                  Bucket=bucket,
+                  Key=key,
+                  Body=json.dumps(data, indent=2),
+                  ContentType='application/json'
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CloudWatch監視・ログ
+  # ========================================
+  # Bedrockログ用CloudWatchロググループ
+  BedrockLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: LoggingEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock/${ProjectName}-${EnvironmentName}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # Lambda関数ログ用CloudWatchロググループ
+  BedrockTestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-bedrock-test'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # Bedrockモデル呼び出し回数監視
+  BedrockInvocationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-bedrock-high-usage'
+      AlarmDescription: Bedrockモデル呼び出し回数が多い
+      MetricName: InvocationsCount
+      Namespace: AWS/Bedrock
+      Statistic: Sum
+      Period: 3600  # 1時間
+      EvaluationPeriods: 1
+      Threshold: !If [IsProduction, 10000, 1000]
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BedrockNotificationTopic
+
+  # Bedrockエラー監視
+  BedrockErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-bedrock-errors'
+      AlarmDescription: Bedrockモデル呼び出しエラーが発生
+      MetricName: InvocationClientErrors
+      Namespace: AWS/Bedrock
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BedrockNotificationTopic
+
+  # ========================================
+  # SNS通知トピック
+  # ========================================
+  BedrockNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-bedrock-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} Bedrock通知'
+      KmsMasterKeyId: !Ref BedrockKMSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # IAMロール・ポリシー
+  BedrockExecutionRoleArn:
+    Description: Bedrock実行用IAMロールARN
+    Value: !GetAtt BedrockExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockExecutionRole'
+
+  BedrockUserPolicyArn:
+    Description: Bedrockユーザーポリシー ARN
+    Value: !Ref BedrockUserPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockUserPolicy'
+
+  # S3バケット
+  BedrockOutputBucketName:
+    Description: Bedrock出力保存S3バケット名
+    Value: !Ref BedrockOutputBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockOutputBucket'
+
+  BedrockLogsBucketName:
+    Condition: LoggingEnabled
+    Description: Bedrockログ保存S3バケット名
+    Value: !Ref BedrockLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockLogsBucket'
+
+  # KMS暗号化
+  BedrockKMSKeyId:
+    Description: Bedrock用KMS暗号化キーID
+    Value: !Ref BedrockKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockKMSKey'
+
+  BedrockKMSKeyArn:
+    Description: Bedrock用KMS暗号化キーARN
+    Value: !GetAtt BedrockKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockKMSKeyArn'
+
+  # Lambda関数
+  BedrockTestFunctionArn:
+    Description: Bedrockテスト用Lambda関数ARN
+    Value: !GetAtt BedrockTestFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockTestFunction'
+
+  # 通知トピック
+  BedrockNotificationTopicArn:
+    Description: Bedrock通知用SNSトピックARN
+    Value: !Ref BedrockNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockNotificationTopic'
+
+  # 利用可能モデル情報
+  AvailableModels:
+    Description: 利用可能なBedrockモデル
+    Value: !Sub |
+      利用可能モデル:
+      - Claude 3: ${EnableClaude3} (高性能チャット・テキスト生成)
+      - Titan Text: ${EnableTitanText} (テキスト生成・要約)
+      - Titan Embeddings: ${EnableTitanEmbeddings} (ベクトル検索)
+      - Stable Diffusion: ${EnableStableDiffusion} (画像生成)
+
+  # Bedrock設定概要
+  BedrockConfiguration:
+    Description: Bedrock設定概要
+    Value: !Sub |
+      Amazon Bedrock設定:
+      - 環境: ${EnvironmentName}
+      - データ保管: ${DataResidencyRegion}
+      - ログ: ${EnableLogging}
+      - 出力バケット: s3://${BedrockOutputBucket}/
+      - 実行ロール: ${BedrockExecutionRole}
+      - テスト関数: ${BedrockTestFunction}
+      - 管理コンソール: https://console.aws.amazon.com/bedrock/home?region=${AWS::Region}
+
+  # 使用開始ガイド
+  GettingStarted:
+    Description: Bedrock使用開始ガイド
+    Value: !Sub |
+      Bedrock使用開始手順:
+      1. モデルアクセス許可: https://console.aws.amazon.com/bedrock/home?region=${AWS::Region}#/modelaccess
+      2. テスト実行: aws lambda invoke --function-name ${BedrockTestFunction} response.json
+      3. 出力確認: aws s3 ls s3://${BedrockOutputBucket}/
+      4. IAMポリシー適用: ${BedrockUserPolicy}
+      5. サンプルコード: https://docs.aws.amazon.com/bedrock/latest/userguide/

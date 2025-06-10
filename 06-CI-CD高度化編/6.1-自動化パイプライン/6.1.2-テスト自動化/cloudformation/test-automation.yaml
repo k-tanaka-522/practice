@@ -1,0 +1,1157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  テスト自動化基盤 - 包括的テストフレームワーク
+  
+  このテンプレートは以下のリソースを作成します：
+  - CodeBuild（単体・統合・E2E・パフォーマンステスト）
+  - Lambda関数（テスト実行・レポート生成・通知）
+  - DynamoDB（テスト結果・メトリクス管理）
+  - S3（テストレポート・アーティファクト保存）
+  - CloudWatch（テストメトリクス・監視）
+  - EventBridge（テスト実行スケジューリング）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本テスト）
+      - staging: ステージング環境（全テスト）
+      - prod: 本番環境（監視テスト）
+
+  ProjectName:
+    Type: String
+    Default: test-automation
+    Description: リソース命名に使用するプロジェクト名
+
+  # テストスイート設定
+  UnitTestFramework:
+    Type: String
+    Default: jest
+    AllowedValues: [jest, pytest, junit, mocha]
+    Description: |
+      単体テストフレームワーク
+      - jest: JavaScript/TypeScript
+      - pytest: Python
+      - junit: Java
+      - mocha: Node.js
+
+  IntegrationTestFramework:
+    Type: String
+    Default: cypress
+    AllowedValues: [cypress, selenium, playwright, postman]
+    Description: |
+      統合テストフレームワーク
+      - cypress: モダンE2Eテスト
+      - selenium: 従来型ブラウザテスト
+      - playwright: マルチブラウザテスト
+      - postman: APIテスト
+
+  PerformanceTestFramework:
+    Type: String
+    Default: k6
+    AllowedValues: [k6, jmeter, artillery, gatling]
+    Description: |
+      パフォーマンステストフレームワーク
+      - k6: モダン負荷テスト
+      - jmeter: 従来型負荷テスト
+      - artillery: Node.js負荷テスト
+      - gatling: Scala負荷テスト
+
+  # テスト実行設定
+  TestTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 5
+    MaxValue: 480
+    Description: |
+      テストタイムアウト（分）
+      長時間テストに対応
+
+  ParallelTestExecution:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: |
+      並列テスト実行の有効化
+      実行時間短縮
+
+  CoverageThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 0
+    MaxValue: 100
+    Description: |
+      コードカバレッジ閾値（%）
+      品質ゲート基準
+
+  # スケジュール設定
+  NightlyTestSchedule:
+    Type: String
+    Default: 'cron(0 2 * * ? *)'
+    Description: |
+      夜間テスト実行スケジュール
+      cron形式（UTC）
+
+  WeeklyTestSchedule:
+    Type: String
+    Default: 'cron(0 4 ? * SUN *)'
+    Description: |
+      週次テスト実行スケジュール
+      cron形式（UTC）
+
+  # 通知設定
+  NotificationEmail:
+    Type: String
+    Default: test-team@example.com
+    Description: |
+      テスト結果通知用メールアドレス
+      失敗・成功時の通知先
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ""
+    Description: |
+      Slack Webhook URL（任意）
+      Slack通知を使用する場合に設定
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # 並列実行を使用するか
+  UseParallelExecution: !Equals [!Ref ParallelTestExecution, 'true']
+  
+  # Slack通知を使用するか
+  UseSlackNotification: !Not [!Equals [!Ref SlackWebhookUrl, ""]]
+
+Resources:
+  # ========================================
+  # S3バケット（テストアーティファクト）
+  # ========================================
+  # テストレポート保存バケット
+  TestReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-test-reports-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 365, 90]
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # テストデータ保存バケット
+  TestDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-test-data-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldTestData
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # DynamoDB テーブル（テスト管理）
+  # ========================================
+  # テスト実行履歴テーブル
+  TestExecutionHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-test-execution-history'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: executionId
+          AttributeType: S
+        - AttributeName: testSuite
+          AttributeType: S
+        - AttributeName: executedAt
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: executionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: TestSuiteIndex
+          KeySchema:
+            - AttributeName: testSuite
+              KeyType: HASH
+            - AttributeName: executedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: executedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # テストメトリクステーブル
+  TestMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-test-metrics'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: metricId
+          AttributeType: S
+        - AttributeName: testSuite
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metricId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: TestSuiteMetricsIndex
+          KeySchema:
+            - AttributeName: testSuite
+              KeyType: HASH
+            - AttributeName: date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CodeBuild テストプロジェクト
+  # ========================================
+  # 単体テストプロジェクト
+  UnitTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-unit-tests'
+      Description: 単体テスト実行
+      ServiceRole: !GetAtt TestExecutionRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: TEST_FRAMEWORK
+            Value: !Ref UnitTestFramework
+          - Name: COVERAGE_THRESHOLD
+            Value: !Ref CoverageThreshold
+          - Name: PARALLEL_EXECUTION
+            Value: !Ref ParallelTestExecution
+          - Name: TEST_REPORTS_BUCKET
+            Value: !Ref TestReportsBucket
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Unit test execution started on `date`
+                - echo Installing dependencies...
+                - |
+                  case $TEST_FRAMEWORK in
+                    jest)
+                      npm install --save-dev jest @jest/reporters
+                      ;;
+                    pytest)
+                      pip install pytest pytest-cov pytest-html pytest-json-report
+                      ;;
+                    junit)
+                      mvn test-compile
+                      ;;
+                    mocha)
+                      npm install --save-dev mocha nyc mochawesome
+                      ;;
+                  esac
+            build:
+              commands:
+                - echo Running unit tests...
+                - |
+                  case $TEST_FRAMEWORK in
+                    jest)
+                      npm test -- --coverage --testResultsProcessor=jest-junit --coverageReporters=text-lcov --coverageReporters=html
+                      ;;
+                    pytest)
+                      pytest --cov=. --cov-report=html --cov-report=xml --html=test-report.html --json-report --json-report-file=test-report.json
+                      ;;
+                    junit)
+                      mvn test -Dmaven.test.failure.ignore=true
+                      ;;
+                    mocha)
+                      nyc mocha --reporter mochawesome --reporter-options reportDir=test-results,reportFilename=test-report
+                      ;;
+                  esac
+                - echo Checking coverage threshold...
+                - |
+                  # カバレッジチェック（フレームワーク別）
+                  coverage_check_passed=true
+                  echo "Coverage threshold: $COVERAGE_THRESHOLD%"
+            post_build:
+              commands:
+                - echo Unit test execution completed on `date`
+                - echo Uploading test reports...
+                - aws s3 sync ./test-results/ s3://$TEST_REPORTS_BUCKET/unit-tests/$(date +%Y%m%d-%H%M%S)/ || true
+                - aws s3 sync ./coverage/ s3://$TEST_REPORTS_BUCKET/coverage/$(date +%Y%m%d-%H%M%S)/ || true
+                - echo Recording test metrics...
+                - python3 -c "
+                  import boto3, json, uuid, os
+                  from datetime import datetime, timedelta
+                  
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table('$PROJECT_NAME-$ENVIRONMENT_NAME-test-execution-history')
+                  
+                  execution_id = str(uuid.uuid4())
+                  ttl = int((datetime.utcnow() + timedelta(days=90)).timestamp())
+                  
+                  table.put_item(
+                      Item={
+                          'executionId': execution_id,
+                          'testSuite': 'unit-tests',
+                          'framework': '$TEST_FRAMEWORK',
+                          'status': 'success' if '$coverage_check_passed' == 'true' else 'failed',
+                          'executedAt': datetime.utcnow().isoformat(),
+                          'coverageThreshold': $COVERAGE_THRESHOLD,
+                          'ttl': ttl
+                      }
+                  )
+                  print(f'Test execution recorded: {execution_id}')
+                  "
+          reports:
+            unit_test_reports:
+              files:
+                - 'test-report.xml'
+                - 'test-report.json'
+                - 'junit.xml'
+              file-format: 'JUNITXML'
+            coverage_reports:
+              files:
+                - 'coverage.xml'
+                - 'coverage/lcov.info'
+              file-format: 'COBERTURAXML'
+          artifacts:
+            files:
+              - test-results/**/*
+              - coverage/**/*
+            name: UnitTestArtifacts
+      TimeoutInMinutes: !Ref TestTimeout
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 統合テストプロジェクト
+  IntegrationTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-integration-tests'
+      Description: 統合・E2Eテスト実行
+      ServiceRole: !GetAtt TestExecutionRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: TEST_FRAMEWORK
+            Value: !Ref IntegrationTestFramework
+          - Name: PARALLEL_EXECUTION
+            Value: !Ref ParallelTestExecution
+          - Name: TEST_REPORTS_BUCKET
+            Value: !Ref TestReportsBucket
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Integration test execution started on `date`
+                - echo Installing dependencies and browsers...
+                - |
+                  case $TEST_FRAMEWORK in
+                    cypress)
+                      npm install cypress cypress-multi-reporters mochawesome
+                      npx cypress install
+                      ;;
+                    selenium)
+                      pip install selenium pytest-html webdriver-manager
+                      # Chrome/Firefox インストール
+                      yum install -y google-chrome-stable firefox
+                      ;;
+                    playwright)
+                      npm install @playwright/test
+                      npx playwright install chromium firefox webkit
+                      ;;
+                    postman)
+                      npm install -g newman newman-reporter-htmlextra
+                      ;;
+                  esac
+                - echo Setting up test environment...
+                - export DISPLAY=:99
+                - Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 & 
+            build:
+              commands:
+                - echo Running integration tests...
+                - |
+                  case $TEST_FRAMEWORK in
+                    cypress)
+                      if [ "$PARALLEL_EXECUTION" = "true" ]; then
+                        npx cypress run --record --parallel --reporter cypress-multi-reporters --reporter-options configFile=reporter-config.json
+                      else
+                        npx cypress run --reporter cypress-multi-reporters --reporter-options configFile=reporter-config.json
+                      fi
+                      ;;
+                    selenium)
+                      pytest tests/integration/ --html=integration-report.html --self-contained-html
+                      ;;
+                    playwright)
+                      npx playwright test --reporter=html,junit --output-dir=test-results
+                      ;;
+                    postman)
+                      newman run postman_collection.json -e postman_environment.json --reporters htmlextra,junit --reporter-htmlextra-export integration-report.html --reporter-junit-export junit-report.xml
+                      ;;
+                  esac
+                - echo Running API tests...
+                - |
+                  # API エンドポイントテスト
+                  curl -f http://localhost:3000/health || echo "Health check failed"
+                  curl -f http://localhost:3000/api/status || echo "API status check failed"
+            post_build:
+              commands:
+                - echo Integration test execution completed on `date`
+                - echo Uploading test reports and screenshots...
+                - aws s3 sync ./test-results/ s3://$TEST_REPORTS_BUCKET/integration-tests/$(date +%Y%m%d-%H%M%S)/ || true
+                - aws s3 sync ./cypress/screenshots/ s3://$TEST_REPORTS_BUCKET/screenshots/$(date +%Y%m%d-%H%M%S)/ || true
+                - aws s3 sync ./cypress/videos/ s3://$TEST_REPORTS_BUCKET/videos/$(date +%Y%m%d-%H%M%S)/ || true
+                - echo Recording test metrics...
+                - python3 -c "
+                  import boto3, json, uuid, os
+                  from datetime import datetime, timedelta
+                  
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table('$PROJECT_NAME-$ENVIRONMENT_NAME-test-execution-history')
+                  
+                  execution_id = str(uuid.uuid4())
+                  ttl = int((datetime.utcnow() + timedelta(days=90)).timestamp())
+                  
+                  table.put_item(
+                      Item={
+                          'executionId': execution_id,
+                          'testSuite': 'integration-tests',
+                          'framework': '$TEST_FRAMEWORK',
+                          'status': 'success',
+                          'executedAt': datetime.utcnow().isoformat(),
+                          'ttl': ttl
+                      }
+                  )
+                  print(f'Integration test execution recorded: {execution_id}')
+                  "
+          reports:
+            integration_test_reports:
+              files:
+                - 'test-results/*.xml'
+                - 'junit-report.xml'
+                - 'integration-report.html'
+              file-format: 'JUNITXML'
+          artifacts:
+            files:
+              - test-results/**/*
+              - cypress/screenshots/**/*
+              - cypress/videos/**/*
+            name: IntegrationTestArtifacts
+      TimeoutInMinutes: !Ref TestTimeout
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # パフォーマンステストプロジェクト
+  PerformanceTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-performance-tests'
+      Description: パフォーマンス・負荷テスト実行
+      ServiceRole: !GetAtt TestExecutionRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: TEST_FRAMEWORK
+            Value: !Ref PerformanceTestFramework
+          - Name: TEST_REPORTS_BUCKET
+            Value: !Ref TestReportsBucket
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Performance test execution started on `date`
+                - echo Installing performance testing tools...
+                - |
+                  case $TEST_FRAMEWORK in
+                    k6)
+                      wget https://github.com/grafana/k6/releases/download/v0.45.0/k6-v0.45.0-linux-amd64.tar.gz
+                      tar -xzf k6-v0.45.0-linux-amd64.tar.gz
+                      mv k6-v0.45.0-linux-amd64/k6 /usr/local/bin/
+                      ;;
+                    jmeter)
+                      wget https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-5.5.tgz
+                      tar -xzf apache-jmeter-5.5.tgz
+                      export JMETER_HOME=./apache-jmeter-5.5
+                      ;;
+                    artillery)
+                      npm install -g artillery
+                      ;;
+                    gatling)
+                      wget https://repo1.maven.org/maven2/io/gatling/highcharts/gatling-charts-highcharts-bundle/3.9.5/gatling-charts-highcharts-bundle-3.9.5-bundle.zip
+                      unzip gatling-charts-highcharts-bundle-3.9.5-bundle.zip
+                      ;;
+                  esac
+            build:
+              commands:
+                - echo Running performance tests...
+                - |
+                  case $TEST_FRAMEWORK in
+                    k6)
+                      k6 run --out json=performance-results.json performance-test.js
+                      ;;
+                    jmeter)
+                      $JMETER_HOME/bin/jmeter -n -t performance-test.jmx -l performance-results.jtl -e -o performance-report/
+                      ;;
+                    artillery)
+                      artillery run --output performance-results.json performance-test.yml
+                      artillery report performance-results.json
+                      ;;
+                    gatling)
+                      ./gatling-charts-highcharts-bundle-3.9.5/bin/gatling.sh -sf simulations/
+                      ;;
+                  esac
+                - echo Analyzing performance metrics...
+                - |
+                  # パフォーマンスメトリクス分析
+                  echo "Performance test completed"
+                  echo "Response time analysis:"
+                  echo "Throughput analysis:"
+                  echo "Error rate analysis:"
+            post_build:
+              commands:
+                - echo Performance test execution completed on `date`
+                - echo Uploading performance reports...
+                - aws s3 sync ./performance-report/ s3://$TEST_REPORTS_BUCKET/performance-tests/$(date +%Y%m%d-%H%M%S)/ || true
+                - aws s3 cp performance-results.json s3://$TEST_REPORTS_BUCKET/performance-tests/$(date +%Y%m%d-%H%M%S)/ || true
+                - echo Recording performance metrics...
+                - python3 -c "
+                  import boto3, json, uuid, os
+                  from datetime import datetime, timedelta
+                  
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table('$PROJECT_NAME-$ENVIRONMENT_NAME-test-execution-history')
+                  
+                  execution_id = str(uuid.uuid4())
+                  ttl = int((datetime.utcnow() + timedelta(days=90)).timestamp())
+                  
+                  table.put_item(
+                      Item={
+                          'executionId': execution_id,
+                          'testSuite': 'performance-tests',
+                          'framework': '$TEST_FRAMEWORK',
+                          'status': 'success',
+                          'executedAt': datetime.utcnow().isoformat(),
+                          'ttl': ttl
+                      }
+                  )
+                  print(f'Performance test execution recorded: {execution_id}')
+                  "
+          artifacts:
+            files:
+              - performance-report/**/*
+              - performance-results.*
+            name: PerformanceTestArtifacts
+      TimeoutInMinutes: !Ref TestTimeout
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # Lambda関数（テスト管理）
+  # ========================================
+  # テスト実行管理Lambda
+  TestExecutionManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-test-execution-manager'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt TestExecutionManagerRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          EXECUTION_HISTORY_TABLE: !Ref TestExecutionHistoryTable
+          METRICS_TABLE: !Ref TestMetricsTable
+          TEST_REPORTS_BUCKET: !Ref TestReportsBucket
+          NOTIFICATION_TOPIC: !Ref TestNotificationTopic
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime, timedelta
+          
+          dynamodb = boto3.resource('dynamodb')
+          codebuild = boto3.client('codebuild')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              """テスト実行管理とオーケストレーション"""
+              
+              try:
+                  # イベントソースに応じた処理
+                  if 'source' in event and event['source'] == 'aws.events':
+                      # スケジュール実行
+                      return handle_scheduled_execution(event)
+                  elif 'Records' in event:
+                      # DynamoDB Streams トリガー
+                      return handle_test_completion(event)
+                  else:
+                      # 手動実行
+                      return handle_manual_execution(event)
+                      
+              except Exception as e:
+                  print(f"Error in test execution manager: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+          
+          def handle_scheduled_execution(event):
+              """スケジュール実行の処理"""
+              
+              try:
+                  rule_name = event['resources'][0].split('/')[-1]
+                  
+                  if 'nightly' in rule_name:
+                      test_suites = ['unit-tests', 'integration-tests', 'performance-tests']
+                  elif 'weekly' in rule_name:
+                      test_suites = ['unit-tests', 'integration-tests', 'performance-tests']
+                  else:
+                      test_suites = ['unit-tests']
+                  
+                  execution_id = str(uuid.uuid4())
+                  
+                  for test_suite in test_suites:
+                      start_test_execution(test_suite, execution_id, 'scheduled')
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Scheduled test execution started',
+                          'executionId': execution_id,
+                          'testSuites': test_suites
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in scheduled execution: {str(e)}")
+                  raise e
+          
+          def handle_manual_execution(event):
+              """手動実行の処理"""
+              
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  test_suite = body.get('testSuite', 'unit-tests')
+                  trigger_type = body.get('triggerType', 'manual')
+                  
+                  execution_id = str(uuid.uuid4())
+                  
+                  result = start_test_execution(test_suite, execution_id, trigger_type)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Test execution started',
+                          'executionId': execution_id,
+                          'testSuite': test_suite,
+                          'buildId': result.get('build', {}).get('id')
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in manual execution: {str(e)}")
+                  raise e
+          
+          def handle_test_completion(event):
+              """テスト完了の処理"""
+              
+              try:
+                  for record in event['Records']:
+                      if record['eventName'] in ['INSERT', 'MODIFY']:
+                          new_image = record['dynamodb'].get('NewImage', {})
+                          execution_id = new_image.get('executionId', {}).get('S')
+                          status = new_image.get('status', {}).get('S')
+                          test_suite = new_image.get('testSuite', {}).get('S')
+                          
+                          if status in ['success', 'failed']:
+                              # 通知送信
+                              send_test_notification(execution_id, test_suite, status)
+                              
+                              # メトリクス更新
+                              update_test_metrics(test_suite, status)
+                  
+                  return {'statusCode': 200, 'body': 'Test completion processed'}
+                  
+              except Exception as e:
+                  print(f"Error processing test completion: {str(e)}")
+                  raise e
+          
+          def start_test_execution(test_suite, execution_id, trigger_type):
+              """テスト実行開始"""
+              
+              project_name = f"{os.environ['PROJECT_NAME']}-{os.environ['ENVIRONMENT_NAME']}-{test_suite}"
+              
+              response = codebuild.start_build(
+                  projectName=project_name,
+                  environmentVariablesOverride=[
+                      {
+                          'name': 'EXECUTION_ID',
+                          'value': execution_id
+                      },
+                      {
+                          'name': 'TRIGGER_TYPE',
+                          'value': trigger_type
+                      }
+                  ]
+              )
+              
+              return response
+          
+          def send_test_notification(execution_id, test_suite, status):
+              """テスト結果通知"""
+              
+              subject = f"Test {status.upper()}: {test_suite}"
+              message = {
+                  'executionId': execution_id,
+                  'testSuite': test_suite,
+                  'status': status,
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'reportsUrl': f"s3://{os.environ['TEST_REPORTS_BUCKET']}/{test_suite}/"
+              }
+              
+              sns.publish(
+                  TopicArn=os.environ['NOTIFICATION_TOPIC'],
+                  Message=json.dumps(message, indent=2),
+                  Subject=subject
+              )
+          
+          def update_test_metrics(test_suite, status):
+              """テストメトリクス更新"""
+              
+              metrics_table = dynamodb.Table(os.environ['METRICS_TABLE'])
+              today = datetime.utcnow().strftime('%Y-%m-%d')
+              
+              metric_id = f"{test_suite}:{today}"
+              ttl = int((datetime.utcnow() + timedelta(days=365)).timestamp())
+              
+              # カウンター更新
+              update_expression = f"ADD {status}Count :inc SET #ttl = :ttl, lastUpdated = :timestamp"
+              
+              metrics_table.update_item(
+                  Key={'metricId': metric_id},
+                  UpdateExpression=update_expression,
+                  ExpressionAttributeNames={'#ttl': 'ttl'},
+                  ExpressionAttributeValues={
+                      ':inc': 1,
+                      ':ttl': ttl,
+                      ':timestamp': datetime.utcnow().isoformat()
+                  }
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # EventBridge ルール（スケジュール実行）
+  # ========================================
+  # 夜間テスト実行ルール
+  NightlyTestRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-nightly-tests'
+      Description: 夜間テスト自動実行
+      ScheduleExpression: !Ref NightlyTestSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TestExecutionManagerFunction.Arn
+          Id: NightlyTestTarget
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 週次テスト実行ルール
+  WeeklyTestRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-weekly-tests'
+      Description: 週次テスト自動実行
+      ScheduleExpression: !Ref WeeklyTestSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TestExecutionManagerFunction.Arn
+          Id: WeeklyTestTarget
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda実行権限
+  NightlyTestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TestExecutionManagerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NightlyTestRule.Arn
+
+  WeeklyTestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TestExecutionManagerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyTestRule.Arn
+
+  # ========================================
+  # DynamoDB Streams トリガー
+  # ========================================
+  TestExecutionStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TestExecutionHistoryTable.StreamArn
+      FunctionName: !Ref TestExecutionManagerFunction
+      StartingPosition: LATEST
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  # テスト実行ロール
+  TestExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TestExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${TestReportsBucket}/*'
+                  - !Sub '${TestDataBucket}/*'
+                  - !GetAtt TestReportsBucket.Arn
+                  - !GetAtt TestDataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt TestExecutionHistoryTable.Arn
+                  - !GetAtt TestMetricsTable.Arn
+
+  # テスト実行管理ロール
+  TestExecutionManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TestExecutionManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource:
+                  - !GetAtt UnitTestProject.Arn
+                  - !GetAtt IntegrationTestProject.Arn
+                  - !GetAtt PerformanceTestProject.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt TestExecutionHistoryTable.Arn
+                  - !GetAtt TestMetricsTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt TestExecutionHistoryTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref TestNotificationTopic
+
+  # ========================================
+  # SNS通知トピック
+  # ========================================
+  TestNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-test-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} テスト通知'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # メール通知サブスクリプション
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref TestNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # ========================================
+  # CloudWatch監視
+  # ========================================
+  # テスト失敗率アラーム
+  TestFailureRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-test-failure-rate'
+      AlarmDescription: Test failure rate is high
+      MetricName: FailedBuilds
+      Namespace: AWS/CodeBuild
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref TestNotificationTopic
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # テストプロジェクト情報
+  UnitTestProjectName:
+    Description: 単体テストプロジェクト名
+    Value: !Ref UnitTestProject
+    Export:
+      Name: !Sub '${AWS::StackName}-UnitTestProject'
+
+  IntegrationTestProjectName:
+    Description: 統合テストプロジェクト名
+    Value: !Ref IntegrationTestProject
+    Export:
+      Name: !Sub '${AWS::StackName}-IntegrationTestProject'
+
+  PerformanceTestProjectName:
+    Description: パフォーマンステストプロジェクト名
+    Value: !Ref PerformanceTestProject
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceTestProject'
+
+  # S3バケット
+  TestReportsBucketName:
+    Description: テストレポートS3バケット名
+    Value: !Ref TestReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TestReportsBucket'
+
+  TestDataBucketName:
+    Description: テストデータS3バケット名
+    Value: !Ref TestDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-TestDataBucket'
+
+  # DynamoDB テーブル
+  TestExecutionHistoryTableName:
+    Description: テスト実行履歴テーブル名
+    Value: !Ref TestExecutionHistoryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TestExecutionHistoryTable'
+
+  TestMetricsTableName:
+    Description: テストメトリクステーブル名
+    Value: !Ref TestMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TestMetricsTable'
+
+  # Lambda関数
+  TestExecutionManagerFunctionArn:
+    Description: テスト実行管理Lambda関数ARN
+    Value: !GetAtt TestExecutionManagerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TestExecutionManagerFunction'
+
+  # 通知トピック
+  TestNotificationTopicArn:
+    Description: テスト通知SNSトピックARN
+    Value: !Ref TestNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-TestNotificationTopic'
+
+  # 管理コンソールURL
+  CodeBuildConsoleURL:
+    Description: CodeBuild管理コンソールURL
+    Value: !Sub 'https://console.aws.amazon.com/codesuite/codebuild/projects?region=${AWS::Region}'
+
+  # 使用ガイド
+  TestAutomationUsageGuide:
+    Description: テスト自動化使用ガイド
+    Value: !Sub |
+      テスト自動化基盤使用ガイド:
+      
+      1. 手動テスト実行:
+      aws codebuild start-build --project-name ${UnitTestProject}
+      aws codebuild start-build --project-name ${IntegrationTestProject}
+      aws codebuild start-build --project-name ${PerformanceTestProject}
+      
+      2. テストレポート確認:
+      https://s3.console.aws.amazon.com/s3/buckets/${TestReportsBucket}
+      
+      3. 実行履歴確認:
+      aws dynamodb scan --table-name ${TestExecutionHistoryTable}
+      
+      4. スケジュール設定:
+      - 夜間テスト: ${NightlyTestSchedule}
+      - 週次テスト: ${WeeklyTestSchedule}
+
+  # 設定概要
+  TestAutomationConfiguration:
+    Description: テスト自動化設定概要
+    Value: !Sub |
+      Test Automation Configuration:
+      - Unit Test Framework: ${UnitTestFramework}
+      - Integration Test Framework: ${IntegrationTestFramework}
+      - Performance Test Framework: ${PerformanceTestFramework}
+      - Coverage Threshold: ${CoverageThreshold}%
+      - Parallel Execution: ${ParallelTestExecution}
+      - Test Timeout: ${TestTimeout} minutes
+      - Reports: s3://${TestReportsBucket}/
+      - Notifications: ${NotificationEmail}

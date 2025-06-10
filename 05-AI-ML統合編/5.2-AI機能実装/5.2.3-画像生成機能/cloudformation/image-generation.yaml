@@ -1,0 +1,1342 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Bedrock 画像生成システム - AI画像生成・編集基盤
+  
+  このテンプレートは以下のリソースを作成します：
+  - Lambda関数（画像生成・編集・スタイル変換）
+  - API Gateway（REST・WebSocket API）
+  - S3（画像保存・バージョン管理）
+  - DynamoDB（生成履歴・リクエスト管理）
+  - SQS（非同期処理・バッチ生成）
+  - CloudFront（画像配信・CDN）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本機能）
+      - staging: ステージング環境（負荷テスト対応）
+      - prod: 本番環境（高性能・CDN配信）
+
+  ProjectName:
+    Type: String
+    Default: image-generation
+    Description: リソース命名に使用するプロジェクト名
+
+  # BedrockセットアップからのImport
+  BedrockStackName:
+    Type: String
+    Description: |
+      Bedrockセットアップスタック名
+      bedrock-setup.yamlで作成されたスタック名
+
+  # 画像生成設定
+  DefaultImageModel:
+    Type: String
+    Default: stability.stable-diffusion-xl-v1:0
+    AllowedValues: 
+      - stability.stable-diffusion-xl-v1:0
+      - amazon.titan-image-generator-v1
+    Description: |
+      デフォルト画像生成モデル
+      - Stable Diffusion XL: 高品質・詳細画像
+      - Titan Image Generator: Amazon製・高速生成
+
+  # 画像設定
+  DefaultImageSize:
+    Type: String
+    Default: 1024x1024
+    AllowedValues: 
+      - 512x512
+      - 768x768
+      - 1024x1024
+      - 1152x896
+      - 1216x832
+      - 1344x768
+      - 1536x640
+    Description: |
+      デフォルト画像サイズ
+      モデルによってサポートサイズが異なる
+
+  MaxConcurrentGenerations:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: |
+      同時生成可能な最大画像数
+      リクエスト制限とコスト管理
+
+  ImageRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 7
+    MaxValue: 2555
+    Description: |
+      画像保持期間（日数）
+      自動削除によるストレージコスト最適化
+
+  # API制限設定
+  ApiRateLimit:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    MaxValue: 1000
+    Description: |
+      API レート制限（リクエスト/分）
+      ユーザー当たりの制限
+
+  DailyGenerationLimit:
+    Type: Number
+    Default: 100
+    MinValue: 10
+    MaxValue: 10000
+    Description: |
+      日次生成制限（画像/日）
+      コスト制御とリソース管理
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+
+Resources:
+  # ========================================
+  # S3バケット（画像保存・配信）
+  # ========================================
+  # 生成画像保存バケット
+  GeneratedImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-images-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: 
+                Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKey'
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+          - Id: DeleteOldImages
+            Status: Enabled
+            ExpirationInDays: !Ref ImageRetentionDays
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # オリジナル/入力画像保存バケット
+  InputImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-inputs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: 
+                Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKey'
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldInputs
+            Status: Enabled
+            ExpirationInDays: !Ref ImageRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CloudFront 配信
+  # ========================================
+  # 画像配信用CloudFront
+  ImageCDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName} ${EnvironmentName} Image CDN'
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt GeneratedImagesBucket.DomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # Managed-CORS-S3Origin
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03  # Managed-SecurityHeadersPolicy
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: S3Origin
+            ViewerProtocolPolicy: https-only
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingDisabled
+            OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+        PriceClass: !If [IsProduction, 'PriceClass_All', 'PriceClass_100']
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        Logging: !If 
+          - IsProduction
+          - Bucket: !GetAtt AccessLogsBucket.DomainName
+            Prefix: cloudfront-logs/
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudFront OAI
+  CloudFrontOAI:
+    Type: AWS::CloudFront::OriginAccessIdentity
+    Properties:
+      OriginAccessIdentityConfig:
+        Comment: !Sub '${ProjectName} ${EnvironmentName} OAI'
+
+  # S3バケットポリシー（CloudFront専用アクセス）
+  GeneratedImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GeneratedImagesBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOAI}'
+            Action: 's3:GetObject'
+            Resource: !Sub '${GeneratedImagesBucket}/*'
+
+  # アクセスログ用バケット（本番環境のみ）
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsProduction
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-access-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # DynamoDB テーブル（生成履歴・管理）
+  # ========================================
+  # 画像生成履歴テーブル
+  ImageGenerationHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-generation-history'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: generationId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: generationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserHistoryIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # レート制限管理テーブル
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-rate-limits'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: limitType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: limitType
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # SQS キュー（非同期処理）
+  # ========================================
+  # 画像生成キュー
+  ImageGenerationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${EnvironmentName}-image-generation.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeoutSeconds: 900  # 15分
+      MessageRetentionPeriod: 1209600  # 14日
+      DeadLetterTargetArn: !GetAtt ImageGenerationDLQ.Arn
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageGenerationDLQ.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # デッドレターキュー
+  ImageGenerationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${EnvironmentName}-image-generation-dlq.fifo'
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600  # 14日
+      KmsMasterKeyId: alias/aws/sqs
+
+  # ========================================
+  # Lambda関数群
+  # ========================================
+  # 画像生成API Lambda
+  ImageGenerationApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-generation-api'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ImageGenerationRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          HISTORY_TABLE: !Ref ImageGenerationHistoryTable
+          RATE_LIMIT_TABLE: !Ref RateLimitTable
+          GENERATION_QUEUE: !Ref ImageGenerationQueue
+          INPUT_BUCKET: !Ref InputImagesBucket
+          OUTPUT_BUCKET: !Ref GeneratedImagesBucket
+          CDN_DOMAIN: !GetAtt ImageCDN.DomainName
+          DEFAULT_MODEL: !Ref DefaultImageModel
+          DEFAULT_SIZE: !Ref DefaultImageSize
+          API_RATE_LIMIT: !Ref ApiRateLimit
+          DAILY_LIMIT: !Ref DailyGenerationLimit
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import hashlib
+          from datetime import datetime, timedelta
+          import base64
+          
+          dynamodb = boto3.resource('dynamodb')
+          sqs = boto3.client('sqs')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """画像生成API メインハンドラー"""
+              
+              try:
+                  # HTTPメソッドによる処理分岐
+                  http_method = event['httpMethod']
+                  path = event['path']
+                  
+                  if http_method == 'POST' and path.endswith('/generate'):
+                      return handle_generate_request(event)
+                  elif http_method == 'GET' and path.endswith('/status'):
+                      return handle_status_request(event)
+                  elif http_method == 'GET' and path.endswith('/history'):
+                      return handle_history_request(event)
+                  elif http_method == 'POST' and path.endswith('/upload'):
+                      return handle_upload_request(event)
+                  else:
+                      return error_response(404, "Endpoint not found")
+                      
+              except Exception as e:
+                  print(f"Error in image generation API: {str(e)}")
+                  return error_response(500, f"Internal server error: {str(e)}")
+          
+          def handle_generate_request(event):
+              """画像生成リクエスト処理"""
+              
+              try:
+                  # リクエストボディ解析
+                  request_body = json.loads(event['body'])
+                  
+                  prompt = request_body.get('prompt', '')
+                  negative_prompt = request_body.get('negativePrompt', '')
+                  model_id = request_body.get('model', os.environ['DEFAULT_MODEL'])
+                  image_size = request_body.get('size', os.environ['DEFAULT_SIZE'])
+                  style = request_body.get('style', 'photographic')
+                  user_id = request_body.get('userId', 'anonymous')
+                  async_mode = request_body.get('async', True)
+                  
+                  # 入力検証
+                  if not prompt or len(prompt.strip()) == 0:
+                      return error_response(400, "Prompt is required")
+                  
+                  if len(prompt) > 1000:
+                      return error_response(400, "Prompt too long (max 1000 characters)")
+                  
+                  # レート制限チェック
+                  if not check_rate_limits(user_id):
+                      return error_response(429, "Rate limit exceeded")
+                  
+                  # 生成ID作成
+                  generation_id = str(uuid.uuid4())
+                  
+                  # 履歴に保存
+                  save_generation_request(generation_id, user_id, {
+                      'prompt': prompt,
+                      'negativePrompt': negative_prompt,
+                      'model': model_id,
+                      'size': image_size,
+                      'style': style,
+                      'async': async_mode
+                  })
+                  
+                  if async_mode:
+                      # 非同期処理：キューに送信
+                      queue_message = {
+                          'generationId': generation_id,
+                          'userId': user_id,
+                          'prompt': prompt,
+                          'negativePrompt': negative_prompt,
+                          'model': model_id,
+                          'size': image_size,
+                          'style': style,
+                          'timestamp': datetime.utcnow().isoformat()
+                      }
+                      
+                      sqs.send_message(
+                          QueueUrl=os.environ['GENERATION_QUEUE'],
+                          MessageBody=json.dumps(queue_message),
+                          MessageGroupId=user_id,
+                          MessageDeduplicationId=generation_id
+                      )
+                      
+                      return success_response({
+                          'generationId': generation_id,
+                          'status': 'queued',
+                          'message': 'Image generation queued for processing'
+                      }, 202)
+                  
+                  else:
+                      # 同期処理は今回は省略（実装が複雑になるため）
+                      return error_response(501, "Synchronous generation not implemented")
+                      
+              except Exception as e:
+                  print(f"Error in generate request: {str(e)}")
+                  return error_response(500, f"Error processing request: {str(e)}")
+          
+          def handle_status_request(event):
+              """生成ステータス確認"""
+              
+              try:
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  generation_id = query_params.get('id')
+                  
+                  if not generation_id:
+                      return error_response(400, "Generation ID is required")
+                  
+                  # 履歴から取得
+                  history_table = dynamodb.Table(os.environ['HISTORY_TABLE'])
+                  
+                  response = history_table.get_item(
+                      Key={'generationId': generation_id}
+                  )
+                  
+                  if 'Item' not in response:
+                      return error_response(404, "Generation not found")
+                  
+                  item = response['Item']
+                  
+                  return success_response({
+                      'generationId': generation_id,
+                      'status': item['status'],
+                      'createdAt': item['createdAt'],
+                      'completedAt': item.get('completedAt'),
+                      'imageUrl': item.get('imageUrl'),
+                      'errorMessage': item.get('errorMessage')
+                  })
+                  
+              except Exception as e:
+                  print(f"Error in status request: {str(e)}")
+                  return error_response(500, f"Error getting status: {str(e)}")
+          
+          def handle_history_request(event):
+              """生成履歴取得"""
+              
+              try:
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  user_id = query_params.get('userId', 'anonymous')
+                  limit = int(query_params.get('limit', '20'))
+                  
+                  history_table = dynamodb.Table(os.environ['HISTORY_TABLE'])
+                  
+                  response = history_table.query(
+                      IndexName='UserHistoryIndex',
+                      KeyConditionExpression='userId = :uid',
+                      ExpressionAttributeValues={':uid': user_id},
+                      ScanIndexForward=False,  # 新しい順
+                      Limit=limit
+                  )
+                  
+                  items = response.get('Items', [])
+                  
+                  return success_response({
+                      'history': [
+                          {
+                              'generationId': item['generationId'],
+                              'status': item['status'],
+                              'prompt': item.get('prompt', ''),
+                              'createdAt': item['createdAt'],
+                              'imageUrl': item.get('imageUrl')
+                          }
+                          for item in items
+                      ]
+                  })
+                  
+              except Exception as e:
+                  print(f"Error in history request: {str(e)}")
+                  return error_response(500, f"Error getting history: {str(e)}")
+          
+          def handle_upload_request(event):
+              """入力画像アップロード処理"""
+              
+              try:
+                  # 実装省略：Base64エンコードされた画像をS3にアップロード
+                  return success_response({
+                      'message': 'Upload functionality not implemented',
+                      'uploadUrl': 'placeholder'
+                  })
+                  
+              except Exception as e:
+                  print(f"Error in upload request: {str(e)}")
+                  return error_response(500, f"Error uploading: {str(e)}")
+          
+          def check_rate_limits(user_id):
+              """レート制限チェック"""
+              
+              try:
+                  rate_limit_table = dynamodb.Table(os.environ['RATE_LIMIT_TABLE'])
+                  now = datetime.utcnow()
+                  
+                  # 分単位制限チェック
+                  minute_key = now.strftime('%Y%m%d%H%M')
+                  minute_response = rate_limit_table.get_item(
+                      Key={'userId': user_id, 'limitType': f'minute:{minute_key}'}
+                  )
+                  
+                  minute_count = minute_response.get('Item', {}).get('count', 0)
+                  if minute_count >= int(os.environ['API_RATE_LIMIT']):
+                      return False
+                  
+                  # 日次制限チェック
+                  day_key = now.strftime('%Y%m%d')
+                  day_response = rate_limit_table.get_item(
+                      Key={'userId': user_id, 'limitType': f'day:{day_key}'}
+                  )
+                  
+                  day_count = day_response.get('Item', {}).get('count', 0)
+                  if day_count >= int(os.environ['DAILY_LIMIT']):
+                      return False
+                  
+                  # カウンター更新
+                  update_rate_limits(user_id, minute_key, day_key)
+                  
+                  return True
+                  
+              except Exception as e:
+                  print(f"Error checking rate limits: {str(e)}")
+                  # エラー時は制限しない（可用性優先）
+                  return True
+          
+          def update_rate_limits(user_id, minute_key, day_key):
+              """レート制限カウンター更新"""
+              
+              rate_limit_table = dynamodb.Table(os.environ['RATE_LIMIT_TABLE'])
+              now = datetime.utcnow()
+              
+              # 分単位カウンター
+              minute_ttl = int((now + timedelta(minutes=2)).timestamp())
+              rate_limit_table.update_item(
+                  Key={'userId': user_id, 'limitType': f'minute:{minute_key}'},
+                  UpdateExpression='ADD #count :inc SET #ttl = :ttl',
+                  ExpressionAttributeNames={'#count': 'count', '#ttl': 'ttl'},
+                  ExpressionAttributeValues={':inc': 1, ':ttl': minute_ttl}
+              )
+              
+              # 日次カウンター
+              day_ttl = int((now + timedelta(days=2)).timestamp())
+              rate_limit_table.update_item(
+                  Key={'userId': user_id, 'limitType': f'day:{day_key}'},
+                  UpdateExpression='ADD #count :inc SET #ttl = :ttl',
+                  ExpressionAttributeNames={'#count': 'count', '#ttl': 'ttl'},
+                  ExpressionAttributeValues={':inc': 1, ':ttl': day_ttl}
+              )
+          
+          def save_generation_request(generation_id, user_id, request_data):
+              """生成リクエストを履歴に保存"""
+              
+              history_table = dynamodb.Table(os.environ['HISTORY_TABLE'])
+              
+              # TTL設定（画像保持期間と同じ）
+              ttl = int((datetime.utcnow() + timedelta(days=90)).timestamp())
+              
+              history_table.put_item(
+                  Item={
+                      'generationId': generation_id,
+                      'userId': user_id,
+                      'status': 'pending',
+                      'prompt': request_data.get('prompt', ''),
+                      'negativePrompt': request_data.get('negativePrompt', ''),
+                      'model': request_data.get('model', ''),
+                      'size': request_data.get('size', ''),
+                      'style': request_data.get('style', ''),
+                      'createdAt': datetime.utcnow().isoformat(),
+                      'ttl': ttl
+                  }
+              )
+          
+          def success_response(data, status_code=200):
+              """成功レスポンス"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+                  },
+                  'body': json.dumps(data, ensure_ascii=False)
+              }
+          
+          def error_response(status_code, message):
+              """エラーレスポンス"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+                  },
+                  'body': json.dumps({
+                      'error': message
+                  }, ensure_ascii=False)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 画像生成ワーカーLambda
+  ImageGenerationWorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-generation-worker'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ImageGenerationRole.Arn
+      Timeout: 900  # 15分
+      MemorySize: 3008
+      ReservedConcurrencyLimit: !Ref MaxConcurrentGenerations
+      Environment:
+        Variables:
+          HISTORY_TABLE: !Ref ImageGenerationHistoryTable
+          OUTPUT_BUCKET: !Ref GeneratedImagesBucket
+          CDN_DOMAIN: !GetAtt ImageCDN.DomainName
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          import base64
+          import hashlib
+          
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """SQSトリガーによる画像生成処理"""
+              
+              try:
+                  for record in event['Records']:
+                      message_data = json.loads(record['body'])
+                      generation_id = message_data['generationId']
+                      
+                      print(f"Processing image generation: {generation_id}")
+                      
+                      # ステータス更新（処理中）
+                      update_generation_status(generation_id, 'processing')
+                      
+                      # 画像生成実行
+                      image_data = generate_image(message_data)
+                      
+                      if image_data:
+                          # S3に保存
+                          image_url = save_image_to_s3(generation_id, image_data)
+                          
+                          # ステータス更新（完了）
+                          update_generation_status(generation_id, 'completed', image_url)
+                          
+                          print(f"Image generation completed: {generation_id}")
+                      else:
+                          # ステータス更新（失敗）
+                          update_generation_status(generation_id, 'failed', None, 'Failed to generate image')
+                          
+                          print(f"Image generation failed: {generation_id}")
+                  
+                  return {'statusCode': 200, 'body': 'Image generation processed'}
+                  
+              except Exception as e:
+                  print(f"Error in image generation worker: {str(e)}")
+                  raise e
+          
+          def generate_image(message_data):
+              """Bedrockを使用した画像生成"""
+              
+              try:
+                  model_id = message_data['model']
+                  prompt = message_data['prompt']
+                  negative_prompt = message_data.get('negativePrompt', '')
+                  size = message_data['size']
+                  style = message_data.get('style', 'photographic')
+                  
+                  if model_id.startswith('stability.stable-diffusion'):
+                      return generate_with_stable_diffusion(model_id, prompt, negative_prompt, size, style)
+                  elif model_id.startswith('amazon.titan-image'):
+                      return generate_with_titan_image(model_id, prompt, size)
+                  else:
+                      print(f"Unsupported model: {model_id}")
+                      return None
+                      
+              except Exception as e:
+                  print(f"Error generating image: {str(e)}")
+                  return None
+          
+          def generate_with_stable_diffusion(model_id, prompt, negative_prompt, size, style):
+              """Stable Diffusion XL で画像生成"""
+              
+              # サイズを幅と高さに分解
+              width, height = map(int, size.split('x'))
+              
+              request_body = {
+                  "text_prompts": [
+                      {
+                          "text": prompt,
+                          "weight": 1.0
+                      }
+                  ],
+                  "cfg_scale": 7,
+                  "seed": 0,
+                  "steps": 30,
+                  "width": width,
+                  "height": height,
+                  "style_preset": style
+              }
+              
+              # ネガティブプロンプトがある場合
+              if negative_prompt:
+                  request_body["text_prompts"].append({
+                      "text": negative_prompt,
+                      "weight": -1.0
+                  })
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId=model_id,
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              
+              if 'artifacts' in response_body and response_body['artifacts']:
+                  return response_body['artifacts'][0]['base64']
+              
+              return None
+          
+          def generate_with_titan_image(model_id, prompt, size):
+              """Titan Image Generator で画像生成"""
+              
+              # サイズを幅と高さに分解
+              width, height = map(int, size.split('x'))
+              
+              request_body = {
+                  "taskType": "TEXT_IMAGE",
+                  "textToImageParams": {
+                      "text": prompt,
+                      "negativeText": "",
+                  },
+                  "imageGenerationConfig": {
+                      "numberOfImages": 1,
+                      "quality": "standard",
+                      "cfgScale": 8.0,
+                      "height": height,
+                      "width": width,
+                      "seed": 0
+                  }
+              }
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId=model_id,
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              
+              if 'images' in response_body and response_body['images']:
+                  return response_body['images'][0]
+              
+              return None
+          
+          def save_image_to_s3(generation_id, image_base64):
+              """生成された画像をS3に保存"""
+              
+              try:
+                  # Base64デコード
+                  image_data = base64.b64decode(image_base64)
+                  
+                  # S3キー生成
+                  timestamp = datetime.utcnow().strftime('%Y/%m/%d')
+                  s3_key = f"generated/{timestamp}/{generation_id}.png"
+                  
+                  # S3にアップロード
+                  s3.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=s3_key,
+                      Body=image_data,
+                      ContentType='image/png',
+                      CacheControl='max-age=31536000',  # 1年
+                      Metadata={
+                          'generation-id': generation_id,
+                          'generated-at': datetime.utcnow().isoformat()
+                      }
+                  )
+                  
+                  # CDN URL生成
+                  cdn_domain = os.environ['CDN_DOMAIN']
+                  image_url = f"https://{cdn_domain}/{s3_key}"
+                  
+                  return image_url
+                  
+              except Exception as e:
+                  print(f"Error saving image to S3: {str(e)}")
+                  return None
+          
+          def update_generation_status(generation_id, status, image_url=None, error_message=None):
+              """生成ステータスを更新"""
+              
+              history_table = dynamodb.Table(os.environ['HISTORY_TABLE'])
+              
+              update_expression = 'SET #status = :status'
+              expression_values = {':status': status}
+              expression_names = {'#status': 'status'}
+              
+              if status == 'completed':
+                  update_expression += ', completedAt = :completed'
+                  expression_values[':completed'] = datetime.utcnow().isoformat()
+                  
+                  if image_url:
+                      update_expression += ', imageUrl = :url'
+                      expression_values[':url'] = image_url
+              
+              if status == 'failed' and error_message:
+                  update_expression += ', errorMessage = :error'
+                  expression_values[':error'] = error_message
+              
+              history_table.update_item(
+                  Key={'generationId': generation_id},
+                  UpdateExpression=update_expression,
+                  ExpressionAttributeNames=expression_names,
+                  ExpressionAttributeValues=expression_values
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SQSトリガー設定
+  ImageGenerationEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ImageGenerationQueue.Arn
+      FunctionName: !Ref ImageGenerationWorkerFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+
+  # ========================================
+  # API Gateway REST API
+  # ========================================
+  # REST API
+  ImageGenerationApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-image-generation-api'
+      Description: AI Image Generation API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      BinaryMediaTypes:
+        - image/png
+        - image/jpeg
+        - image/gif
+        - image/webp
+
+  # API Gateway リソース
+  GenerateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      ParentId: !GetAtt ImageGenerationApi.RootResourceId
+      PathPart: generate
+
+  StatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      ParentId: !GetAtt ImageGenerationApi.RootResourceId
+      PathPart: status
+
+  HistoryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      ParentId: !GetAtt ImageGenerationApi.RootResourceId
+      PathPart: history
+
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      ParentId: !GetAtt ImageGenerationApi.RootResourceId
+      PathPart: upload
+
+  # POST メソッド（生成）
+  GenerateMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      ResourceId: !Ref GenerateResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ImageGenerationApiFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 202
+        - StatusCode: 400
+        - StatusCode: 429
+        - StatusCode: 500
+
+  # GET メソッド（ステータス）
+  StatusMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      ResourceId: !Ref StatusResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ImageGenerationApiFunction.Arn}/invocations'
+
+  # GET メソッド（履歴）
+  HistoryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      ResourceId: !Ref HistoryResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ImageGenerationApiFunction.Arn}/invocations'
+
+  # POST メソッド（アップロード）
+  UploadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      ResourceId: !Ref UploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ImageGenerationApiFunction.Arn}/invocations'
+
+  # CORS設定
+  GenerateOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      ResourceId: !Ref GenerateResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # API デプロイメント
+  ImageApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GenerateMethod
+      - StatusMethod
+      - HistoryMethod
+      - UploadMethod
+      - GenerateOptionsMethod
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      Description: !Sub '${EnvironmentName} deployment'
+
+  # API ステージ
+  ImageApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ImageGenerationApi
+      DeploymentId: !Ref ImageApiDeployment
+      StageName: !Ref EnvironmentName
+      ThrottleSettings:
+        RateLimit: !Ref ApiRateLimit
+        BurstLimit: !Ref MaxConcurrentGenerations
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [IsProduction, ERROR, INFO]
+          DataTraceEnabled: !If [IsProduction, false, true]
+          MetricsEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda実行権限
+  ImageGenerationApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ImageGenerationApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ImageGenerationApi}/*'
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  ImageGenerationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ImageGenerationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/stability.stable-diffusion-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-image-*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ImageGenerationHistoryTable.Arn
+                  - !Sub '${ImageGenerationHistoryTable.Arn}/index/*'
+                  - !GetAtt RateLimitTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${InputImagesBucket}/*'
+                  - !Sub '${GeneratedImagesBucket}/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                Resource: 
+                  - !GetAtt ImageGenerationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: 
+                  Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKeyArn'
+
+  # ========================================
+  # CloudWatch 監視
+  # ========================================
+  # Lambda ログ
+  ImageGenerationApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-generation-api'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  ImageGenerationWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-generation-worker'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # 高エラー率アラーム
+  ImageGenerationErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-image-generation-errors'
+      AlarmDescription: Image generation error rate is high
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ImageGenerationWorkerFunction
+
+  # 長時間処理アラーム
+  ImageGenerationDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-image-generation-duration'
+      AlarmDescription: Image generation duration is high
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 600000  # 10分
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ImageGenerationWorkerFunction
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # API エンドポイント
+  ImageGenerationApiEndpoint:
+    Description: Image Generation API エンドポイント
+    Value: !Sub 'https://${ImageGenerationApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageGenerationApiEndpoint'
+
+  # CDN情報
+  ImageCDNDomain:
+    Description: 画像配信CDNドメイン
+    Value: !GetAtt ImageCDN.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageCDNDomain'
+
+  ImageCDNURL:
+    Description: 画像配信CDNURL
+    Value: !Sub 'https://${ImageCDN.DomainName}'
+
+  # S3バケット
+  GeneratedImagesBucketName:
+    Description: 生成画像保存S3バケット名
+    Value: !Ref GeneratedImagesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-GeneratedImagesBucket'
+
+  InputImagesBucketName:
+    Description: 入力画像保存S3バケット名
+    Value: !Ref InputImagesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InputImagesBucket'
+
+  # Lambda関数
+  ImageGenerationApiFunctionArn:
+    Description: 画像生成API Lambda関数ARN
+    Value: !GetAtt ImageGenerationApiFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageGenerationApiFunction'
+
+  ImageGenerationWorkerFunctionArn:
+    Description: 画像生成ワーカーLambda関数ARN
+    Value: !GetAtt ImageGenerationWorkerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageGenerationWorkerFunction'
+
+  # DynamoDB テーブル
+  ImageGenerationHistoryTableName:
+    Description: 画像生成履歴テーブル名
+    Value: !Ref ImageGenerationHistoryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageGenerationHistoryTable'
+
+  # SQS キュー
+  ImageGenerationQueueUrl:
+    Description: 画像生成キューURL
+    Value: !Ref ImageGenerationQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageGenerationQueue'
+
+  # 使用例
+  ImageGenerationUsageExample:
+    Description: 画像生成API使用例
+    Value: !Sub |
+      画像生成システム使用例:
+      
+      1. 画像生成リクエスト:
+      curl -X POST ${ImageGenerationApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/generate \
+        -H "Content-Type: application/json" \
+        -d '{
+          "prompt": "A beautiful sunset over mountains",
+          "model": "${DefaultImageModel}",
+          "size": "${DefaultImageSize}",
+          "userId": "user123",
+          "async": true
+        }'
+      
+      2. 生成ステータス確認:
+      curl "${ImageGenerationApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/status?id=GENERATION_ID"
+      
+      3. 生成履歴取得:
+      curl "${ImageGenerationApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/history?userId=user123"
+
+  # 設定概要
+  ImageGenerationConfiguration:
+    Description: 画像生成システム設定概要
+    Value: !Sub |
+      Image Generation System:
+      - API: https://${ImageGenerationApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}
+      - CDN: https://${ImageCDN.DomainName}
+      - Default Model: ${DefaultImageModel}
+      - Default Size: ${DefaultImageSize}
+      - Rate Limit: ${ApiRateLimit}/min
+      - Daily Limit: ${DailyGenerationLimit}/day
+      - Max Concurrent: ${MaxConcurrentGenerations}
+      - Images Bucket: s3://${GeneratedImagesBucket}/
+      - Retention: ${ImageRetentionDays} days

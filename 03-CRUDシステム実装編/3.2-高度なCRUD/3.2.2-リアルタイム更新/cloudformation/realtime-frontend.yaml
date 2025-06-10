@@ -1,0 +1,643 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  リアルタイム更新フロントエンド - React/Next.js WebSocket統合
+  
+  このテンプレートは以下のリソースを作成します：
+  - S3バケット（静的Webサイトホスティング用）
+  - CloudFront配信（グローバルCDN）
+  - Lambda@Edge関数（ルーティング・認証）
+  - CodePipeline（CI/CDパイプライン）
+  - CloudWatch監視とアラーム
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（コスト最適化）
+      - staging: ステージング環境（本番に近い設定）
+      - prod: 本番環境（高可用性・パフォーマンス重視）
+
+  ProjectName:
+    Type: String
+    Default: realtime-frontend
+    Description: リソース命名に使用するプロジェクト名
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: |
+      カスタムドメイン名（任意）
+      例: chat.example.com
+
+  WebSocketApiEndpoint:
+    Type: String
+    Description: |
+      WebSocket APIエンドポイントURL
+      realtime-websocket.yamlスタックから取得
+
+  GitHubOwner:
+    Type: String
+    Default: ""
+    Description: GitHubリポジトリオーナー名（CI/CD用）
+
+  GitHubRepo:
+    Type: String
+    Default: ""
+    Description: GitHubリポジトリ名（CI/CD用）
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: デプロイ対象ブランチ
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # カスタムドメインを使用するか
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, ""]]
+  
+  # CI/CDパイプラインを作成するか
+  HasGitHub: !And
+    - !Not [!Equals [!Ref GitHubOwner, ""]]
+    - !Not [!Equals [!Ref GitHubRepo, ""]]
+
+Resources:
+  # ========================================
+  # S3バケット（静的サイトホスティング）
+  # ========================================
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-website-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: !If [IsProduction, 30, 7]
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CloudFront配信設定
+  # ========================================
+  # Origin Access Control（OAC）
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${EnvironmentName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront配信
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName} ${EnvironmentName} リアルタイムWebアプリケーション配信'
+        Enabled: true
+        DefaultRootObject: index.html
+        
+        # オリジン設定
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !Ref OriginAccessControl
+        
+        # デフォルト動作設定
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: !Ref WebsiteCachePolicy
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt URLRewriteFunction.FunctionMetadata.FunctionARN
+        
+        # カスタムエラーページ
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+        
+        # 価格クラス設定
+        PriceClass: !If [IsProduction, PriceClass_All, PriceClass_100]
+        
+        # カスタムドメイン設定
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref DomainName]
+          - !Ref AWS::NoValue
+        
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref SSLCertificate
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        
+        # ログ設定
+        Logging: !If
+          - IsProduction
+          - Bucket: !GetAtt LoggingBucket.DomainName
+            Prefix: cloudfront-logs/
+            IncludeCookies: false
+          - !Ref AWS::NoValue
+      
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CloudFront Functions
+  # ========================================
+  # URL書き換え関数（SPAルーティング用）
+  URLRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-url-rewrite'
+      FunctionConfig:
+        Comment: SPAルーティング用URL書き換え関数
+        Runtime: cloudfront-js-1.0
+      FunctionCode: |
+        function handler(event) {
+            var request = event.request;
+            var uri = request.uri;
+            
+            // API リクエストは通す
+            if (uri.startsWith('/api/')) {
+                return request;
+            }
+            
+            // 静的ファイル（拡張子あり）は通す
+            if (uri.includes('.')) {
+                return request;
+            }
+            
+            // SPAルーティング用にindex.htmlにリダイレクト
+            if (!uri.endsWith('/')) {
+                request.uri = '/index.html';
+            }
+            
+            return request;
+        }
+
+  # ========================================
+  # キャッシュポリシー
+  # ========================================
+  WebsiteCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${ProjectName}-${EnvironmentName}-website-cache'
+        Comment: Webサイト用キャッシュポリシー
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          QueryStringsConfig:
+            QueryStringBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+
+  # セキュリティヘッダーポリシー
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${ProjectName}-${EnvironmentName}-security-headers'
+        Comment: セキュリティヘッダー設定
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: false
+          ContentTypeOptions:
+            Override: false
+          FrameOptions:
+            FrameOption: DENY
+            Override: false
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: false
+        CustomHeadersConfig:
+          Items:
+            - Header: X-WebSocket-Endpoint
+              Value: !Ref WebSocketApiEndpoint
+              Override: false
+
+  # ========================================
+  # SSL証明書（カスタムドメイン用）
+  # ========================================
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZone
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Route 53 ホストゾーン
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Condition: HasCustomDomain
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub '${ProjectName} ${EnvironmentName} ホストゾーン'
+
+  # DNS レコード
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2  # CloudFront hosted zone ID
+
+  # ========================================
+  # ログ用S3バケット
+  # ========================================
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsProduction
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # ========================================
+  # IAMロール（S3アクセス用）
+  # ========================================
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${WebsiteBucket}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ========================================
+  # CI/CDパイプライン（GitHub連携）
+  # ========================================
+  # CodeBuild プロジェクト
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Condition: HasGitHub
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-build'
+      Description: React/Next.js アプリケーションビルド
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:5.0
+        EnvironmentVariables:
+          - Name: REACT_APP_WEBSOCKET_ENDPOINT
+            Value: !Ref WebSocketApiEndpoint
+          - Name: REACT_APP_ENVIRONMENT
+            Value: !Ref EnvironmentName
+          - Name: S3_BUCKET
+            Value: !Ref WebsiteBucket
+          - Name: CLOUDFRONT_DISTRIBUTION_ID
+            Value: !Ref CloudFrontDistribution
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 14
+              commands:
+                - npm install
+            pre_build:
+              commands:
+                - echo Build started on `date`
+                - echo Installing dependencies...
+            build:
+              commands:
+                - echo Build phase started on `date`
+                - npm run build
+                - echo Build completed on `date`
+            post_build:
+              commands:
+                - echo Uploading to S3...
+                - aws s3 sync build/ s3://$S3_BUCKET --delete
+                - echo Invalidating CloudFront cache...
+                - aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DISTRIBUTION_ID --paths "/*"
+          artifacts:
+            files:
+              - '**/*'
+            base-directory: build
+
+  # CodePipeline
+  DeploymentPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: HasGitHub
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-pipeline'
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+
+  # ========================================
+  # IAMロール（CI/CD用）
+  # ========================================
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Condition: HasGitHub
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${WebsiteBucket}/*'
+                  - !Sub '${ArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt WebsiteBucket.Arn
+                  - !GetAtt ArtifactsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Condition: HasGitHub
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt ArtifactsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: !GetAtt BuildProject.Arn
+
+  # アーティファクト保存用S3バケット
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Condition: HasGitHub
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-artifacts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # GitHub トークン（Secrets Manager）
+  GitHubToken:
+    Type: AWS::SecretsManager::Secret
+    Condition: HasGitHub
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-github-token'
+      Description: GitHub Personal Access Token for CI/CD
+      SecretString: !Sub |
+        {
+          "token": "REPLACE_WITH_YOUR_GITHUB_TOKEN"
+        }
+
+  # ========================================
+  # CloudWatch監視
+  # ========================================
+  # CloudFrontエラー率アラーム
+  CloudFrontErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-cloudfront-errors'
+      AlarmDescription: CloudFront 4xx/5xxエラー率監視
+      MetricName: 4xxErrorRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+
+  # CloudFrontキャッシュヒット率アラーム
+  CloudFrontCacheHitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-cloudfront-cache-hit'
+      AlarmDescription: CloudFrontキャッシュヒット率監視
+      MetricName: CacheHitRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 80
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # Webサイト情報
+  WebsiteURL:
+    Description: Webサイト URL
+    Value: !If
+      - HasCustomDomain
+      - !Sub 'https://${DomainName}'
+      - !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-Website-URL'
+
+  CloudFrontDistributionId:
+    Description: CloudFront配信ID
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFront-DistributionId'
+
+  CloudFrontDomainName:
+    Description: CloudFront ドメイン名
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFront-DomainName'
+
+  # S3バケット情報
+  WebsiteBucketName:
+    Description: WebサイトS3バケット名
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-Website-Bucket'
+
+  WebsiteBucketArn:
+    Description: WebサイトS3バケットARN
+    Value: !GetAtt WebsiteBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Website-Bucket-Arn'
+
+  # CI/CD情報
+  BuildProjectName:
+    Condition: HasGitHub
+    Description: CodeBuildプロジェクト名
+    Value: !Ref BuildProject
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildProject'
+
+  DeploymentPipelineName:
+    Condition: HasGitHub
+    Description: CodePipelineパイプライン名
+    Value: !Ref DeploymentPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-Pipeline'
+
+  # 設定情報
+  WebSocketEndpoint:
+    Description: WebSocket APIエンドポイント
+    Value: !Ref WebSocketApiEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocket-Endpoint'
+
+  # フロントエンド環境変数
+  FrontendEnvVars:
+    Description: フロントエンド用環境変数設定例
+    Value: !Sub |
+      REACT_APP_WEBSOCKET_ENDPOINT=${WebSocketApiEndpoint}
+      REACT_APP_ENVIRONMENT=${EnvironmentName}
+      REACT_APP_API_ENDPOINT=https://${CloudFrontDistribution.DomainName}/api

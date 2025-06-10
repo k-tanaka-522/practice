@@ -1,0 +1,760 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Amazon QuickSight ダッシュボード - ビジネスインテリジェンス基盤
+  
+  このテンプレートは以下のリソースを作成します：
+  - QuickSight データソース（S3、RDS、Athena連携）
+  - QuickSight データセット（分析用データ定義）
+  - QuickSight ダッシュボード（ビジュアル分析）
+  - QuickSight ユーザー・グループ管理
+  - Lambda関数（自動更新・通知）
+  - CloudWatch監視とアラーム
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本機能）
+      - staging: ステージング環境（本番に近い設定）
+      - prod: 本番環境（高パフォーマンス・全機能）
+
+  ProjectName:
+    Type: String
+    Default: quicksight-dashboard
+    Description: リソース命名に使用するプロジェクト名
+
+  # QuickSight設定
+  QuickSightEdition:
+    Type: String
+    Default: STANDARD
+    AllowedValues: [STANDARD, ENTERPRISE]
+    Description: |
+      QuickSight エディション
+      - STANDARD: 基本機能（$9/月/ユーザー）
+      - ENTERPRISE: 高度な機能（$18/月/ユーザー）
+
+  QuickSightAccountName:
+    Type: String
+    Default: ""
+    Description: |
+      QuickSightアカウント名（既存の場合）
+      空白の場合は新規作成
+
+  # データソース設定
+  DataLakeS3Bucket:
+    Type: String
+    Description: |
+      データレイクS3バケット名
+      ETLパイプラインで作成したCuratedバケット
+
+  AthenaDatabase:
+    Type: String
+    Default: ""
+    Description: |
+      Athenaデータベース名（任意）
+      S3データをクエリする場合に使用
+
+  # ユーザー管理
+  AdminUserEmail:
+    Type: String
+    Description: |
+      QuickSight管理者メールアドレス
+      初期ユーザーとして設定
+
+  BusinessUsersEmails:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: |
+      ビジネスユーザーメールアドレス（カンマ区切り）
+      例: user1@example.com,user2@example.com
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # Enterpriseエディションかどうか
+  IsEnterprise: !Equals [!Ref QuickSightEdition, 'ENTERPRISE']
+  
+  # 新規QuickSightアカウント作成が必要か
+  CreateQuickSightAccount: !Equals [!Ref QuickSightAccountName, ""]
+  
+  # Athenaデータソースを使用するか
+  UseAthena: !Not [!Equals [!Ref AthenaDatabase, ""]]
+  
+  # ビジネスユーザーが指定されているか
+  HasBusinessUsers: !Not [!Equals [!Select [0, !Ref BusinessUsersEmails], ""]]
+
+Resources:
+  # ========================================
+  # QuickSight アカウント設定
+  # ========================================
+  # QuickSight アカウント（新規作成の場合）
+  QuickSightAccount:
+    Type: AWS::QuickSight::AccountCustomization
+    Condition: CreateQuickSightAccount
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DefaultTheme: !If [IsEnterprise, 'MIDNIGHT', 'CLASSIC']
+      DefaultEmailCustomizationTemplate: !If 
+        - IsEnterprise
+        - !Ref EmailCustomization
+        - !Ref AWS::NoValue
+
+  # メール カスタマイゼーション（Enterprise版のみ）
+  EmailCustomization:
+    Type: AWS::QuickSight::Template
+    Condition: IsEnterprise
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      TemplateId: !Sub '${ProjectName}-${EnvironmentName}-email-template'
+      Name: !Sub '${ProjectName} ${EnvironmentName} Email Template'
+      Definition:
+        DefaultPageLayout:
+          Canvas:
+            ParameterDeclarations: []
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # QuickSight データソース
+  # ========================================
+  # S3データソース
+  S3DataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub '${ProjectName}-${EnvironmentName}-s3-datasource'
+      Name: !Sub '${ProjectName} ${EnvironmentName} S3 Data Lake'
+      Type: S3
+      DataSourceParameters:
+        S3Parameters:
+          ManifestFileLocation:
+            Bucket: !Ref DataLakeS3Bucket
+            Key: manifests/data-manifest.json
+      Permissions:
+        - Principal: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${AdminUserEmail}'
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:UpdateDataSourcePermissions
+      SslProperties:
+        DisableSsl: false
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Athenaデータソース（オプション）
+  AthenaDataSource:
+    Type: AWS::QuickSight::DataSource
+    Condition: UseAthena
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub '${ProjectName}-${EnvironmentName}-athena-datasource'
+      Name: !Sub '${ProjectName} ${EnvironmentName} Athena Analytics'
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: primary
+      Permissions:
+        - Principal: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${AdminUserEmail}'
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:UpdateDataSourcePermissions
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # QuickSight データセット
+  # ========================================
+  # 売上分析データセット
+  SalesDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub '${ProjectName}-${EnvironmentName}-sales-dataset'
+      Name: !Sub '${ProjectName} ${EnvironmentName} Sales Analysis'
+      ImportMode: SPICE
+      PhysicalTableMap:
+        SalesTable:
+          S3Source:
+            DataSourceArn: !GetAtt S3DataSource.Arn
+            InputColumns:
+              - Name: sale_id
+                Type: STRING
+              - Name: product_id
+                Type: STRING
+              - Name: customer_id
+                Type: STRING
+              - Name: sale_date
+                Type: DATETIME
+              - Name: amount
+                Type: DECIMAL
+              - Name: quantity
+                Type: INTEGER
+              - Name: category
+                Type: STRING
+              - Name: region
+                Type: STRING
+      LogicalTableMap:
+        SalesLogicalTable:
+          Alias: Sales
+          Source:
+            PhysicalTableId: SalesTable
+          DataTransforms:
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: year_month
+                    ColumnId: year_month
+                    Expression: "formatDate(sale_date, 'yyyy-MM')"
+                  - ColumnName: revenue
+                    ColumnId: revenue
+                    Expression: "amount * quantity"
+            - FilterOperation:
+                ConditionExpression: "sale_date >= truncDate('MM', now() - 365)"
+      ColumnGroups:
+        - GeoSpatialColumnGroup:
+            Name: LocationGroup
+            CountryCode: JP
+            Columns:
+              - region
+      Permissions:
+        - Principal: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${AdminUserEmail}'
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ユーザー行動データセット
+  UserBehaviorDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub '${ProjectName}-${EnvironmentName}-userbehavior-dataset'
+      Name: !Sub '${ProjectName} ${EnvironmentName} User Behavior'
+      ImportMode: SPICE
+      PhysicalTableMap:
+        UserBehaviorTable:
+          S3Source:
+            DataSourceArn: !GetAtt S3DataSource.Arn
+            InputColumns:
+              - Name: user_id
+                Type: STRING
+              - Name: session_id
+                Type: STRING
+              - Name: event_type
+                Type: STRING
+              - Name: timestamp
+                Type: DATETIME
+              - Name: page_url
+                Type: STRING
+              - Name: device_type
+                Type: STRING
+              - Name: browser
+                Type: STRING
+              - Name: duration_seconds
+                Type: INTEGER
+      LogicalTableMap:
+        UserBehaviorLogicalTable:
+          Alias: UserBehavior
+          Source:
+            PhysicalTableId: UserBehaviorTable
+          DataTransforms:
+            - CreateColumnsOperation:
+                Columns:
+                  - ColumnName: hour_of_day
+                    ColumnId: hour_of_day
+                    Expression: "extract('HH', timestamp)"
+                  - ColumnName: day_of_week
+                    ColumnId: day_of_week
+                    Expression: "formatDate(timestamp, 'EEEE')"
+      Permissions:
+        - Principal: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${AdminUserEmail}'
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # QuickSight 分析（Analysis）
+  # ========================================
+  # 売上分析
+  SalesAnalysis:
+    Type: AWS::QuickSight::Analysis
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      AnalysisId: !Sub '${ProjectName}-${EnvironmentName}-sales-analysis'
+      Name: !Sub '${ProjectName} ${EnvironmentName} Sales Analysis'
+      Definition:
+        DataSetIdentifierDeclarations:
+          - DataSetArn: !GetAtt SalesDataSet.Arn
+            DataSetIdentifier: SalesData
+        Sheets:
+          - SheetId: SalesOverview
+            Name: 売上概要
+            Visuals:
+              - LineChartVisual:
+                  VisualId: MonthlySalesChart
+                  Title:
+                    Visibility: VISIBLE
+                    Value: 月次売上推移
+                  FieldWells:
+                    LineChartAggregatedFieldWells:
+                      Category:
+                        - FieldId: year_month
+                          Column:
+                            DataSetIdentifier: SalesData
+                            ColumnName: year_month
+                      Values:
+                        - FieldId: total_revenue
+                          Column:
+                            DataSetIdentifier: SalesData
+                            ColumnName: revenue
+                      Colors:
+                        - FieldId: category
+                          Column:
+                            DataSetIdentifier: SalesData
+                            ColumnName: category
+              - BarChartVisual:
+                  VisualId: RegionSalesChart
+                  Title:
+                    Visibility: VISIBLE
+                    Value: 地域別売上
+                  FieldWells:
+                    BarChartAggregatedFieldWells:
+                      Category:
+                        - FieldId: region
+                          Column:
+                            DataSetIdentifier: SalesData
+                            ColumnName: region
+                      Values:
+                        - FieldId: total_revenue
+                          Column:
+                            DataSetIdentifier: SalesData
+                            ColumnName: revenue
+              - PieChartVisual:
+                  VisualId: CategoryDistribution
+                  Title:
+                    Visibility: VISIBLE
+                    Value: カテゴリ別売上構成
+                  FieldWells:
+                    PieChartAggregatedFieldWells:
+                      Category:
+                        - FieldId: category
+                          Column:
+                            DataSetIdentifier: SalesData
+                            ColumnName: category
+                      Values:
+                        - FieldId: total_revenue
+                          Column:
+                            DataSetIdentifier: SalesData
+                            ColumnName: revenue
+      Permissions:
+        - Principal: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${AdminUserEmail}'
+          Actions:
+            - quicksight:RestoreAnalysis
+            - quicksight:UpdateAnalysisPermissions
+            - quicksight:DeleteAnalysis
+            - quicksight:QueryAnalysis
+            - quicksight:DescribeAnalysisPermissions
+            - quicksight:UpdateAnalysis
+            - quicksight:DescribeAnalysis
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # QuickSight ダッシュボード
+  # ========================================
+  # エグゼクティブダッシュボード
+  ExecutiveDashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DashboardId: !Sub '${ProjectName}-${EnvironmentName}-executive-dashboard'
+      Name: !Sub '${ProjectName} ${EnvironmentName} Executive Dashboard'
+      SourceEntity:
+        SourceTemplate:
+          DataSetReferences:
+            - DataSetArn: !GetAtt SalesDataSet.Arn
+              DataSetPlaceholder: SalesData
+            - DataSetArn: !GetAtt UserBehaviorDataSet.Arn
+              DataSetPlaceholder: UserBehaviorData
+          Arn: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:template/${ProjectName}-${EnvironmentName}-executive-template'
+      Permissions:
+        - Principal: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:user/default/${AdminUserEmail}'
+          Actions:
+            - quicksight:DescribeDashboard
+            - quicksight:ListDashboardVersions
+            - quicksight:UpdateDashboardPermissions
+            - quicksight:QueryDashboard
+            - quicksight:UpdateDashboard
+            - quicksight:DeleteDashboard
+            - quicksight:DescribeDashboardPermissions
+            - quicksight:UpdateDashboardPublishedVersion
+      DashboardPublishOptions:
+        AdHocFilteringOption:
+          AvailabilityStatus: !If [IsEnterprise, ENABLED, DISABLED]
+        ExportToCSVOption:
+          AvailabilityStatus: ENABLED
+        SheetControlsOption:
+          VisibilityState: EXPANDED
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # QuickSight ユーザー・グループ管理
+  # ========================================
+  # 管理者グループ
+  AdminGroup:
+    Type: AWS::QuickSight::Group
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      GroupName: !Sub '${ProjectName}-${EnvironmentName}-admins'
+      Description: QuickSight管理者グループ
+      Namespace: default
+
+  # ビジネスユーザーグループ
+  BusinessUsersGroup:
+    Type: AWS::QuickSight::Group
+    Condition: HasBusinessUsers
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      GroupName: !Sub '${ProjectName}-${EnvironmentName}-business-users'
+      Description: ビジネスユーザーグループ
+      Namespace: default
+
+  # ========================================
+  # Lambda関数（自動化）
+  # ========================================
+  # データセット更新Lambda
+  DataSetRefreshFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-dataset-refresh'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt QuickSightLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          SALES_DATASET_ID: !Ref SalesDataSet
+          USERBEHAVIOR_DATASET_ID: !Ref UserBehaviorDataSet
+          SNS_TOPIC_ARN: !Ref QuickSightNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          quicksight = boto3.client('quicksight')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              """QuickSightデータセットの自動更新"""
+              
+              try:
+                  account_id = os.environ['AWS_ACCOUNT_ID']
+                  datasets = [
+                      os.environ['SALES_DATASET_ID'],
+                      os.environ['USERBEHAVIOR_DATASET_ID']
+                  ]
+                  
+                  results = []
+                  
+                  for dataset_id in datasets:
+                      try:
+                          # データセット更新開始
+                          response = quicksight.create_ingestion(
+                              DataSetId=dataset_id,
+                              IngestionId=f"refresh-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}",
+                              AwsAccountId=account_id
+                          )
+                          
+                          results.append({
+                              'dataset_id': dataset_id,
+                              'status': 'STARTED',
+                              'ingestion_arn': response['IngestionArn']
+                          })
+                          
+                          print(f"Started refresh for dataset: {dataset_id}")
+                          
+                      except Exception as e:
+                          results.append({
+                              'dataset_id': dataset_id,
+                              'status': 'FAILED',
+                              'error': str(e)
+                          })
+                          print(f"Failed to refresh dataset {dataset_id}: {str(e)}")
+                  
+                  # 結果をSNSで通知
+                  message = {
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'refresh_results': results
+                  }
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=json.dumps(message, indent=2),
+                      Subject='QuickSight Dataset Refresh Results'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Dataset refresh completed',
+                          'results': results
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in dataset refresh: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 定期更新スケジュール
+  DataSetRefreshSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: QuickSightデータセット定期更新
+      ScheduleExpression: !If [IsProduction, 'cron(0 6 * * ? *)', 'cron(0 12 * * ? *)']
+      Targets:
+        - Arn: !GetAtt DataSetRefreshFunction.Arn
+          Id: DataSetRefreshTarget
+
+  DataSetRefreshPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DataSetRefreshFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataSetRefreshSchedule.Arn
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  # QuickSight Lambda実行ロール
+  QuickSightLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QuickSightLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - quicksight:CreateIngestion
+                  - quicksight:DescribeIngestion
+                  - quicksight:ListIngestions
+                  - quicksight:CancelIngestion
+                  - quicksight:DescribeDataSet
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref QuickSightNotificationTopic
+
+  # QuickSight サービスロール
+  QuickSightServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: quicksight.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QuickSightS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataLakeS3Bucket}'
+                  - !Sub 'arn:aws:s3:::${DataLakeS3Bucket}/*'
+        - PolicyName: QuickSightAthenaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:BatchGetQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:GetWorkGroup
+                  - athena:ListQueryExecutions
+                  - athena:StartQueryExecution
+                  - athena:StopQueryExecution
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: '*'
+
+  # ========================================
+  # SNS通知トピック
+  # ========================================
+  QuickSightNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-quicksight-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} QuickSight通知'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CloudWatch監視
+  # ========================================
+  # データセット更新失敗アラーム
+  DataSetRefreshFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-dataset-refresh-failures'
+      AlarmDescription: QuickSightデータセット更新失敗監視
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DataSetRefreshFunction
+      AlarmActions:
+        - !Ref QuickSightNotificationTopic
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # QuickSight リソース情報
+  ExecutiveDashboardURL:
+    Description: エグゼクティブダッシュボードURL
+    Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ExecutiveDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutiveDashboard-URL'
+
+  SalesDataSetId:
+    Description: 売上分析データセットID
+    Value: !Ref SalesDataSet
+    Export:
+      Name: !Sub '${AWS::StackName}-SalesDataSet'
+
+  UserBehaviorDataSetId:
+    Description: ユーザー行動データセットID
+    Value: !Ref UserBehaviorDataSet
+    Export:
+      Name: !Sub '${AWS::StackName}-UserBehaviorDataSet'
+
+  # 管理情報
+  QuickSightConsoleURL:
+    Description: QuickSight管理コンソールURL
+    Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/start'
+
+  DataSetRefreshFunctionArn:
+    Description: データセット更新Lambda関数ARN
+    Value: !GetAtt DataSetRefreshFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataSetRefreshFunction'
+
+  # 通知トピック
+  QuickSightNotificationTopicArn:
+    Description: QuickSight通知用SNSトピックARN
+    Value: !Ref QuickSightNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickSightNotificationTopic'
+
+  # QuickSight設定情報
+  QuickSightConfiguration:
+    Description: QuickSight設定概要
+    Value: !Sub |
+      QuickSight BI基盤:
+      - エディション: ${QuickSightEdition}
+      - ダッシュボード: https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ExecutiveDashboard}
+      - データソース: S3 (${DataLakeS3Bucket})
+      - 更新スケジュール: ${DataSetRefreshSchedule}
+      - 管理コンソール: https://${AWS::Region}.quicksight.aws.amazon.com/sn/start

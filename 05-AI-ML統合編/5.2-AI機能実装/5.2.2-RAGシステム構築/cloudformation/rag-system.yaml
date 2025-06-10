@@ -1,0 +1,1412 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  RAG (Retrieval-Augmented Generation) システム - AI文書検索・回答生成基盤
+  
+  このテンプレートは以下のリソースを作成します：
+  - OpenSearch（ベクトル検索・フルテキスト検索）
+  - Lambda関数（文書処理・埋め込み生成・検索・回答生成）
+  - S3（文書保存・処理済みデータ）
+  - DynamoDB（メタデータ・検索履歴）
+  - SQS（非同期文書処理）
+  - Step Functions（文書処理ワークフロー）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（t3.small.search）
+      - staging: ステージング環境（t3.medium.search）
+      - prod: 本番環境（m6g.large.search）
+
+  ProjectName:
+    Type: String
+    Default: rag-system
+    Description: リソース命名に使用するプロジェクト名
+
+  # BedrockセットアップからのImport
+  BedrockStackName:
+    Type: String
+    Description: |
+      Bedrockセットアップスタック名
+      bedrock-setup.yamlで作成されたスタック名
+
+  # OpenSearch設定
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    AllowedValues: 
+      - t3.small.search
+      - t3.medium.search
+      - m6g.large.search
+      - m6g.xlarge.search
+      - r6g.large.search
+    Description: |
+      OpenSearchインスタンスタイプ
+      - t3.small: 開発用（2 vCPU, 2 GB RAM）
+      - t3.medium: 検証用（2 vCPU, 4 GB RAM）
+      - m6g.large: 本番用（2 vCPU, 8 GB RAM）
+
+  OpenSearchInstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: |
+      OpenSearchインスタンス数
+      高可用性のため本番環境では3以上推奨
+
+  # ベクトル設定
+  EmbeddingModel:
+    Type: String
+    Default: amazon.titan-embed-text-v1
+    AllowedValues: 
+      - amazon.titan-embed-text-v1
+      - cohere.embed-english-v3
+      - cohere.embed-multilingual-v3
+    Description: |
+      埋め込みモデル
+      - Titan Embed: Amazon製・日本語対応
+      - Cohere English: 英語特化・高性能
+      - Cohere Multilingual: 多言語対応
+
+  VectorDimensions:
+    Type: Number
+    Default: 1536
+    AllowedValues: [512, 1024, 1536, 4096]
+    Description: |
+      ベクトル次元数
+      使用する埋め込みモデルに応じて設定
+
+  # 検索設定
+  MaxSearchResults:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: |
+      検索結果の最大件数
+      回答生成時のコンテキスト数
+
+  SimilarityThreshold:
+    Type: Number
+    Default: 0.7
+    MinValue: 0.1
+    MaxValue: 1.0
+    Description: |
+      類似度閾値（0.0-1.0）
+      この値未満の検索結果は除外
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # マルチインスタンス構成かどうか
+  IsMultiInstance: !Not [!Equals [!Ref OpenSearchInstanceCount, 1]]
+
+Resources:
+  # ========================================
+  # S3バケット（文書保存）
+  # ========================================
+  # 文書保存バケット
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-documents-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: 
+                Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKey'
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: documents/
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 処理済み文書バケット
+  ProcessedDocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-processed-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: 
+                Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKey'
+            BucketKeyEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # DynamoDB テーブル（メタデータ管理）
+  # ========================================
+  # 文書メタデータテーブル
+  DocumentMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-document-metadata'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: documentId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: uploadedAt
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: documentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserDocumentsIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: uploadedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: uploadedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 検索履歴テーブル
+  SearchHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-search-history'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: searchId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: searchedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: searchId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserSearchIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: searchedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # OpenSearch ドメイン
+  # ========================================
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Sub '${ProjectName}-${EnvironmentName}-search'
+      EngineVersion: 'OpenSearch_2.3'
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: !Ref OpenSearchInstanceCount
+        DedicatedMasterEnabled: !If [IsMultiInstance, true, false]
+        MasterInstanceType: !If [IsMultiInstance, 't3.small.search', !Ref 'AWS::NoValue']
+        MasterInstanceCount: !If [IsMultiInstance, 3, !Ref 'AWS::NoValue']
+        ZoneAwarenessEnabled: !If [IsMultiInstance, true, false]
+        ZoneAwarenessConfig: !If 
+          - IsMultiInstance
+          - AvailabilityZoneCount: 2
+          - !Ref 'AWS::NoValue'
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: !If [IsProduction, 100, 20]
+        Iops: !If [IsProduction, 3000, 3000]
+        Throughput: !If [IsProduction, 125, 125]
+      EncryptionAtRestOptions:
+        Enabled: true
+        KmsKeyId: 
+          Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKey'
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: 'Policy-Min-TLS-1-2-2019-07'
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt RAGLambdaRole.Arn
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ProjectName}-${EnvironmentName}-search/*'
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: false
+        MasterUserOptions:
+          MasterUserARN: !GetAtt RAGLambdaRole.Arn
+      LogPublishingOptions:
+        INDEX_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !Sub '${OpenSearchLogGroup.Arn}'
+          Enabled: true
+        SEARCH_SLOW_LOGS:
+          CloudWatchLogsLogGroupArn: !Sub '${OpenSearchLogGroup.Arn}'
+          Enabled: true
+        ES_APPLICATION_LOGS:
+          CloudWatchLogsLogGroupArn: !Sub '${OpenSearchLogGroup.Arn}'
+          Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # SQS キュー（非同期処理）
+  # ========================================
+  # 文書処理キュー
+  DocumentProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${EnvironmentName}-document-processing.fifo'
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeoutSeconds: 900  # 15分
+      MessageRetentionPeriod: 1209600  # 14日
+      DeadLetterTargetArn: !GetAtt DocumentProcessingDLQ.Arn
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DocumentProcessingDLQ.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # デッドレターキュー
+  DocumentProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${EnvironmentName}-document-processing-dlq.fifo'
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600  # 14日
+      KmsMasterKeyId: alias/aws/sqs
+
+  # ========================================
+  # Lambda関数群
+  # ========================================
+  # 文書処理Lambda
+  DocumentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-document-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RAGLambdaRole.Arn
+      Timeout: 900  # 15分
+      MemorySize: 3008
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET: !Ref DocumentsBucket
+          PROCESSED_BUCKET: !Ref ProcessedDocumentsBucket
+          METADATA_TABLE: !Ref DocumentMetadataTable
+          PROCESSING_QUEUE: !Ref DocumentProcessingQueue
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          EMBEDDING_MODEL: !Ref EmbeddingModel
+          VECTOR_DIMENSIONS: !Ref VectorDimensions
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import hashlib
+          from datetime import datetime, timedelta
+          from urllib.parse import unquote_plus
+          import base64
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          sqs = boto3.client('sqs')
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          
+          def lambda_handler(event, context):
+              """S3トリガーによる文書処理開始"""
+              
+              try:
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+                      
+                      print(f"Processing document: s3://{bucket}/{key}")
+                      
+                      # メタデータ生成
+                      document_id = generate_document_id(bucket, key)
+                      
+                      # DynamoDBにメタデータを保存
+                      save_document_metadata(document_id, bucket, key, 'processing')
+                      
+                      # 処理キューに送信
+                      queue_message = {
+                          'documentId': document_id,
+                          'bucket': bucket,
+                          'key': key,
+                          'timestamp': datetime.utcnow().isoformat()
+                      }
+                      
+                      sqs.send_message(
+                          QueueUrl=os.environ['PROCESSING_QUEUE'],
+                          MessageBody=json.dumps(queue_message),
+                          MessageGroupId=document_id,
+                          MessageDeduplicationId=document_id
+                      )
+                      
+                      print(f"Document queued for processing: {document_id}")
+                  
+                  return {'statusCode': 200, 'body': 'Documents queued for processing'}
+                  
+              except Exception as e:
+                  print(f"Error in document processor: {str(e)}")
+                  raise e
+          
+          def generate_document_id(bucket, key):
+              """文書IDを生成"""
+              content = f"{bucket}:{key}:{datetime.utcnow().isoformat()}"
+              return hashlib.sha256(content.encode()).hexdigest()[:16]
+          
+          def save_document_metadata(document_id, bucket, key, status):
+              """文書メタデータをDynamoDBに保存"""
+              
+              metadata_table = dynamodb.Table(os.environ['METADATA_TABLE'])
+              
+              # ファイル情報を取得
+              try:
+                  response = s3.head_object(Bucket=bucket, Key=key)
+                  file_size = response['ContentLength']
+                  content_type = response.get('ContentType', 'application/octet-stream')
+              except:
+                  file_size = 0
+                  content_type = 'unknown'
+              
+              # TTL設定（1年後）
+              ttl = int((datetime.utcnow() + timedelta(days=365)).timestamp())
+              
+              metadata_table.put_item(
+                  Item={
+                      'documentId': document_id,
+                      'bucket': bucket,
+                      'key': key,
+                      'status': status,
+                      'fileName': key.split('/')[-1],
+                      'fileSize': file_size,
+                      'contentType': content_type,
+                      'uploadedAt': datetime.utcnow().isoformat(),
+                      'userId': 'system',  # 実際の実装ではユーザーIDを設定
+                      'ttl': ttl
+                  }
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 文書処理ワーカーLambda
+  DocumentProcessingWorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-document-worker'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RAGLambdaRole.Arn
+      Timeout: 900  # 15分
+      MemorySize: 3008
+      ReservedConcurrencyLimit: !If [IsProduction, 20, 5]
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET: !Ref DocumentsBucket
+          PROCESSED_BUCKET: !Ref ProcessedDocumentsBucket
+          METADATA_TABLE: !Ref DocumentMetadataTable
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          EMBEDDING_MODEL: !Ref EmbeddingModel
+          VECTOR_DIMENSIONS: !Ref VectorDimensions
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import hashlib
+          from datetime import datetime
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from aws_requests_auth.aws_auth import AWSRequestsAuth
+          import PyPDF2
+          import docx
+          import chardet
+          
+          s3 = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          
+          def lambda_handler(event, context):
+              """SQSトリガーによる文書処理"""
+              
+              try:
+                  for record in event['Records']:
+                      message_data = json.loads(record['body'])
+                      document_id = message_data['documentId']
+                      bucket = message_data['bucket']
+                      key = message_data['key']
+                      
+                      print(f"Processing document: {document_id}")
+                      
+                      # 文書の読み込みとテキスト抽出
+                      text_content = extract_text_from_document(bucket, key)
+                      
+                      if not text_content:
+                          update_document_status(document_id, 'failed', 'Failed to extract text')
+                          continue
+                      
+                      # テキストをチャンクに分割
+                      chunks = split_text_into_chunks(text_content)
+                      
+                      # 各チャンクの埋め込みを生成
+                      embeddings = generate_embeddings(chunks)
+                      
+                      # OpenSearchにインデックス
+                      index_documents_to_opensearch(document_id, chunks, embeddings, {
+                          'bucket': bucket,
+                          'key': key,
+                          'fileName': key.split('/')[-1]
+                      })
+                      
+                      # 処理済みデータをS3に保存
+                      save_processed_data(document_id, {
+                          'chunks': chunks,
+                          'embeddings': embeddings,
+                          'metadata': {
+                              'bucket': bucket,
+                              'key': key,
+                              'processedAt': datetime.utcnow().isoformat()
+                          }
+                      })
+                      
+                      # ステータス更新
+                      update_document_status(document_id, 'completed', f'Processed {len(chunks)} chunks')
+                      
+                      print(f"Document processing completed: {document_id}")
+                  
+                  return {'statusCode': 200, 'body': 'Documents processed successfully'}
+                  
+              except Exception as e:
+                  print(f"Error in document processing worker: {str(e)}")
+                  raise e
+          
+          def extract_text_from_document(bucket, key):
+              """文書からテキストを抽出"""
+              
+              try:
+                  # S3から文書をダウンロード
+                  response = s3.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read()
+                  
+                  # ファイル拡張子に応じてテキスト抽出
+                  file_extension = key.lower().split('.')[-1]
+                  
+                  if file_extension == 'pdf':
+                      return extract_text_from_pdf(content)
+                  elif file_extension in ['docx', 'doc']:
+                      return extract_text_from_docx(content)
+                  elif file_extension == 'txt':
+                      return extract_text_from_txt(content)
+                  else:
+                      print(f"Unsupported file type: {file_extension}")
+                      return None
+                      
+              except Exception as e:
+                  print(f"Error extracting text: {str(e)}")
+                  return None
+          
+          def extract_text_from_pdf(content):
+              """PDFからテキスト抽出"""
+              # 実装省略：PyPDF2を使用してPDFからテキストを抽出
+              return "PDF text extraction implementation"
+          
+          def extract_text_from_docx(content):
+              """DOCXからテキスト抽出"""
+              # 実装省略：python-docxを使用してDOCXからテキストを抽出
+              return "DOCX text extraction implementation"
+          
+          def extract_text_from_txt(content):
+              """TXTからテキスト抽出"""
+              try:
+                  # 文字エンコーディングを検出
+                  detected = chardet.detect(content)
+                  encoding = detected.get('encoding', 'utf-8')
+                  
+                  return content.decode(encoding)
+              except:
+                  return content.decode('utf-8', errors='ignore')
+          
+          def split_text_into_chunks(text, chunk_size=1000, overlap=200):
+              """テキストをチャンクに分割"""
+              chunks = []
+              start = 0
+              
+              while start < len(text):
+                  end = start + chunk_size
+                  chunk = text[start:end]
+                  
+                  # 文の途中で切れないように調整
+                  if end < len(text):
+                      last_period = chunk.rfind('。')
+                      last_newline = chunk.rfind('\n')
+                      last_break = max(last_period, last_newline)
+                      
+                      if last_break > start + chunk_size // 2:
+                          chunk = text[start:start + last_break + 1]
+                          end = start + last_break + 1
+                  
+                  chunks.append(chunk.strip())
+                  start = end - overlap
+              
+              return [chunk for chunk in chunks if len(chunk.strip()) > 50]
+          
+          def generate_embeddings(chunks):
+              """テキストチャンクの埋め込みを生成"""
+              embeddings = []
+              
+              for chunk in chunks:
+                  try:
+                      embedding = generate_single_embedding(chunk)
+                      embeddings.append(embedding)
+                  except Exception as e:
+                      print(f"Error generating embedding: {str(e)}")
+                      embeddings.append([0.0] * int(os.environ['VECTOR_DIMENSIONS']))
+              
+              return embeddings
+          
+          def generate_single_embedding(text):
+              """単一テキストの埋め込み生成"""
+              
+              model_id = os.environ['EMBEDDING_MODEL']
+              
+              request_body = {
+                  "inputText": text
+              }
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId=model_id,
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              return response_body.get('embedding', [])
+          
+          def index_documents_to_opensearch(document_id, chunks, embeddings, metadata):
+              """OpenSearchにドキュメントをインデックス"""
+              
+              # OpenSearch接続設定
+              host = os.environ['OPENSEARCH_ENDPOINT']
+              region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+              service = 'es'
+              credentials = boto3.Session().get_credentials()
+              awsauth = AWSRequestsAuth(credentials, region, service)
+              
+              client = OpenSearch(
+                  hosts=[{'host': host, 'port': 443}],
+                  http_auth=awsauth,
+                  use_ssl=True,
+                  verify_certs=True,
+                  connection_class=RequestsHttpConnection
+              )
+              
+              index_name = f"{os.environ['PROJECT_NAME']}-{os.environ['ENVIRONMENT']}-documents"
+              
+              # インデックス作成（存在しない場合）
+              if not client.indices.exists(index=index_name):
+                  create_opensearch_index(client, index_name)
+              
+              # ドキュメントをインデックス
+              for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+                  doc_body = {
+                      'document_id': document_id,
+                      'chunk_id': f"{document_id}_{i}",
+                      'content': chunk,
+                      'vector': embedding,
+                      'metadata': metadata,
+                      'indexed_at': datetime.utcnow().isoformat()
+                  }
+                  
+                  client.index(
+                      index=index_name,
+                      id=f"{document_id}_{i}",
+                      body=doc_body
+                  )
+          
+          def create_opensearch_index(client, index_name):
+              """OpenSearchインデックスを作成"""
+              
+              vector_dims = int(os.environ['VECTOR_DIMENSIONS'])
+              
+              index_body = {
+                  'settings': {
+                      'index': {
+                          'knn': True
+                      }
+                  },
+                  'mappings': {
+                      'properties': {
+                          'document_id': {'type': 'keyword'},
+                          'chunk_id': {'type': 'keyword'},
+                          'content': {'type': 'text', 'analyzer': 'standard'},
+                          'vector': {
+                              'type': 'knn_vector',
+                              'dimension': vector_dims,
+                              'method': {
+                                  'name': 'hnsw',
+                                  'space_type': 'cosinesimil',
+                                  'engine': 'lucene'
+                              }
+                          },
+                          'metadata': {'type': 'object'},
+                          'indexed_at': {'type': 'date'}
+                      }
+                  }
+              }
+              
+              client.indices.create(index=index_name, body=index_body)
+          
+          def save_processed_data(document_id, data):
+              """処理済みデータをS3に保存"""
+              
+              key = f"processed/{document_id}.json"
+              
+              s3.put_object(
+                  Bucket=os.environ['PROCESSED_BUCKET'],
+                  Key=key,
+                  Body=json.dumps(data, ensure_ascii=False, indent=2),
+                  ContentType='application/json'
+              )
+          
+          def update_document_status(document_id, status, message=''):
+              """文書ステータスを更新"""
+              
+              metadata_table = dynamodb.Table(os.environ['METADATA_TABLE'])
+              
+              metadata_table.update_item(
+                  Key={'documentId': document_id},
+                  UpdateExpression='SET #status = :status, processedAt = :timestamp, processingMessage = :message',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': status,
+                      ':timestamp': datetime.utcnow().isoformat(),
+                      ':message': message
+                  }
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 検索・回答生成Lambda
+  SearchAndAnswerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-search-answer'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt RAGLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          SEARCH_HISTORY_TABLE: !Ref SearchHistoryTable
+          EMBEDDING_MODEL: !Ref EmbeddingModel
+          VECTOR_DIMENSIONS: !Ref VectorDimensions
+          MAX_SEARCH_RESULTS: !Ref MaxSearchResults
+          SIMILARITY_THRESHOLD: !Ref SimilarityThreshold
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime, timedelta
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from aws_requests_auth.aws_auth import AWSRequestsAuth
+          
+          dynamodb = boto3.resource('dynamodb')
+          bedrock_runtime = boto3.client('bedrock-runtime')
+          
+          def lambda_handler(event, context):
+              """検索・回答生成API"""
+              
+              try:
+                  # リクエストの解析
+                  if 'body' in event:
+                      request_body = json.loads(event['body'])
+                  else:
+                      request_body = event
+                  
+                  query = request_body.get('query', '')
+                  user_id = request_body.get('userId', 'anonymous')
+                  search_type = request_body.get('searchType', 'semantic')  # semantic, keyword, hybrid
+                  
+                  if not query.strip():
+                      return error_response(400, "Query is required")
+                  
+                  # 検索実行
+                  search_results = perform_search(query, search_type)
+                  
+                  # AI回答生成
+                  answer = generate_answer(query, search_results)
+                  
+                  # 検索履歴保存
+                  search_id = str(uuid.uuid4())
+                  save_search_history(search_id, user_id, query, search_results, answer)
+                  
+                  return success_response({
+                      'searchId': search_id,
+                      'query': query,
+                      'answer': answer,
+                      'sources': [
+                          {
+                              'document_id': result['_source']['document_id'],
+                              'content': result['_source']['content'][:200] + '...',
+                              'score': result['_score'],
+                              'metadata': result['_source'].get('metadata', {})
+                          }
+                          for result in search_results
+                      ],
+                      'timestamp': datetime.utcnow().isoformat()
+                  })
+                  
+              except Exception as e:
+                  print(f"Error in search and answer: {str(e)}")
+                  return error_response(500, f"Internal server error: {str(e)}")
+          
+          def perform_search(query, search_type):
+              """検索実行"""
+              
+              # OpenSearch接続
+              host = os.environ['OPENSEARCH_ENDPOINT']
+              region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+              service = 'es'
+              credentials = boto3.Session().get_credentials()
+              awsauth = AWSRequestsAuth(credentials, region, service)
+              
+              client = OpenSearch(
+                  hosts=[{'host': host, 'port': 443}],
+                  http_auth=awsauth,
+                  use_ssl=True,
+                  verify_certs=True,
+                  connection_class=RequestsHttpConnection
+              )
+              
+              index_name = f"{os.environ['PROJECT_NAME']}-{os.environ['ENVIRONMENT']}-documents"
+              
+              if search_type == 'semantic':
+                  return semantic_search(client, index_name, query)
+              elif search_type == 'keyword':
+                  return keyword_search(client, index_name, query)
+              elif search_type == 'hybrid':
+                  return hybrid_search(client, index_name, query)
+              else:
+                  return semantic_search(client, index_name, query)
+          
+          def semantic_search(client, index_name, query):
+              """セマンティック検索（ベクトル検索）"""
+              
+              # クエリの埋め込み生成
+              query_embedding = generate_query_embedding(query)
+              
+              search_body = {
+                  'size': int(os.environ['MAX_SEARCH_RESULTS']),
+                  'query': {
+                      'knn': {
+                          'vector': {
+                              'vector': query_embedding,
+                              'k': int(os.environ['MAX_SEARCH_RESULTS'])
+                          }
+                      }
+                  },
+                  '_source': ['document_id', 'chunk_id', 'content', 'metadata']
+              }
+              
+              response = client.search(index=index_name, body=search_body)
+              
+              # 類似度フィルタリング
+              threshold = float(os.environ['SIMILARITY_THRESHOLD'])
+              filtered_hits = [
+                  hit for hit in response['hits']['hits'] 
+                  if hit['_score'] >= threshold
+              ]
+              
+              return filtered_hits
+          
+          def keyword_search(client, index_name, query):
+              """キーワード検索（フルテキスト検索）"""
+              
+              search_body = {
+                  'size': int(os.environ['MAX_SEARCH_RESULTS']),
+                  'query': {
+                      'match': {
+                          'content': {
+                              'query': query,
+                              'operator': 'and'
+                          }
+                      }
+                  },
+                  '_source': ['document_id', 'chunk_id', 'content', 'metadata']
+              }
+              
+              response = client.search(index=index_name, body=search_body)
+              return response['hits']['hits']
+          
+          def hybrid_search(client, index_name, query):
+              """ハイブリッド検索（セマンティック + キーワード）"""
+              
+              # クエリの埋め込み生成
+              query_embedding = generate_query_embedding(query)
+              
+              search_body = {
+                  'size': int(os.environ['MAX_SEARCH_RESULTS']),
+                  'query': {
+                      'bool': {
+                          'should': [
+                              {
+                                  'knn': {
+                                      'vector': {
+                                          'vector': query_embedding,
+                                          'k': int(os.environ['MAX_SEARCH_RESULTS'])
+                                      }
+                                  }
+                              },
+                              {
+                                  'match': {
+                                      'content': {
+                                          'query': query,
+                                          'boost': 0.5
+                                      }
+                                  }
+                              }
+                          ]
+                      }
+                  },
+                  '_source': ['document_id', 'chunk_id', 'content', 'metadata']
+              }
+              
+              response = client.search(index=index_name, body=search_body)
+              return response['hits']['hits']
+          
+          def generate_query_embedding(query):
+              """クエリの埋め込み生成"""
+              
+              model_id = os.environ['EMBEDDING_MODEL']
+              
+              request_body = {
+                  "inputText": query
+              }
+              
+              response = bedrock_runtime.invoke_model(
+                  modelId=model_id,
+                  body=json.dumps(request_body),
+                  contentType="application/json",
+                  accept="application/json"
+              )
+              
+              response_body = json.loads(response['body'].read())
+              return response_body.get('embedding', [])
+          
+          def generate_answer(query, search_results):
+              """検索結果を基にAI回答を生成"""
+              
+              if not search_results:
+                  return "申し訳ございませんが、関連する情報が見つかりませんでした。"
+              
+              # コンテキスト構築
+              context_parts = []
+              for result in search_results[:5]:  # 上位5件を使用
+                  content = result['_source']['content']
+                  context_parts.append(content)
+              
+              context = "\n\n".join(context_parts)
+              
+              # プロンプト構築
+              prompt = f"""以下の文書に基づいて、質問に対して正確で役立つ回答を提供してください。
+
+文書内容:
+{context}
+
+質問: {query}
+
+回答:"""
+              
+              # Claude 3で回答生成
+              try:
+                  request_body = {
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 1000,
+                      "messages": [
+                          {
+                              "role": "user",
+                              "content": prompt
+                          }
+                      ],
+                      "temperature": 0.3,
+                      "top_p": 0.9
+                  }
+                  
+                  response = bedrock_runtime.invoke_model(
+                      modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+                      body=json.dumps(request_body),
+                      contentType="application/json",
+                      accept="application/json"
+                  )
+                  
+                  response_body = json.loads(response['body'].read())
+                  answer = response_body.get('content', [{}])[0].get('text', '')
+                  
+                  return answer or "申し訳ございませんが、回答を生成できませんでした。"
+                  
+              except Exception as e:
+                  print(f"Error generating answer: {str(e)}")
+                  return "申し訳ございませんが、回答の生成中にエラーが発生しました。"
+          
+          def save_search_history(search_id, user_id, query, search_results, answer):
+              """検索履歴を保存"""
+              
+              search_history_table = dynamodb.Table(os.environ['SEARCH_HISTORY_TABLE'])
+              
+              # TTL設定（90日後）
+              ttl = int((datetime.utcnow() + timedelta(days=90)).timestamp())
+              
+              search_history_table.put_item(
+                  Item={
+                      'searchId': search_id,
+                      'userId': user_id,
+                      'query': query,
+                      'answer': answer,
+                      'resultCount': len(search_results),
+                      'searchedAt': datetime.utcnow().isoformat(),
+                      'ttl': ttl
+                  }
+              )
+          
+          def success_response(data):
+              """成功レスポンス"""
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(data, ensure_ascii=False)
+              }
+          
+          def error_response(status_code, message):
+              """エラーレスポンス"""
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps({
+                      'error': message
+                  }, ensure_ascii=False)
+              }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SQSトリガー設定
+  DocumentProcessingEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DocumentProcessingQueue.Arn
+      FunctionName: !Ref DocumentProcessingWorkerFunction
+      BatchSize: 1
+      MaximumBatchingWindowInSeconds: 5
+
+  # S3トリガー権限
+  DocumentProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DocumentProcessorFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${DocumentsBucket}'
+
+  # ========================================
+  # REST API Gateway
+  # ========================================
+  # REST API
+  RAGApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-rag-api'
+      Description: RAG System REST API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+
+  # API Gateway リソース
+  SearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RAGApi
+      ParentId: !GetAtt RAGApi.RootResourceId
+      PathPart: search
+
+  # POST メソッド
+  SearchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RAGApi
+      ResourceId: !Ref SearchResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchAndAnswerFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API デプロイメント
+  RAGApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SearchMethod
+    Properties:
+      RestApiId: !Ref RAGApi
+      Description: !Sub '${EnvironmentName} deployment'
+
+  # API ステージ
+  RAGApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RAGApi
+      DeploymentId: !Ref RAGApiDeployment
+      StageName: !Ref EnvironmentName
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: !If [IsProduction, ERROR, INFO]
+          DataTraceEnabled: !If [IsProduction, false, true]
+          MetricsEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda実行権限
+  SearchAndAnswerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SearchAndAnswerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RAGApi}/*'
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  RAGLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RAGLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/cohere.embed-*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DocumentsBucket}/*'
+                  - !Sub '${ProcessedDocumentsBucket}/*'
+                  - !GetAtt DocumentsBucket.Arn
+                  - !GetAtt ProcessedDocumentsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt DocumentMetadataTable.Arn
+                  - !Sub '${DocumentMetadataTable.Arn}/index/*'
+                  - !GetAtt SearchHistoryTable.Arn
+                  - !Sub '${SearchHistoryTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                Resource: 
+                  - !GetAtt DocumentProcessingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpGet
+                  - es:ESHttpHead
+                  - es:ESHttpDelete
+                Resource: !Sub '${OpenSearchDomain.DomainArn}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: 
+                  Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKeyArn'
+
+  # ========================================
+  # CloudWatch 監視
+  # ========================================
+  # OpenSearchログ
+  OpenSearchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/opensearch/${ProjectName}-${EnvironmentName}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # Lambda ログ
+  DocumentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-document-processor'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  DocumentProcessingWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-document-worker'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  SearchAndAnswerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-search-answer'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # OpenSearchクラスター健全性アラーム
+  OpenSearchClusterHealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-opensearch-cluster-health'
+      AlarmDescription: OpenSearchクラスター健全性監視
+      MetricName: ClusterStatus.red
+      Namespace: AWS/ES
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: DomainName
+          Value: !Ref OpenSearchDomain
+        - Name: ClientId
+          Value: !Ref AWS::AccountId
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # API エンドポイント
+  RAGApiEndpoint:
+    Description: RAG System API エンドポイント
+    Value: !Sub 'https://${RAGApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/search'
+    Export:
+      Name: !Sub '${AWS::StackName}-RAGApiEndpoint'
+
+  # OpenSearch情報
+  OpenSearchDomainEndpoint:
+    Description: OpenSearchドメインエンドポイント
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchEndpoint'
+
+  OpenSearchDashboardsURL:
+    Description: OpenSearchダッシュボードURL
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}/_dashboards/'
+
+  # S3バケット
+  DocumentsBucketName:
+    Description: 文書保存S3バケット名
+    Value: !Ref DocumentsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DocumentsBucket'
+
+  ProcessedDocumentsBucketName:
+    Description: 処理済み文書S3バケット名
+    Value: !Ref ProcessedDocumentsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDocumentsBucket'
+
+  # Lambda関数
+  DocumentProcessorFunctionArn:
+    Description: 文書処理Lambda関数ARN
+    Value: !GetAtt DocumentProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DocumentProcessorFunction'
+
+  SearchAndAnswerFunctionArn:
+    Description: 検索・回答生成Lambda関数ARN
+    Value: !GetAtt SearchAndAnswerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SearchAndAnswerFunction'
+
+  # DynamoDB テーブル
+  DocumentMetadataTableName:
+    Description: 文書メタデータテーブル名
+    Value: !Ref DocumentMetadataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DocumentMetadataTable'
+
+  SearchHistoryTableName:
+    Description: 検索履歴テーブル名
+    Value: !Ref SearchHistoryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-SearchHistoryTable'
+
+  # 使用例
+  RAGSystemUsageExample:
+    Description: RAGシステム使用例
+    Value: !Sub |
+      RAGシステム使用例:
+      
+      1. 文書アップロード:
+      aws s3 cp document.pdf s3://${DocumentsBucket}/documents/
+      
+      2. 検索・回答取得:
+      curl -X POST ${RAGApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/search \
+        -H "Content-Type: application/json" \
+        -d '{"query": "検索したい内容", "userId": "user123", "searchType": "semantic"}'
+      
+      3. OpenSearchダッシュボード:
+      https://${OpenSearchDomain.DomainEndpoint}/_dashboards/
+
+  # 設定概要
+  RAGSystemConfiguration:
+    Description: RAGシステム設定概要
+    Value: !Sub |
+      RAG System Configuration:
+      - API: https://${RAGApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/search
+      - OpenSearch: ${OpenSearchDomain.DomainEndpoint}
+      - Embedding Model: ${EmbeddingModel}
+      - Vector Dimensions: ${VectorDimensions}
+      - Documents Bucket: s3://${DocumentsBucket}/
+      - Max Search Results: ${MaxSearchResults}
+      - Similarity Threshold: ${SimilarityThreshold}

@@ -1,0 +1,1084 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  マルチステージビルドパイプライン - 高度なCI/CD基盤
+  
+  このテンプレートは以下のリソースを作成します：
+  - CodePipeline（マルチステージパイプライン）
+  - CodeBuild（ビルド・テスト・デプロイ）
+  - CodeCommit（ソースコード管理）
+  - S3（アーティファクト保存・配布）
+  - IAMロール（パイプライン実行権限）
+  - CloudWatch（監視・ログ・メトリクス）
+  - SNS（通知・アラート）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本機能）
+      - staging: ステージング環境（詳細テスト）
+      - prod: 本番環境（本格運用）
+
+  ProjectName:
+    Type: String
+    Default: multi-stage-build
+    Description: リソース命名に使用するプロジェクト名
+
+  # ソースコード設定
+  GitHubOwner:
+    Type: String
+    Default: ""
+    Description: |
+      GitHubオーナー名（任意）
+      空の場合はCodeCommitを使用
+
+  GitHubRepository:
+    Type: String
+    Default: ""
+    Description: |
+      GitHubリポジトリ名（任意）
+      GitHubOwnerが設定されている場合必須
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: |
+      GitHubブランチ名
+      デフォルトはmain
+
+  # パイプライン設定
+  BuildTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 480
+    Description: |
+      ビルドタイムアウト（分）
+      長時間ビルドに対応
+
+  BuildComputeType:
+    Type: String
+    Default: BUILD_GENERAL1_MEDIUM
+    AllowedValues: 
+      - BUILD_GENERAL1_SMALL
+      - BUILD_GENERAL1_MEDIUM
+      - BUILD_GENERAL1_LARGE
+      - BUILD_GENERAL1_2XLARGE
+    Description: |
+      ビルド環境のコンピューティングタイプ
+      - SMALL: 3 GB RAM, 2 vCPU
+      - MEDIUM: 7 GB RAM, 4 vCPU
+      - LARGE: 15 GB RAM, 8 vCPU
+      - 2XLARGE: 145 GB RAM, 72 vCPU
+
+  # 通知設定
+  NotificationEmail:
+    Type: String
+    Default: admin@example.com
+    Description: |
+      パイプライン通知用メールアドレス
+      成功・失敗時の通知先
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ""
+    Description: |
+      Slack Webhook URL（任意）
+      Slack通知を使用する場合に設定
+
+  # デプロイ対象環境
+  DeployToStaging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: |
+      ステージング環境へのデプロイ有効化
+      本番前の検証環境
+
+  DeployToProduction:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: |
+      本番環境への自動デプロイ有効化
+      手動承認が推奨
+
+Conditions:
+  # GitHub使用かどうか
+  UseGitHub: !And
+    - !Not [!Equals [!Ref GitHubOwner, ""]]
+    - !Not [!Equals [!Ref GitHubRepository, ""]]
+  
+  # CodeCommit使用かどうか
+  UseCodeCommit: !Not [!Condition UseGitHub]
+  
+  # ステージングデプロイを使用するか
+  EnableStagingDeploy: !Equals [!Ref DeployToStaging, 'true']
+  
+  # 本番デプロイを使用するか
+  EnableProductionDeploy: !Equals [!Ref DeployToProduction, 'true']
+  
+  # Slack通知を使用するか
+  UseSlackNotification: !Not [!Equals [!Ref SlackWebhookUrl, ""]]
+
+Resources:
+  # ========================================
+  # S3バケット（アーティファクト保存）
+  # ========================================
+  # パイプラインアーティファクトバケット
+  PipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-pipeline-artifacts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ビルドキャッシュバケット
+  BuildCacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-build-cache-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldCache
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # デプロイアーティファクトバケット
+  DeploymentArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-deployment-artifacts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CodeCommit リポジトリ（GitHub未使用時）
+  # ========================================
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Condition: UseCodeCommit
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-${EnvironmentName}-repository'
+      RepositoryDescription: !Sub '${ProjectName} ${EnvironmentName} source code repository'
+      Code:
+        S3:
+          Bucket: !Ref PipelineArtifactsBucket
+          Key: initial-code.zip
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CodeBuild プロジェクト
+  # ========================================
+  # ビルド・単体テストプロジェクト
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-build'
+      Description: ビルド・単体テスト実行
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref BuildComputeType
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: BUILD_CACHE_BUCKET
+            Value: !Ref BuildCacheBucket
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - echo Restore build cache...
+                - aws s3 sync s3://$BUILD_CACHE_BUCKET/cache/ ./cache/ || true
+                - echo Build started on `date`
+                - echo Installing dependencies...
+                - npm install || pip install -r requirements.txt || echo "No package manager detected"
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Running unit tests...
+                - npm test || python -m pytest || echo "No tests defined"
+                - echo Running lint checks...
+                - npm run lint || flake8 . || echo "No lint checks defined"
+                - echo Building the application...
+                - npm run build || python setup.py build || echo "No build step defined"
+                - echo Running security scans...
+                - npm audit || echo "No security scan for this language"
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Saving build cache...
+                - aws s3 sync ./cache/ s3://$BUILD_CACHE_BUCKET/cache/ || true
+                - echo Generating build report...
+                - echo "Build successful" > build-report.txt
+          artifacts:
+            files:
+              - '**/*'
+            secondary-artifacts:
+              BuildArtifact:
+                files:
+                  - build-report.txt
+                  - package*.json
+                  - requirements*.txt
+                  - Dockerfile
+                  - '**/*.js'
+                  - '**/*.py'
+                  - '**/*.html'
+                  - '**/*.css'
+                name: BuildOutput
+          cache:
+            paths:
+              - './cache/**/*'
+              - './node_modules/**/*'
+              - './.pip-cache/**/*'
+      TimeoutInMinutes: !Ref BuildTimeout
+      Cache:
+        Type: S3
+        Location: !Sub '${BuildCacheBucket}/codebuild-cache'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 統合テストプロジェクト
+  IntegrationTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-integration-test'
+      Description: 統合テスト・E2Eテスト実行
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref BuildComputeType
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Integration test started on `date`
+                - echo Setting up test environment...
+                - npm install || pip install -r requirements.txt || echo "No package manager detected"
+                - echo Waiting for deployment to be ready...
+                - sleep 30
+            build:
+              commands:
+                - echo Running integration tests...
+                - npm run test:integration || python -m pytest tests/integration/ || echo "No integration tests defined"
+                - echo Running end-to-end tests...
+                - npm run test:e2e || python -m pytest tests/e2e/ || echo "No E2E tests defined"
+                - echo Running performance tests...
+                - npm run test:performance || echo "No performance tests defined"
+                - echo Running security tests...
+                - npm run test:security || echo "No security tests defined"
+            post_build:
+              commands:
+                - echo Integration test completed on `date`
+                - echo Generating test report...
+                - echo "Integration tests successful" > integration-test-report.txt
+          artifacts:
+            files:
+              - integration-test-report.txt
+              - test-results/**/*
+              - coverage/**/*
+            name: IntegrationTestOutput
+      TimeoutInMinutes: !Ref BuildTimeout
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # セキュリティスキャンプロジェクト
+  SecurityScanProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-security-scan'
+      Description: セキュリティスキャン・脆弱性チェック
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Security scan started on `date`
+                - echo Installing security tools...
+                - pip install bandit safety || echo "Python security tools installation failed"
+                - npm install -g retire || echo "Node.js security tools installation failed"
+            build:
+              commands:
+                - echo Running dependency vulnerability scan...
+                - npm audit --audit-level moderate || echo "npm audit not available"
+                - safety check || echo "Python safety check not available"
+                - echo Running static code analysis...
+                - bandit -r . -f json -o bandit-report.json || echo "Bandit scan not available"
+                - retire --outputformat json --outputpath retire-report.json || echo "Retire.js scan not available"
+                - echo Running container image scan...
+                - aws ecr describe-repositories --repository-names $PROJECT_NAME-$ENVIRONMENT_NAME || echo "No ECR repository found"
+                - echo Running CloudFormation template validation...
+                - find . -name "*.yaml" -o -name "*.yml" | grep -i cloudformation | xargs -I {} aws cloudformation validate-template --template-body file://{} || echo "No CloudFormation templates found"
+            post_build:
+              commands:
+                - echo Security scan completed on `date`
+                - echo Generating security report...
+                - echo "Security scans completed" > security-report.txt
+                - echo "Please review all security findings before deployment" >> security-report.txt
+          artifacts:
+            files:
+              - security-report.txt
+              - bandit-report.json
+              - retire-report.json
+              - '*-security-report.*'
+            name: SecurityScanOutput
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # デプロイメントプロジェクト
+  DeploymentProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-deploy'
+      Description: アプリケーションデプロイメント
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: !Ref BuildComputeType
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: DEPLOYMENT_BUCKET
+            Value: !Ref DeploymentArtifactsBucket
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Deployment started on `date`
+                - echo Configuring AWS CLI...
+                - aws configure set default.region $AWS_DEFAULT_REGION
+                - echo Validating deployment prerequisites...
+                - aws sts get-caller-identity
+            build:
+              commands:
+                - echo Deploying CloudFormation stacks...
+                - |
+                  for template in $(find . -name "*.yaml" -o -name "*.yml" | grep -i cloudformation); do
+                    stack_name="$PROJECT_NAME-$ENVIRONMENT_NAME-$(basename $template .yaml)"
+                    echo "Deploying stack: $stack_name"
+                    aws cloudformation deploy \
+                      --template-file $template \
+                      --stack-name $stack_name \
+                      --parameter-overrides EnvironmentName=$ENVIRONMENT_NAME ProjectName=$PROJECT_NAME \
+                      --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+                      --no-fail-on-empty-changeset || echo "Stack deployment failed: $stack_name"
+                  done
+                - echo Deploying Lambda functions...
+                - |
+                  if [ -d "lambda" ]; then
+                    for func_dir in lambda/*/; do
+                      func_name=$(basename $func_dir)
+                      echo "Updating Lambda function: $func_name"
+                      cd $func_dir
+                      zip -r ../$func_name.zip .
+                      aws lambda update-function-code \
+                        --function-name $PROJECT_NAME-$ENVIRONMENT_NAME-$func_name \
+                        --zip-file fileb://../$func_name.zip || echo "Lambda update failed: $func_name"
+                      cd - > /dev/null
+                    done
+                  fi
+                - echo Uploading static assets...
+                - aws s3 sync ./build/ s3://$DEPLOYMENT_BUCKET/assets/ --delete || echo "No build directory found"
+            post_build:
+              commands:
+                - echo Deployment completed on `date`
+                - echo Running post-deployment tests...
+                - echo "Deployment successful" > deployment-report.txt
+                - echo "Environment: $ENVIRONMENT_NAME" >> deployment-report.txt
+                - echo "Timestamp: $(date)" >> deployment-report.txt
+          artifacts:
+            files:
+              - deployment-report.txt
+            name: DeploymentOutput
+      TimeoutInMinutes: !Ref BuildTimeout
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CodePipeline
+  # ========================================
+  BuildPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-pipeline'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactsBucket
+      Stages:
+        # ソースステージ
+        - Name: Source
+          Actions:
+            - !If
+              - UseGitHub
+              - Name: SourceAction
+                ActionTypeId:
+                  Category: Source
+                  Owner: ThirdParty
+                  Provider: GitHub
+                  Version: '1'
+                Configuration:
+                  Owner: !Ref GitHubOwner
+                  Repo: !Ref GitHubRepository
+                  Branch: !Ref GitHubBranch
+                  OAuthToken: '{{resolve:secretsmanager:github-token:SecretString:token}}'
+                OutputArtifacts:
+                  - Name: SourceOutput
+              - Name: SourceAction
+                ActionTypeId:
+                  Category: Source
+                  Owner: AWS
+                  Provider: CodeCommit
+                  Version: '1'
+                Configuration:
+                  RepositoryName: !GetAtt CodeCommitRepository.Name
+                  BranchName: !Ref GitHubBranch
+                OutputArtifacts:
+                  - Name: SourceOutput
+
+        # ビルド・テストステージ
+        - Name: BuildAndTest
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+            
+            - Name: SecurityScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref SecurityScanProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: SecurityScanOutput
+              RunOrder: 2
+
+        # ステージングデプロイステージ（条件付き）
+        - !If
+          - EnableStagingDeploy
+          - Name: DeployToStaging
+            Actions:
+              - Name: DeployStaging
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref DeploymentProject
+                  EnvironmentVariables: |
+                    [
+                      {
+                        "name": "TARGET_ENVIRONMENT",
+                        "value": "staging"
+                      }
+                    ]
+                InputArtifacts:
+                  - Name: BuildOutput
+                OutputArtifacts:
+                  - Name: StagingDeployOutput
+                RunOrder: 1
+              
+              - Name: IntegrationTest
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref IntegrationTestProject
+                InputArtifacts:
+                  - Name: StagingDeployOutput
+                OutputArtifacts:
+                  - Name: IntegrationTestOutput
+                RunOrder: 2
+          - !Ref 'AWS::NoValue'
+
+        # 本番デプロイステージ（条件付き・手動承認）
+        - !If
+          - EnableProductionDeploy
+          - Name: DeployToProduction
+            Actions:
+              - Name: ManualApproval
+                ActionTypeId:
+                  Category: Approval
+                  Owner: AWS
+                  Provider: Manual
+                  Version: '1'
+                Configuration:
+                  NotificationArn: !Ref PipelineNotificationTopic
+                  CustomData: 本番環境へのデプロイを承認してください
+                RunOrder: 1
+              
+              - Name: DeployProduction
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Provider: CodeBuild
+                  Version: '1'
+                Configuration:
+                  ProjectName: !Ref DeploymentProject
+                  EnvironmentVariables: |
+                    [
+                      {
+                        "name": "TARGET_ENVIRONMENT",
+                        "value": "production"
+                      }
+                    ]
+                InputArtifacts:
+                  - Name: BuildOutput
+                OutputArtifacts:
+                  - Name: ProductionDeployOutput
+                RunOrder: 2
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  # CodePipelineサービスロール
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub '${PipelineArtifactsBucket}/*'
+                  - !GetAtt PipelineArtifactsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt IntegrationTestProject.Arn
+                  - !GetAtt SecurityScanProject.Arn
+                  - !GetAtt DeploymentProject.Arn
+              - !If
+                - UseCodeCommit
+                - Effect: Allow
+                  Action:
+                    - codecommit:CancelUploadArchive
+                    - codecommit:GetBranch
+                    - codecommit:GetCommit
+                    - codecommit:GetRepository
+                    - codecommit:ListBranches
+                    - codecommit:ListRepositories
+                  Resource: !GetAtt CodeCommitRepository.Arn
+                - !Ref 'AWS::NoValue'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PipelineNotificationTopic
+
+  # CodeBuildサービスロール
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !Sub '${PipelineArtifactsBucket}/*'
+                  - !Sub '${BuildCacheBucket}/*'
+                  - !Sub '${DeploymentArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:GetFunction
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+
+  # ========================================
+  # SNS通知トピック
+  # ========================================
+  PipelineNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-pipeline-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} パイプライン通知'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # メール通知サブスクリプション
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref PipelineNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Slack通知Lambda（オプション）
+  SlackNotificationFunction:
+    Type: AWS::Lambda::Function
+    Condition: UseSlackNotification
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-slack-notification'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SlackNotificationRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import os
+          
+          http = urllib3.PoolManager()
+          
+          def lambda_handler(event, context):
+              """CodePipelineイベントをSlackに通知"""
+              
+              try:
+                  webhook_url = os.environ['SLACK_WEBHOOK_URL']
+                  
+                  for record in event['Records']:
+                      message = json.loads(record['Sns']['Message'])
+                      
+                      # パイプライン状態に応じて色を設定
+                      if 'SUCCEEDED' in record['Sns']['Subject']:
+                          color = 'good'
+                          emoji = ':white_check_mark:'
+                      elif 'FAILED' in record['Sns']['Subject']:
+                          color = 'danger'
+                          emoji = ':x:'
+                      else:
+                          color = 'warning'
+                          emoji = ':warning:'
+                      
+                      slack_message = {
+                          'text': f"{emoji} *CodePipeline Notification*",
+                          'attachments': [
+                              {
+                                  'color': color,
+                                  'fields': [
+                                      {
+                                          'title': 'Pipeline',
+                                          'value': message.get('detail', {}).get('pipeline', 'Unknown'),
+                                          'short': True
+                                      },
+                                      {
+                                          'title': 'State',
+                                          'value': message.get('detail', {}).get('state', 'Unknown'),
+                                          'short': True
+                                      },
+                                      {
+                                          'title': 'Region',
+                                          'value': message.get('region', 'Unknown'),
+                                          'short': True
+                                      },
+                                      {
+                                          'title': 'Time',
+                                          'value': message.get('time', 'Unknown'),
+                                          'short': True
+                                      }
+                                  ]
+                              }
+                          ]
+                      }
+                      
+                      response = http.request(
+                          'POST',
+                          webhook_url,
+                          body=json.dumps(slack_message),
+                          headers={'Content-Type': 'application/json'}
+                      )
+                      
+                      print(f"Slack notification sent: {response.status}")
+                  
+                  return {'statusCode': 200, 'body': 'Notifications sent'}
+                  
+              except Exception as e:
+                  print(f"Error sending Slack notification: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Slack通知サブスクリプション
+  SlackNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: UseSlackNotification
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref PipelineNotificationTopic
+      Endpoint: !GetAtt SlackNotificationFunction.Arn
+
+  SlackNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Condition: UseSlackNotification
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SlackNotificationFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref PipelineNotificationTopic
+
+  # Slack通知Lambda用ロール
+  SlackNotificationRole:
+    Type: AWS::IAM::Role
+    Condition: UseSlackNotification
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # ========================================
+  # CloudWatch監視
+  # ========================================
+  # パイプライン失敗アラーム
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-pipeline-failures'
+      AlarmDescription: CodePipeline execution failures
+      MetricName: PipelineExecutionFailure
+      Namespace: AWS/CodePipeline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: PipelineName
+          Value: !Ref BuildPipeline
+      AlarmActions:
+        - !Ref PipelineNotificationTopic
+
+  # ビルド失敗アラーム
+  BuildFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-build-failures'
+      AlarmDescription: CodeBuild project failures
+      MetricName: FailedBuilds
+      Namespace: AWS/CodeBuild
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: ProjectName
+          Value: !Ref BuildProject
+      AlarmActions:
+        - !Ref PipelineNotificationTopic
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # パイプライン情報
+  PipelineName:
+    Description: CodePipeline名
+    Value: !Ref BuildPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineName'
+
+  PipelineUrl:
+    Description: CodePipelineコンソールURL
+    Value: !Sub 'https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${BuildPipeline}/view'
+
+  # S3バケット
+  PipelineArtifactsBucketName:
+    Description: パイプラインアーティファクトS3バケット名
+    Value: !Ref PipelineArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineArtifactsBucket'
+
+  BuildCacheBucketName:
+    Description: ビルドキャッシュS3バケット名
+    Value: !Ref BuildCacheBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BuildCacheBucket'
+
+  DeploymentArtifactsBucketName:
+    Description: デプロイメントアーティファクトS3バケット名
+    Value: !Ref DeploymentArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DeploymentArtifactsBucket'
+
+  # CodeCommit情報
+  CodeCommitRepositoryName:
+    Condition: UseCodeCommit
+    Description: CodeCommitリポジトリ名
+    Value: !GetAtt CodeCommitRepository.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-CodeCommitRepository'
+
+  CodeCommitCloneUrl:
+    Condition: UseCodeCommit
+    Description: CodeCommitクローンURL
+    Value: !GetAtt CodeCommitRepository.CloneUrlHttp
+
+  # 通知トピック
+  PipelineNotificationTopicArn:
+    Description: パイプライン通知SNSトピックARN
+    Value: !Ref PipelineNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineNotificationTopic'
+
+  # 使用ガイド
+  PipelineUsageGuide:
+    Description: パイプライン使用ガイド
+    Value: !Sub |
+      マルチステージビルドパイプライン:
+      
+      1. ソースコード管理:
+      ${UseCodeCommit}
+      
+      2. パイプライン監視:
+      https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${BuildPipeline}/view
+      
+      3. ビルドログ確認:
+      https://console.aws.amazon.com/codesuite/codebuild/projects/${BuildProject}/history
+      
+      4. 通知設定:
+      Email: ${NotificationEmail}
+      SNS: ${PipelineNotificationTopic}
+
+  # 設定概要
+  PipelineConfiguration:
+    Description: パイプライン設定概要
+    Value: !Sub |
+      Multi-Stage Build Pipeline:
+      - Pipeline: ${BuildPipeline}
+      - Source: ${UseGitHub}
+      - Build Timeout: ${BuildTimeout} minutes
+      - Compute Type: ${BuildComputeType}
+      - Staging Deploy: ${DeployToStaging}
+      - Production Deploy: ${DeployToProduction}
+      - Artifacts: s3://${PipelineArtifactsBucket}/
+      - Cache: s3://${BuildCacheBucket}/

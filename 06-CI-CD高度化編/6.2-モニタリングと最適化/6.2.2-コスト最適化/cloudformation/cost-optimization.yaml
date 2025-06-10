@@ -1,0 +1,1329 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  コスト最適化基盤 - 包括的コスト監視・分析・削減システム
+  
+  このテンプレートは以下のリソースを作成します：
+  - Cost Explorer API（コスト分析・予測・推奨事項）
+  - Lambda関数（コスト分析・最適化推奨・リソース管理）
+  - DynamoDB（コストデータ・予算・アラート履歴）
+  - CloudWatch（コストメトリクス・予算アラート）
+  - EventBridge（コスト監視・自動対応）
+  - S3（コストレポート・分析データ）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本監視）
+      - staging: ステージング環境（詳細分析）
+      - prod: 本番環境（フルコスト最適化）
+
+  ProjectName:
+    Type: String
+    Default: cost-optimization
+    Description: リソース命名に使用するプロジェクト名
+
+  # 予算設定
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 100000
+    Description: |
+      月次予算上限（USD）
+      この値を超えるとアラートが発生
+
+  BudgetThresholdPercentage:
+    Type: Number
+    Default: 80
+    MinValue: 50
+    MaxValue: 100
+    Description: |
+      予算アラート閾値（%）
+      予算のこの割合に達するとアラート
+
+  # コスト最適化設定
+  CostOptimizationAggressiveness:
+    Type: String
+    Default: conservative
+    AllowedValues: [conservative, moderate, aggressive]
+    Description: |
+      コスト最適化の積極性
+      - conservative: 安全性重視・小幅削減
+      - moderate: バランス重視・中程度削減
+      - aggressive: 削減重視・大幅削減
+
+  AutoOptimizationEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: |
+      自動コスト最適化の有効化
+      true: 自動でコスト削減を実行
+      false: 推奨事項のみ提示
+
+  # 分析設定
+  CostAnalysisGranularity:
+    Type: String
+    Default: DAILY
+    AllowedValues: [HOURLY, DAILY, MONTHLY]
+    Description: |
+      コスト分析の粒度
+      - HOURLY: 時間別（詳細分析）
+      - DAILY: 日別（標準）
+      - MONTHLY: 月別（概要）
+
+  # 削減対象設定
+  UnusedResourcesThresholdDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 90
+    Description: |
+      未使用リソース判定期間（日数）
+      この期間アクティビティがないリソースを特定
+
+  RightSizingThreshold:
+    Type: Number
+    Default: 20
+    MinValue: 5
+    MaxValue: 50
+    Description: |
+      リソース最適化閾値（%）
+      使用率がこの値未満の場合サイズ変更を推奨
+
+  # 通知設定
+  CostNotificationEmail:
+    Type: String
+    Default: cost-team@example.com
+    Description: |
+      コスト通知用メールアドレス
+      予算アラート・最適化推奨の通知先
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ""
+    Description: |
+      Slack Webhook URL（任意）
+      Slack通知を使用する場合に設定
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # 自動最適化を使用するか
+  UseAutoOptimization: !Equals [!Ref AutoOptimizationEnabled, 'true']
+  
+  # Slack通知を使用するか
+  UseSlackNotification: !Not [!Equals [!Ref SlackWebhookUrl, ""]]
+
+Resources:
+  # ========================================
+  # S3バケット（コストレポート・データ）
+  # ========================================
+  # コストレポート保存バケット
+  CostReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-cost-reports-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: !If [IsProduction, 2555, 365]  # 7年 or 1年
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # DynamoDB テーブル（コストデータ管理）
+  # ========================================
+  # コストメトリクステーブル
+  CostMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-cost-metrics'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: metricId
+          AttributeType: S
+        - AttributeName: service
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+        - AttributeName: costCategory
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metricId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ServiceCostIndex
+          KeySchema:
+            - AttributeName: service
+              KeyType: HASH
+            - AttributeName: date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: CostCategoryIndex
+          KeySchema:
+            - AttributeName: costCategory
+              KeyType: HASH
+            - AttributeName: date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # コスト最適化推奨事項テーブル
+  CostOptimizationRecommendationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-cost-recommendations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recommendationId
+          AttributeType: S
+        - AttributeName: resourceType
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: savingsEstimate
+          AttributeType: N
+      KeySchema:
+        - AttributeName: recommendationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ResourceTypeIndex
+          KeySchema:
+            - AttributeName: resourceType
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: SavingsIndex
+          KeySchema:
+            - AttributeName: savingsEstimate
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # リソース使用状況テーブル
+  ResourceUtilizationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-resource-utilization'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: resourceId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resourceId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # Lambda関数（コスト分析・最適化）
+  # ========================================
+  # コスト分析Lambda
+  CostAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-cost-analyzer'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt CostOptimizationRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          COST_METRICS_TABLE: !Ref CostMetricsTable
+          RECOMMENDATIONS_TABLE: !Ref CostOptimizationRecommendationsTable
+          UTILIZATION_TABLE: !Ref ResourceUtilizationTable
+          COST_REPORTS_BUCKET: !Ref CostReportsBucket
+          MONTHLY_BUDGET_LIMIT: !Ref MonthlyBudgetLimit
+          ANALYSIS_GRANULARITY: !Ref CostAnalysisGranularity
+          UNUSED_THRESHOLD_DAYS: !Ref UnusedResourcesThresholdDays
+          RIGHTSIZING_THRESHOLD: !Ref RightSizingThreshold
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import statistics
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          
+          dynamodb = boto3.resource('dynamodb')
+          ce = boto3.client('ce')  # Cost Explorer
+          cloudwatch = boto3.client('cloudwatch')
+          ec2 = boto3.client('ec2')
+          rds = boto3.client('rds')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              """コスト分析メインハンドラー"""
+              
+              try:
+                  # イベントソースに応じた処理
+                  if 'source' in event and event['source'] == 'aws.events':
+                      # 定期実行
+                      return handle_scheduled_analysis(event)
+                  elif 'requestType' in event:
+                      # 特定分析リクエスト
+                      return handle_analysis_request(event)
+                  else:
+                      # デフォルト：日次分析
+                      return handle_daily_analysis()
+                      
+              except Exception as e:
+                  print(f"Error in cost analyzer: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+          
+          def handle_scheduled_analysis(event):
+              """定期コスト分析"""
+              
+              try:
+                  # 現在のコスト分析
+                  cost_analysis = analyze_current_costs()
+                  
+                  # 使用率分析
+                  utilization_analysis = analyze_resource_utilization()
+                  
+                  # 最適化推奨事項生成
+                  recommendations = generate_cost_optimization_recommendations(
+                      cost_analysis, utilization_analysis
+                  )
+                  
+                  # 予算分析
+                  budget_analysis = analyze_budget_performance()
+                  
+                  # 結果保存
+                  save_cost_analysis_results({
+                      'costAnalysis': cost_analysis,
+                      'utilizationAnalysis': utilization_analysis,
+                      'recommendations': recommendations,
+                      'budgetAnalysis': budget_analysis
+                  })
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Cost analysis completed',
+                          'totalCost': cost_analysis.get('totalCost', 0),
+                          'recommendations': len(recommendations),
+                          'potentialSavings': sum(r.get('savingsEstimate', 0) for r in recommendations)
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in scheduled analysis: {str(e)}")
+                  raise e
+          
+          def analyze_current_costs():
+              """現在のコスト分析"""
+              
+              try:
+                  end_date = datetime.now().date()
+                  start_date = end_date - timedelta(days=30)  # 過去30日
+                  
+                  # サービス別コスト取得
+                  response = ce.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': start_date.isoformat(),
+                          'End': end_date.isoformat()
+                      },
+                      Granularity=os.environ['ANALYSIS_GRANULARITY'],
+                      Metrics=['BlendedCost', 'UsageQuantity'],
+                      GroupBy=[
+                          {'Type': 'DIMENSION', 'Key': 'SERVICE'},
+                          {'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}
+                      ]
+                  )
+                  
+                  # コストデータ集計
+                  service_costs = {}
+                  total_cost = 0
+                  
+                  for result in response['ResultsByTime']:
+                      for group in result['Groups']:
+                          service = group['Keys'][0]
+                          usage_type = group['Keys'][1]
+                          cost = float(group['Metrics']['BlendedCost']['Amount'])
+                          
+                          if service not in service_costs:
+                              service_costs[service] = {'total': 0, 'usageTypes': {}}
+                          
+                          service_costs[service]['total'] += cost
+                          service_costs[service]['usageTypes'][usage_type] = cost
+                          total_cost += cost
+                  
+                  # 上位コストサービス特定
+                  top_services = sorted(
+                      service_costs.items(),
+                      key=lambda x: x[1]['total'],
+                      reverse=True
+                  )[:10]
+                  
+                  return {
+                      'totalCost': total_cost,
+                      'serviceCosts': service_costs,
+                      'topServices': top_services,
+                      'period': {'start': start_date.isoformat(), 'end': end_date.isoformat()},
+                      'analyzedAt': datetime.utcnow().isoformat()
+                  }
+                  
+              except Exception as e:
+                  print(f"Error analyzing current costs: {str(e)}")
+                  return {}
+          
+          def analyze_resource_utilization():
+              """リソース使用率分析"""
+              
+              try:
+                  analysis = {
+                      'ec2': analyze_ec2_utilization(),
+                      'rds': analyze_rds_utilization(),
+                      'ebs': analyze_ebs_utilization(),
+                      's3': analyze_s3_utilization()
+                  }
+                  
+                  return analysis
+                  
+              except Exception as e:
+                  print(f"Error analyzing resource utilization: {str(e)}")
+                  return {}
+          
+          def analyze_ec2_utilization():
+              """EC2使用率分析"""
+              
+              try:
+                  instances = ec2.describe_instances()
+                  utilization_data = []
+                  
+                  for reservation in instances['Reservations']:
+                      for instance in reservation['Instances']:
+                          instance_id = instance['InstanceId']
+                          instance_type = instance['InstanceType']
+                          state = instance['State']['Name']
+                          
+                          if state == 'running':
+                              # CloudWatchメトリクス取得
+                              cpu_utilization = get_cloudwatch_metric(
+                                  'AWS/EC2', 'CPUUtilization', 
+                                  [{'Name': 'InstanceId', 'Value': instance_id}],
+                                  days=7
+                              )
+                              
+                              network_in = get_cloudwatch_metric(
+                                  'AWS/EC2', 'NetworkIn',
+                                  [{'Name': 'InstanceId', 'Value': instance_id}],
+                                  days=7
+                              )
+                              
+                              utilization_data.append({
+                                  'resourceId': instance_id,
+                                  'resourceType': 'ec2',
+                                  'instanceType': instance_type,
+                                  'state': state,
+                                  'cpuUtilization': cpu_utilization,
+                                  'networkActivity': network_in,
+                                  'isUnderUtilized': cpu_utilization < float(os.environ['RIGHTSIZING_THRESHOLD']),
+                                  'lastAnalyzed': datetime.utcnow().isoformat()
+                              })
+                  
+                  return {
+                      'totalInstances': len(utilization_data),
+                      'underUtilized': len([u for u in utilization_data if u['isUnderUtilized']]),
+                      'utilizationData': utilization_data
+                  }
+                  
+              except Exception as e:
+                  print(f"Error analyzing EC2 utilization: {str(e)}")
+                  return {}
+          
+          def analyze_rds_utilization():
+              """RDS使用率分析"""
+              
+              try:
+                  instances = rds.describe_db_instances()
+                  utilization_data = []
+                  
+                  for instance in instances['DBInstances']:
+                      db_instance_id = instance['DBInstanceIdentifier']
+                      db_instance_class = instance['DBInstanceClass']
+                      status = instance['DBInstanceStatus']
+                      
+                      if status == 'available':
+                          # CloudWatchメトリクス取得
+                          cpu_utilization = get_cloudwatch_metric(
+                              'AWS/RDS', 'CPUUtilization',
+                              [{'Name': 'DBInstanceIdentifier', 'Value': db_instance_id}],
+                              days=7
+                          )
+                          
+                          connections = get_cloudwatch_metric(
+                              'AWS/RDS', 'DatabaseConnections',
+                              [{'Name': 'DBInstanceIdentifier', 'Value': db_instance_id}],
+                              days=7
+                          )
+                          
+                          utilization_data.append({
+                              'resourceId': db_instance_id,
+                              'resourceType': 'rds',
+                              'instanceClass': db_instance_class,
+                              'status': status,
+                              'cpuUtilization': cpu_utilization,
+                              'connections': connections,
+                              'isUnderUtilized': cpu_utilization < float(os.environ['RIGHTSIZING_THRESHOLD']),
+                              'lastAnalyzed': datetime.utcnow().isoformat()
+                          })
+                  
+                  return {
+                      'totalInstances': len(utilization_data),
+                      'underUtilized': len([u for u in utilization_data if u['isUnderUtilized']]),
+                      'utilizationData': utilization_data
+                  }
+                  
+              except Exception as e:
+                  print(f"Error analyzing RDS utilization: {str(e)}")
+                  return {}
+          
+          def analyze_ebs_utilization():
+              """EBS使用率分析"""
+              
+              try:
+                  volumes = ec2.describe_volumes()
+                  utilization_data = []
+                  
+                  for volume in volumes['Volumes']:
+                      volume_id = volume['VolumeId']
+                      state = volume['State']
+                      size = volume['Size']
+                      
+                      # 未アタッチボリューム特定
+                      is_unattached = len(volume['Attachments']) == 0
+                      
+                      utilization_data.append({
+                          'resourceId': volume_id,
+                          'resourceType': 'ebs',
+                          'state': state,
+                          'size': size,
+                          'isUnattached': is_unattached,
+                          'attachments': len(volume['Attachments']),
+                          'lastAnalyzed': datetime.utcnow().isoformat()
+                      })
+                  
+                  return {
+                      'totalVolumes': len(utilization_data),
+                      'unattachedVolumes': len([u for u in utilization_data if u['isUnattached']]),
+                      'utilizationData': utilization_data
+                  }
+                  
+              except Exception as e:
+                  print(f"Error analyzing EBS utilization: {str(e)}")
+                  return {}
+          
+          def analyze_s3_utilization():
+              """S3使用率分析"""
+              
+              try:
+                  buckets = s3.list_buckets()
+                  utilization_data = []
+                  
+                  for bucket in buckets['Buckets']:
+                      bucket_name = bucket['Name']
+                      
+                      # バケットサイズ取得
+                      try:
+                          size_response = cloudwatch.get_metric_statistics(
+                              Namespace='AWS/S3',
+                              MetricName='BucketSizeBytes',
+                              Dimensions=[
+                                  {'Name': 'BucketName', 'Value': bucket_name},
+                                  {'Name': 'StorageType', 'Value': 'StandardStorage'}
+                              ],
+                              StartTime=datetime.utcnow() - timedelta(days=1),
+                              EndTime=datetime.utcnow(),
+                              Period=86400,
+                              Statistics=['Average']
+                          )
+                          
+                          bucket_size = 0
+                          if size_response['Datapoints']:
+                              bucket_size = size_response['Datapoints'][-1]['Average']
+                          
+                          utilization_data.append({
+                              'resourceId': bucket_name,
+                              'resourceType': 's3',
+                              'sizeBytes': bucket_size,
+                              'sizeMB': bucket_size / (1024 * 1024),
+                              'isEmpty': bucket_size == 0,
+                              'lastAnalyzed': datetime.utcnow().isoformat()
+                          })
+                          
+                      except Exception:
+                          # メトリクスが利用できない場合
+                          continue
+                  
+                  return {
+                      'totalBuckets': len(utilization_data),
+                      'emptyBuckets': len([u for u in utilization_data if u['isEmpty']]),
+                      'utilizationData': utilization_data
+                  }
+                  
+              except Exception as e:
+                  print(f"Error analyzing S3 utilization: {str(e)}")
+                  return {}
+          
+          def get_cloudwatch_metric(namespace, metric_name, dimensions, days=7):
+              """CloudWatchメトリクス取得"""
+              
+              try:
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace=namespace,
+                      MetricName=metric_name,
+                      Dimensions=dimensions,
+                      StartTime=datetime.utcnow() - timedelta(days=days),
+                      EndTime=datetime.utcnow(),
+                      Period=3600,  # 1時間間隔
+                      Statistics=['Average']
+                  )
+                  
+                  if response['Datapoints']:
+                      return statistics.mean([dp['Average'] for dp in response['Datapoints']])
+                  
+                  return 0
+                  
+              except Exception as e:
+                  print(f"Error getting CloudWatch metric: {str(e)}")
+                  return 0
+          
+          def generate_cost_optimization_recommendations(cost_analysis, utilization_analysis):
+              """コスト最適化推奨事項生成"""
+              
+              recommendations = []
+              
+              # EC2最適化推奨
+              ec2_recommendations = generate_ec2_recommendations(utilization_analysis.get('ec2', {}))
+              recommendations.extend(ec2_recommendations)
+              
+              # RDS最適化推奨
+              rds_recommendations = generate_rds_recommendations(utilization_analysis.get('rds', {}))
+              recommendations.extend(rds_recommendations)
+              
+              # EBS最適化推奨
+              ebs_recommendations = generate_ebs_recommendations(utilization_analysis.get('ebs', {}))
+              recommendations.extend(ebs_recommendations)
+              
+              # S3最適化推奨
+              s3_recommendations = generate_s3_recommendations(utilization_analysis.get('s3', {}))
+              recommendations.extend(s3_recommendations)
+              
+              return recommendations
+          
+          def generate_ec2_recommendations(ec2_analysis):
+              """EC2最適化推奨事項生成"""
+              
+              recommendations = []
+              
+              for instance_data in ec2_analysis.get('utilizationData', []):
+                  if instance_data['isUnderUtilized']:
+                      recommendation_id = str(uuid.uuid4())
+                      
+                      # インスタンスタイプによる推奨サイズ
+                      current_type = instance_data['instanceType']
+                      recommended_type = get_smaller_instance_type(current_type)
+                      
+                      # 推定節約額計算
+                      estimated_savings = calculate_ec2_savings(current_type, recommended_type)
+                      
+                      recommendations.append({
+                          'recommendationId': recommendation_id,
+                          'resourceType': 'ec2',
+                          'resourceId': instance_data['resourceId'],
+                          'recommendationType': 'rightsizing',
+                          'title': 'EC2インスタンスサイズ最適化',
+                          'description': f"インスタンス {instance_data['resourceId']} の CPU使用率が {instance_data['cpuUtilization']:.1f}% と低いため、サイズダウンを推奨します。",
+                          'currentConfiguration': {
+                              'instanceType': current_type,
+                              'cpuUtilization': instance_data['cpuUtilization']
+                          },
+                          'recommendedConfiguration': {
+                              'instanceType': recommended_type
+                          },
+                          'savingsEstimate': estimated_savings,
+                          'implementationEffort': 'medium',
+                          'riskLevel': 'low',
+                          'createdAt': datetime.utcnow().isoformat(),
+                          'ttl': int((datetime.utcnow() + timedelta(days=90)).timestamp())
+                      })
+              
+              return recommendations
+          
+          def generate_rds_recommendations(rds_analysis):
+              """RDS最適化推奨事項生成"""
+              
+              recommendations = []
+              
+              for instance_data in rds_analysis.get('utilizationData', []):
+                  if instance_data['isUnderUtilized']:
+                      recommendation_id = str(uuid.uuid4())
+                      
+                      estimated_savings = 500  # 仮の値
+                      
+                      recommendations.append({
+                          'recommendationId': recommendation_id,
+                          'resourceType': 'rds',
+                          'resourceId': instance_data['resourceId'],
+                          'recommendationType': 'rightsizing',
+                          'title': 'RDSインスタンスサイズ最適化',
+                          'description': f"RDSインスタンス {instance_data['resourceId']} の使用率が低いため、サイズダウンを推奨します。",
+                          'savingsEstimate': estimated_savings,
+                          'implementationEffort': 'high',
+                          'riskLevel': 'medium',
+                          'createdAt': datetime.utcnow().isoformat(),
+                          'ttl': int((datetime.utcnow() + timedelta(days=90)).timestamp())
+                      })
+              
+              return recommendations
+          
+          def generate_ebs_recommendations(ebs_analysis):
+              """EBS最適化推奨事項生成"""
+              
+              recommendations = []
+              
+              for volume_data in ebs_analysis.get('utilizationData', []):
+                  if volume_data['isUnattached']:
+                      recommendation_id = str(uuid.uuid4())
+                      
+                      # 未アタッチボリュームの削除推奨
+                      estimated_savings = calculate_ebs_savings(volume_data['size'])
+                      
+                      recommendations.append({
+                          'recommendationId': recommendation_id,
+                          'resourceType': 'ebs',
+                          'resourceId': volume_data['resourceId'],
+                          'recommendationType': 'deletion',
+                          'title': '未使用EBSボリューム削除',
+                          'description': f"EBSボリューム {volume_data['resourceId']} ({volume_data['size']}GB) が未アタッチのため、削除を推奨します。",
+                          'savingsEstimate': estimated_savings,
+                          'implementationEffort': 'low',
+                          'riskLevel': 'low',
+                          'createdAt': datetime.utcnow().isoformat(),
+                          'ttl': int((datetime.utcnow() + timedelta(days=90)).timestamp())
+                      })
+              
+              return recommendations
+          
+          def generate_s3_recommendations(s3_analysis):
+              """S3最適化推奨事項生成"""
+              
+              recommendations = []
+              
+              for bucket_data in s3_analysis.get('utilizationData', []):
+                  if bucket_data['isEmpty']:
+                      recommendation_id = str(uuid.uuid4())
+                      
+                      recommendations.append({
+                          'recommendationId': recommendation_id,
+                          'resourceType': 's3',
+                          'resourceId': bucket_data['resourceId'],
+                          'recommendationType': 'cleanup',
+                          'title': '空のS3バケット確認',
+                          'description': f"S3バケット {bucket_data['resourceId']} が空のため、削除を検討してください。",
+                          'savingsEstimate': 1,  # 最小限の節約
+                          'implementationEffort': 'low',
+                          'riskLevel': 'low',
+                          'createdAt': datetime.utcnow().isoformat(),
+                          'ttl': int((datetime.utcnow() + timedelta(days=90)).timestamp())
+                      })
+              
+              return recommendations
+          
+          def get_smaller_instance_type(current_type):
+              """より小さなインスタンスタイプ推奨"""
+              
+              # 簡易マッピング
+              downsize_map = {
+                  't3.large': 't3.medium',
+                  't3.medium': 't3.small',
+                  'm5.large': 'm5.medium',
+                  'm5.xlarge': 'm5.large',
+                  'c5.large': 'c5.medium',
+                  'r5.large': 'r5.medium'
+              }
+              
+              return downsize_map.get(current_type, current_type)
+          
+          def calculate_ec2_savings(current_type, recommended_type):
+              """EC2節約額計算"""
+              
+              # 簡易価格マッピング（月額USD）
+              pricing = {
+                  't3.small': 15,
+                  't3.medium': 30,
+                  't3.large': 60,
+                  'm5.medium': 40,
+                  'm5.large': 80,
+                  'c5.medium': 35,
+                  'c5.large': 70,
+                  'r5.medium': 50,
+                  'r5.large': 100
+              }
+              
+              current_cost = pricing.get(current_type, 50)
+              recommended_cost = pricing.get(recommended_type, 25)
+              
+              return max(0, current_cost - recommended_cost)
+          
+          def calculate_ebs_savings(size_gb):
+              """EBS節約額計算"""
+              
+              # EBS gp2価格: $0.10 per GB per month
+              return size_gb * 0.10
+          
+          def analyze_budget_performance():
+              """予算パフォーマンス分析"""
+              
+              try:
+                  # 現在の月間コスト取得
+                  current_month_start = datetime.now().replace(day=1).date()
+                  current_month_end = datetime.now().date()
+                  
+                  response = ce.get_cost_and_usage(
+                      TimePeriod={
+                          'Start': current_month_start.isoformat(),
+                          'End': current_month_end.isoformat()
+                      },
+                      Granularity='MONTHLY',
+                      Metrics=['BlendedCost']
+                  )
+                  
+                  current_cost = 0
+                  if response['ResultsByTime']:
+                      current_cost = float(response['ResultsByTime'][0]['Total']['BlendedCost']['Amount'])
+                  
+                  budget_limit = float(os.environ['MONTHLY_BUDGET_LIMIT'])
+                  budget_usage_percentage = (current_cost / budget_limit) * 100
+                  
+                  # 予測計算（簡易）
+                  days_in_month = 30
+                  current_day = datetime.now().day
+                  projected_cost = current_cost * (days_in_month / current_day)
+                  
+                  return {
+                      'budgetLimit': budget_limit,
+                      'currentCost': current_cost,
+                      'projectedCost': projected_cost,
+                      'budgetUsagePercentage': budget_usage_percentage,
+                      'isOverBudget': projected_cost > budget_limit,
+                      'daysLeftInMonth': days_in_month - current_day,
+                      'analyzedAt': datetime.utcnow().isoformat()
+                  }
+                  
+              except Exception as e:
+                  print(f"Error analyzing budget performance: {str(e)}")
+                  return {}
+          
+          def save_cost_analysis_results(analysis_results):
+              """コスト分析結果保存"""
+              
+              try:
+                  cost_metrics_table = dynamodb.Table(os.environ['COST_METRICS_TABLE'])
+                  recommendations_table = dynamodb.Table(os.environ['RECOMMENDATIONS_TABLE'])
+                  
+                  # 分析結果保存
+                  metric_id = str(uuid.uuid4())
+                  ttl = int((datetime.utcnow() + timedelta(days=90)).timestamp())
+                  
+                  cost_metrics_table.put_item(
+                      Item={
+                          'metricId': metric_id,
+                          'service': 'overall',
+                          'costCategory': 'analysis',
+                          'date': datetime.utcnow().date().isoformat(),
+                          'analysisResults': analysis_results,
+                          'ttl': ttl
+                      }
+                  )
+                  
+                  # 推奨事項保存
+                  for recommendation in analysis_results.get('recommendations', []):
+                      recommendations_table.put_item(Item=recommendation)
+                  
+                  print(f"Saved cost analysis results: {metric_id}")
+                  
+              except Exception as e:
+                  print(f"Error saving cost analysis results: {str(e)}")
+          
+          def handle_analysis_request(event):
+              """特定分析リクエスト処理"""
+              # 実装省略
+              return {'statusCode': 200, 'body': 'Analysis request processed'}
+          
+          def handle_daily_analysis():
+              """日次分析処理"""
+              # 実装省略
+              return {'statusCode': 200, 'body': 'Daily analysis completed'}
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # Cost and Usage Report設定
+  # ========================================
+  CostAndUsageReport:
+    Type: AWS::CUR::ReportDefinition
+    Properties:
+      ReportName: !Sub '${ProjectName}-${EnvironmentName}-cost-usage-report'
+      TimeUnit: HOURLY
+      Format: textORcsv
+      Compression: GZIP
+      AdditionalSchemaElements:
+        - RESOURCES
+      S3Bucket: !Ref CostReportsBucket
+      S3Prefix: 'cost-reports/'
+      S3Region: !Ref AWS::Region
+      AdditionalArtifacts:
+        - REDSHIFT
+        - QUICKSIGHT
+      ReportVersioning: OVERWRITE_REPORT
+
+  # ========================================
+  # Budget設定
+  # ========================================
+  MonthlyCostBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${ProjectName}-${EnvironmentName}-monthly-budget'
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: USD
+        TimeUnit: MONTHLY
+        TimeFrame: RECURRING
+        BudgetType: COST
+        CostFilters:
+          TagKey:
+            - Environment
+          TagValue:
+            - !Ref EnvironmentName
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: !Ref BudgetThresholdPercentage
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref CostNotificationEmail
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: EMAIL
+              Address: !Ref CostNotificationEmail
+
+  # ========================================
+  # EventBridge ルール（定期実行）
+  # ========================================
+  # コスト分析定期実行
+  CostAnalysisSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-cost-analysis'
+      Description: 日次コスト分析実行
+      ScheduleExpression: 'cron(0 6 * * ? *)'  # 毎日6時
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CostAnalyzerFunction.Arn
+          Id: CostAnalysisTarget
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda実行権限
+  CostAnalysisPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CostAnalyzerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CostAnalysisSchedule.Arn
+
+  # ========================================
+  # CloudWatch ダッシュボード
+  # ========================================
+  CostOptimizationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${EnvironmentName}-cost-optimization'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "us-east-1",
+                "title": "月間推定コスト",
+                "period": 86400,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${CostAnalyzerFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "コスト分析Lambda",
+                "period": 300
+              }
+            },
+            {
+              "type": "number",
+              "x": 0,
+              "y": 6,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Billing", "EstimatedCharges", "Currency", "USD" ]
+                ],
+                "view": "singleValue",
+                "region": "us-east-1",
+                "title": "現在の月間コスト",
+                "period": 86400,
+                "stat": "Maximum"
+              }
+            },
+            {
+              "type": "number",
+              "x": 6,
+              "y": 6,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Custom/CostOptimization", "MonthlyBudget", "Environment", "${EnvironmentName}" ]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "月間予算",
+                "period": 86400,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "number",
+              "x": 12,
+              "y": 6,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Custom/CostOptimization", "TotalRecommendations", "Environment", "${EnvironmentName}" ]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "最適化推奨事項",
+                "period": 86400,
+                "stat": "Maximum"
+              }
+            },
+            {
+              "type": "number",
+              "x": 18,
+              "y": 6,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Custom/CostOptimization", "PotentialSavings", "Environment", "${EnvironmentName}" ]
+                ],
+                "view": "singleValue",
+                "region": "${AWS::Region}",
+                "title": "推定節約額（USD）",
+                "period": 86400,
+                "stat": "Maximum"
+              }
+            }
+          ]
+        }
+
+  # ========================================
+  # SNS通知トピック
+  # ========================================
+  CostNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-cost-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} コスト通知'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # メール通知サブスクリプション
+  CostEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CostNotificationTopic
+      Endpoint: !Ref CostNotificationEmail
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  CostOptimizationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CostOptimizationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetUsageReport
+                  - ce:GetReservationCoverage
+                  - ce:GetReservationPurchaseRecommendation
+                  - ce:GetReservationUtilization
+                  - ce:GetSavingsPlansUtilization
+                  - ce:ListCostAndUsageSpecifications
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - budgets:ViewBudget
+                  - budgets:DescribeBudget
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeSnapshots
+                  - ec2:DescribeImages
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                  - s3:GetBucketNotification
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt CostMetricsTable.Arn
+                  - !Sub '${CostMetricsTable.Arn}/index/*'
+                  - !GetAtt CostOptimizationRecommendationsTable.Arn
+                  - !Sub '${CostOptimizationRecommendationsTable.Arn}/index/*'
+                  - !GetAtt ResourceUtilizationTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${CostReportsBucket}/*'
+                  - !GetAtt CostReportsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref CostNotificationTopic
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # Lambda関数
+  CostAnalyzerFunctionArn:
+    Description: コスト分析Lambda関数ARN
+    Value: !GetAtt CostAnalyzerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CostAnalyzerFunction'
+
+  # DynamoDB テーブル
+  CostMetricsTableName:
+    Description: コストメトリクステーブル名
+    Value: !Ref CostMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CostMetricsTable'
+
+  CostOptimizationRecommendationsTableName:
+    Description: コスト最適化推奨事項テーブル名
+    Value: !Ref CostOptimizationRecommendationsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CostOptimizationRecommendationsTable'
+
+  # S3バケット
+  CostReportsBucketName:
+    Description: コストレポートS3バケット名
+    Value: !Ref CostReportsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CostReportsBucket'
+
+  # Budget
+  MonthlyCostBudgetName:
+    Description: 月次コスト予算名
+    Value: !Ref MonthlyCostBudget
+
+  # 通知トピック
+  CostNotificationTopicArn:
+    Description: コスト通知SNSトピックARN
+    Value: !Ref CostNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CostNotificationTopic'
+
+  # ダッシュボード
+  CostOptimizationDashboardURL:
+    Description: コスト最適化ダッシュボードURL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CostOptimizationDashboard}'
+
+  # Cost and Usage Report
+  CostAndUsageReportName:
+    Description: Cost and Usage Report名
+    Value: !Ref CostAndUsageReport
+
+  # 使用ガイド
+  CostOptimizationUsageGuide:
+    Description: コスト最適化使用ガイド
+    Value: !Sub |
+      コスト最適化基盤使用ガイド:
+      
+      1. ダッシュボード確認:
+      https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CostOptimizationDashboard}
+      
+      2. 手動分析実行:
+      aws lambda invoke --function-name ${CostAnalyzerFunction} response.json
+      
+      3. 推奨事項確認:
+      aws dynamodb scan --table-name ${CostOptimizationRecommendationsTable}
+      
+      4. Cost Explorer確認:
+      https://console.aws.amazon.com/cost-management/home#/dashboard
+      
+      5. 予算確認:
+      https://console.aws.amazon.com/billing/home#/budgets
+
+  # 設定概要
+  CostOptimizationConfiguration:
+    Description: コスト最適化設定概要
+    Value: !Sub |
+      Cost Optimization Configuration:
+      - Monthly Budget: $${MonthlyBudgetLimit}
+      - Alert Threshold: ${BudgetThresholdPercentage}%
+      - Optimization Aggressiveness: ${CostOptimizationAggressiveness}
+      - Auto Optimization: ${AutoOptimizationEnabled}
+      - Analysis Granularity: ${CostAnalysisGranularity}
+      - Unused Resources Threshold: ${UnusedResourcesThresholdDays} days
+      - Right Sizing Threshold: ${RightSizingThreshold}%
+      - Cost Reports: s3://${CostReportsBucket}/
+      - Notifications: ${CostNotificationEmail}

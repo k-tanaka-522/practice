@@ -1,0 +1,511 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  リアルタイム更新システム統合スタック - マスタースタック
+  
+  このテンプレートは以下のネストスタックを統合します：
+  - WebSocket APIとバックエンド処理（realtime-websocket.yaml）
+  - フロントエンド配信とCI/CD（realtime-frontend.yaml）
+  - 共通リソースとモニタリング設定
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（コスト最適化）
+      - staging: ステージング環境（本番に近い設定）
+      - prod: 本番環境（高可用性・スケーラビリティ重視）
+
+  ProjectName:
+    Type: String
+    Default: realtime-system
+    Description: プロジェクト名（全リソースの命名に使用）
+
+  # WebSocket設定
+  MaxConnections:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 100000
+    Description: 最大同時接続数
+
+  MessageRetentionHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: メッセージ保持時間（時間）
+
+  # フロントエンド設定
+  DomainName:
+    Type: String
+    Default: ""
+    Description: カスタムドメイン名（任意）
+
+  # CI/CD設定
+  GitHubOwner:
+    Type: String
+    Default: ""
+    Description: GitHubリポジトリオーナー名
+
+  GitHubRepo:
+    Type: String
+    Default: ""
+    Description: GitHubリポジトリ名
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: デプロイ対象ブランチ
+
+  # テンプレート格納場所
+  TemplatesBucket:
+    Type: String
+    Description: ネストスタックテンプレート格納S3バケット名
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # カスタムドメインを使用するか
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, ""]]
+  
+  # CI/CDパイプラインを作成するか
+  HasGitHub: !And
+    - !Not [!Equals [!Ref GitHubOwner, ""]]
+    - !Not [!Equals [!Ref GitHubRepo, ""]]
+
+Resources:
+  # ========================================
+  # WebSocketバックエンドスタック
+  # ========================================
+  WebSocketStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/realtime-websocket.yaml'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ProjectName: !Sub '${ProjectName}-websocket'
+        MaxConnections: !Ref MaxConnections
+        MessageRetentionHours: !Ref MessageRetentionHours
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: StackType
+          Value: WebSocket
+
+  # ========================================
+  # フロントエンドスタック
+  # ========================================
+  FrontendStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: WebSocketStack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/realtime-frontend.yaml'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ProjectName: !Sub '${ProjectName}-frontend'
+        DomainName: !Ref DomainName
+        WebSocketApiEndpoint: !GetAtt WebSocketStack.Outputs.WebSocketApiEndpoint
+        GitHubOwner: !Ref GitHubOwner
+        GitHubRepo: !Ref GitHubRepo
+        GitHubBranch: !Ref GitHubBranch
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: StackType
+          Value: Frontend
+
+  # ========================================
+  # 統合モニタリングスタック
+  # ========================================
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - WebSocketStack
+      - FrontendStack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/realtime-monitoring.yaml'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ProjectName: !Sub '${ProjectName}-monitoring'
+        WebSocketApiId: !GetAtt WebSocketStack.Outputs.WebSocketApiId
+        CloudFrontDistributionId: !GetAtt FrontendStack.Outputs.CloudFrontDistributionId
+        ConnectionsTableName: !GetAtt WebSocketStack.Outputs.ConnectionsTableName
+        MessagesTableName: !GetAtt WebSocketStack.Outputs.MessagesTableName
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: StackType
+          Value: Monitoring
+
+  # ========================================
+  # 統合SNSトピック（アラート通知用）
+  # ========================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-alerts'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} システムアラート'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Eメール通知サブスクリプション（本番環境のみ）
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: IsProduction
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: admin@example.com  # 実際のメールアドレスに変更
+
+  # ========================================
+  # CloudWatch統合ダッシュボード
+  # ========================================
+  SystemDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${EnvironmentName}-system'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGatewayV2", "Count", "ApiId", "${WebSocketStack.Outputs.WebSocketApiId}", "Stage", "${EnvironmentName}" ],
+                  [ ".", "IntegrationError", ".", ".", ".", "." ],
+                  [ ".", "IntegrationLatency", ".", ".", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "WebSocket API メトリクス",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CloudFront", "Requests", "DistributionId", "${FrontendStack.Outputs.CloudFrontDistributionId}" ],
+                  [ ".", "BytesDownloaded", ".", "." ],
+                  [ ".", "4xxErrorRate", ".", "." ],
+                  [ ".", "5xxErrorRate", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "us-east-1",
+                "title": "CloudFront メトリクス",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${WebSocketStack.Outputs.ConnectionsTableName}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "UserErrors", ".", "." ],
+                  [ ".", "SystemErrors", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB接続テーブル メトリクス",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${WebSocketStack.Outputs.MessagesTableName}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "UserErrors", ".", "." ],
+                  [ ".", "SystemErrors", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDBメッセージテーブル メトリクス",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${ProjectName}-websocket-${EnvironmentName}-sendmessage' | fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Lambda関数エラーログ",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # ========================================
+  # システムヘルスチェック Lambda
+  # ========================================
+  HealthCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-health-check'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt HealthCheckRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          WEBSOCKET_ENDPOINT: !GetAtt WebSocketStack.Outputs.WebSocketApiEndpoint
+          WEBSITE_URL: !GetAtt FrontendStack.Outputs.WebsiteURL
+          CONNECTIONS_TABLE: !GetAtt WebSocketStack.Outputs.ConnectionsTableName
+          SNS_TOPIC_ARN: !Ref AlertTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          import os
+          from datetime import datetime, timedelta
+          
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          http = urllib3.PoolManager()
+          
+          def lambda_handler(event, context):
+              """システム全体のヘルスチェック"""
+              health_status = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'overall_status': 'HEALTHY',
+                  'checks': {}
+              }
+              
+              try:
+                  # 1. WebSocket API ヘルスチェック
+                  websocket_health = check_websocket_health()
+                  health_status['checks']['websocket'] = websocket_health
+                  
+                  # 2. フロントエンド ヘルスチェック
+                  frontend_health = check_frontend_health()
+                  health_status['checks']['frontend'] = frontend_health
+                  
+                  # 3. DynamoDB ヘルスチェック
+                  dynamodb_health = check_dynamodb_health()
+                  health_status['checks']['dynamodb'] = dynamodb_health
+                  
+                  # 4. 総合ステータス判定
+                  failed_checks = [name for name, status in health_status['checks'].items() 
+                                 if status['status'] != 'HEALTHY']
+                  
+                  if failed_checks:
+                      health_status['overall_status'] = 'UNHEALTHY'
+                      health_status['failed_checks'] = failed_checks
+                      
+                      # アラート送信
+                      send_alert(health_status)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(health_status, indent=2)
+                  }
+                  
+              except Exception as e:
+                  error_status = {
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'overall_status': 'ERROR',
+                      'error': str(e)
+                  }
+                  
+                  send_alert(error_status)
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(error_status)
+                  }
+          
+          def check_websocket_health():
+              """WebSocket APIのヘルスチェック"""
+              try:
+                  # WebSocket エンドポイントの到達性確認
+                  endpoint = os.environ['WEBSOCKET_ENDPOINT']
+                  # 実際のWebSocket接続テストは複雑なため、URLの構文チェックのみ
+                  if not endpoint.startswith('wss://'):
+                      return {'status': 'UNHEALTHY', 'message': 'Invalid WebSocket endpoint'}
+                  
+                  return {'status': 'HEALTHY', 'endpoint': endpoint}
+              except Exception as e:
+                  return {'status': 'UNHEALTHY', 'error': str(e)}
+          
+          def check_frontend_health():
+              """フロントエンドのヘルスチェック"""
+              try:
+                  website_url = os.environ['WEBSITE_URL']
+                  response = http.request('GET', website_url, timeout=10)
+                  
+                  if response.status == 200:
+                      return {'status': 'HEALTHY', 'url': website_url, 'response_code': response.status}
+                  else:
+                      return {'status': 'UNHEALTHY', 'url': website_url, 'response_code': response.status}
+              except Exception as e:
+                  return {'status': 'UNHEALTHY', 'error': str(e)}
+          
+          def check_dynamodb_health():
+              """DynamoDBのヘルスチェック"""
+              try:
+                  table_name = os.environ['CONNECTIONS_TABLE']
+                  table = dynamodb.Table(table_name)
+                  
+                  # テーブルのステータス確認
+                  response = table.meta.client.describe_table(TableName=table_name)
+                  table_status = response['Table']['TableStatus']
+                  
+                  if table_status == 'ACTIVE':
+                      return {'status': 'HEALTHY', 'table': table_name, 'table_status': table_status}
+                  else:
+                      return {'status': 'UNHEALTHY', 'table': table_name, 'table_status': table_status}
+              except Exception as e:
+                  return {'status': 'UNHEALTHY', 'error': str(e)}
+          
+          def send_alert(status):
+              """アラート通知送信"""
+              try:
+                  message = f"システムヘルスチェック異常検出:\n{json.dumps(status, indent=2)}"
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message=message,
+                      Subject=f"[ALERT] {os.environ.get('PROJECT_NAME', 'System')} Health Check Failed"
+                  )
+              except Exception as e:
+                  print(f"Failed to send alert: {str(e)}")
+
+  # ヘルスチェック用IAMロール
+  HealthCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HealthCheckPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                Resource: 
+                  - !GetAtt WebSocketStack.Outputs.ConnectionsTableArn
+                  - !GetAtt WebSocketStack.Outputs.MessagesTableArn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+
+  # 定期ヘルスチェック実行（EventBridge）
+  HealthCheckSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 定期システムヘルスチェック実行
+      ScheduleExpression: !If [IsProduction, 'rate(5 minutes)', 'rate(30 minutes)']
+      Targets:
+        - Arn: !GetAtt HealthCheckFunction.Arn
+          Id: HealthCheckTarget
+
+  HealthCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref HealthCheckFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthCheckSchedule.Arn
+
+# ========================================
+# 出力値（システム全体の情報）
+# ========================================
+Outputs:
+  # システム全体URL
+  SystemWebsiteURL:
+    Description: リアルタイムシステム WebサイトURL
+    Value: !GetAtt FrontendStack.Outputs.WebsiteURL
+    Export:
+      Name: !Sub '${AWS::StackName}-System-WebsiteURL'
+
+  WebSocketEndpoint:
+    Description: WebSocket APIエンドポイント
+    Value: !GetAtt WebSocketStack.Outputs.WebSocketApiEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-System-WebSocketEndpoint'
+
+  # 管理情報
+  SystemDashboardURL:
+    Description: CloudWatchダッシュボードURL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}-system'
+
+  AlertTopicArn:
+    Description: システムアラート用SNSトピックARN
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopic'
+
+  # ネストスタック情報
+  WebSocketStackId:
+    Description: WebSocketスタックID
+    Value: !Ref WebSocketStack
+
+  FrontendStackId:
+    Description: フロントエンドスタックID
+    Value: !Ref FrontendStack
+
+  MonitoringStackId:
+    Description: モニタリングスタックID
+    Value: !Ref MonitoringStack
+
+  # システム構成情報
+  SystemArchitecture:
+    Description: システム構成概要
+    Value: !Sub |
+      リアルタイム更新システム構成:
+      - WebSocket API: ${WebSocketStack.Outputs.WebSocketApiEndpoint}
+      - フロントエンド: ${FrontendStack.Outputs.WebsiteURL}
+      - 最大接続数: ${MaxConnections}
+      - 環境: ${EnvironmentName}
+      - ダッシュボード: https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${EnvironmentName}-system

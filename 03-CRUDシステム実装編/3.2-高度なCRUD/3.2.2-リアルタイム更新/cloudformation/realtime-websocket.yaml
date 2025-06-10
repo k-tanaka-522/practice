@@ -1,0 +1,889 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  リアルタイム更新システム - WebSocketとDynamoDB統合
+  
+  このテンプレートは以下のリソースを作成します：
+  - API Gateway WebSocket API（リアルタイム通信用）
+  - Lambda関数（接続管理・メッセージ配信用）
+  - DynamoDB接続管理テーブル
+  - CloudWatchログとメトリクス
+  - IAMロールと権限設定
+  - Auto Scalingとアラーム設定
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（コスト最適化）
+      - staging: ステージング環境（本番に近い設定）
+      - prod: 本番環境（高可用性・スケーラビリティ重視）
+
+  ProjectName:
+    Type: String
+    Default: realtime-websocket
+    Description: リソース命名に使用するプロジェクト名
+
+  MaxConnections:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    MaxValue: 100000
+    Description: |
+      最大同時接続数
+      本番環境では適切な値に調整してください
+
+  MessageRetentionHours:
+    Type: Number
+    Default: 24
+    MinValue: 1
+    MaxValue: 168
+    Description: |
+      メッセージ保持時間（時間）
+      DynamoDBのTTL設定に使用
+
+Conditions:
+  # 本番環境かどうか（高可用性設定の制御）
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # ステージング以上の環境（監視強化）
+  IsProductionLike: !Or
+    - !Equals [!Ref EnvironmentName, 'prod']
+    - !Equals [!Ref EnvironmentName, 'staging']
+
+Resources:
+  # ========================================
+  # WebSocket API Gateway
+  # ========================================
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-websocket-api'
+      Description: |
+        リアルタイム更新用WebSocket API
+        チャット、通知、ライブアップデートに使用
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  # WebSocket API デプロイメント
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - DefaultRoute
+      - SendMessageRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+      Description: !Sub '${EnvironmentName} WebSocket API deployment'
+
+  # WebSocket API ステージ
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      DeploymentId: !Ref WebSocketDeployment
+      StageName: !Ref EnvironmentName
+      Description: !Sub '${EnvironmentName} WebSocket API stage'
+      DefaultRouteSettings:
+        DetailedMetricsEnabled: !If [IsProductionLike, true, false]
+        LoggingLevel: !If [IsProductionLike, INFO, ERROR]
+        DataTraceEnabled: !If [IsProduction, false, true]
+        ThrottlingBurstLimit: !If [IsProduction, 5000, 1000]
+        ThrottlingRateLimit: !If [IsProduction, 2000, 500]
+      AccessLogSettings:
+        DestinationArn: !GetAtt WebSocketLogGroup.Arn
+        Format: |
+          {
+            "requestId": "$requestId",
+            "connectionId": "$context.connectionId",
+            "routeKey": "$context.routeKey",
+            "eventType": "$context.eventType",
+            "requestTime": "$requestTime",
+            "status": "$status",
+            "error": "$error.message"
+          }
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  # ========================================
+  # WebSocket ルート設定
+  # ========================================
+  # 接続ルート（$connect）
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      Target: !Sub 'integrations/${ConnectIntegration}'
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+        - LambdaArn: !GetAtt ConnectFunction.Arn
+
+  # 切断ルート（$disconnect）
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub 'integrations/${DisconnectIntegration}'
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+        - LambdaArn: !GetAtt DisconnectFunction.Arn
+
+  # デフォルトルート（未定義のアクション）
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Sub 'integrations/${DefaultIntegration}'
+
+  DefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+        - LambdaArn: !GetAtt DefaultFunction.Arn
+
+  # メッセージ送信ルート
+  SendMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: sendmessage
+      Target: !Sub 'integrations/${SendMessageIntegration}'
+
+  SendMessageIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 
+        - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+        - LambdaArn: !GetAtt SendMessageFunction.Arn
+
+  # ========================================
+  # DynamoDB接続管理テーブル
+  # ========================================
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-connections'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S    # WebSocket接続ID
+        - AttributeName: userId
+          AttributeType: S    # ユーザーID（認証済みの場合）
+        - AttributeName: roomId
+          AttributeType: S    # ルーム/チャンネルID
+        - AttributeName: connectedAt
+          AttributeType: S    # 接続時刻
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH       # パーティションキー
+      GlobalSecondaryIndexes:
+        - IndexName: UserConnectionsIndex    # ユーザー別接続検索用
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: connectedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: RoomConnectionsIndex    # ルーム別接続検索用
+          KeySchema:
+            - AttributeName: roomId
+              KeyType: HASH
+            - AttributeName: connectedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true        # 古い接続記録を自動削除
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES  # DynamoDBストリーム有効化
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: TableType
+          Value: Connections
+
+  # メッセージ履歴テーブル
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-messages'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: messageId
+          AttributeType: S    # メッセージID
+        - AttributeName: roomId
+          AttributeType: S    # ルーム/チャンネルID
+        - AttributeName: timestamp
+          AttributeType: S    # 送信時刻
+        - AttributeName: userId
+          AttributeType: S    # 送信者ID
+      KeySchema:
+        - AttributeName: messageId
+          KeyType: HASH       # パーティションキー
+      GlobalSecondaryIndexes:
+        - IndexName: RoomMessagesIndex      # ルーム別メッセージ取得用
+          KeySchema:
+            - AttributeName: roomId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: UserMessagesIndex      # ユーザー別メッセージ取得用
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true        # 古いメッセージを自動削除
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: TableType
+          Value: Messages
+
+  # ========================================
+  # Lambda関数群
+  # ========================================
+  # 接続処理Lambda
+  ConnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-connect'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          ENVIRONMENT: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          import uuid
+          
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+          
+          def lambda_handler(event, context):
+              """WebSocket接続時の処理"""
+              connection_id = event['requestContext']['connectionId']
+              
+              try:
+                  # 接続情報をDynamoDBに保存
+                  ttl = int((datetime.utcnow() + timedelta(hours=24)).timestamp())
+                  
+                  # クエリパラメータからユーザー情報取得
+                  query_params = event.get('queryStringParameters') or {}
+                  user_id = query_params.get('userId', 'anonymous')
+                  room_id = query_params.get('roomId', 'general')
+                  
+                  connections_table.put_item(
+                      Item={
+                          'connectionId': connection_id,
+                          'userId': user_id,
+                          'roomId': room_id,
+                          'connectedAt': datetime.utcnow().isoformat(),
+                          'ttl': ttl,
+                          'userAgent': event['requestContext'].get('identity', {}).get('userAgent', ''),
+                          'sourceIp': event['requestContext'].get('identity', {}).get('sourceIp', '')
+                      }
+                  )
+                  
+                  print(f"Connection established: {connection_id} for user {user_id} in room {room_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Connected successfully',
+                          'connectionId': connection_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Connection error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': 'Failed to connect',
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 切断処理Lambda
+  DisconnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-disconnect'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          ENVIRONMENT: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+          
+          def lambda_handler(event, context):
+              """WebSocket切断時の処理"""
+              connection_id = event['requestContext']['connectionId']
+              
+              try:
+                  # 接続情報をDynamoDBから削除
+                  response = connections_table.delete_item(
+                      Key={'connectionId': connection_id},
+                      ReturnValues='ALL_OLD'
+                  )
+                  
+                  if 'Attributes' in response:
+                      user_id = response['Attributes'].get('userId', 'unknown')
+                      room_id = response['Attributes'].get('roomId', 'unknown')
+                      print(f"Connection closed: {connection_id} for user {user_id} in room {room_id}")
+                  else:
+                      print(f"Connection {connection_id} not found in database")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Disconnected successfully'
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Disconnect error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': 'Failed to disconnect',
+                          'error': str(e)
+                      })
+                  }
+
+  # デフォルト処理Lambda
+  DefaultFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-default'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          ENVIRONMENT: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          def lambda_handler(event, context):
+              """未定義のアクションに対する処理"""
+              connection_id = event['requestContext']['connectionId']
+              
+              try:
+                  # リクエストボディをパース
+                  body = json.loads(event.get('body', '{}'))
+                  action = body.get('action', 'unknown')
+                  
+                  print(f"Unknown action '{action}' received from connection {connection_id}")
+                  
+                  # WebSocket経由でエラーレスポンスを送信
+                  api_gateway = boto3.client('apigatewaymanagementapi',
+                      endpoint_url=f"https://{event['requestContext']['domainName']}/{event['requestContext']['stage']}")
+                  
+                  error_message = {
+                      'type': 'error',
+                      'message': f"Unknown action: {action}",
+                      'supportedActions': ['sendmessage', 'joinroom', 'leaveroom']
+                  }
+                  
+                  api_gateway.post_to_connection(
+                      ConnectionId=connection_id,
+                      Data=json.dumps(error_message)
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Error sent to client'})
+                  }
+                  
+              except Exception as e:
+                  print(f"Default handler error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': 'Internal server error',
+                          'error': str(e)
+                      })
+                  }
+
+  # メッセージ送信Lambda
+  SendMessageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-sendmessage'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          MESSAGES_TABLE: !Ref MessagesTable
+          ENVIRONMENT: !Ref EnvironmentName
+          MAX_CONNECTIONS: !Ref MaxConnections
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          import uuid
+          from boto3.dynamodb.conditions import Key
+          
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+          messages_table = dynamodb.Table(os.environ['MESSAGES_TABLE'])
+          
+          def lambda_handler(event, context):
+              """メッセージ送信とブロードキャスト処理"""
+              connection_id = event['requestContext']['connectionId']
+              domain_name = event['requestContext']['domainName']
+              stage = event['requestContext']['stage']
+              
+              api_gateway = boto3.client('apigatewaymanagementapi',
+                  endpoint_url=f"https://{domain_name}/{stage}")
+              
+              try:
+                  # リクエストボディをパース
+                  body = json.loads(event.get('body', '{}'))
+                  message_content = body.get('message', '')
+                  target_room = body.get('roomId', 'general')
+                  message_type = body.get('type', 'chat')
+                  
+                  if not message_content:
+                      raise ValueError("Message content is required")
+                  
+                  # 送信者の接続情報を取得
+                  sender_response = connections_table.get_item(
+                      Key={'connectionId': connection_id}
+                  )
+                  
+                  if 'Item' not in sender_response:
+                      raise ValueError("Sender connection not found")
+                  
+                  sender_info = sender_response['Item']
+                  sender_user_id = sender_info.get('userId', 'anonymous')
+                  
+                  # メッセージをメッセージテーブルに保存
+                  message_id = str(uuid.uuid4())
+                  timestamp = datetime.utcnow().isoformat()
+                  ttl = int((datetime.utcnow() + timedelta(hours=int(os.environ.get('MESSAGE_RETENTION_HOURS', 24)))).timestamp())
+                  
+                  message_item = {
+                      'messageId': message_id,
+                      'roomId': target_room,
+                      'userId': sender_user_id,
+                      'message': message_content,
+                      'type': message_type,
+                      'timestamp': timestamp,
+                      'ttl': ttl
+                  }
+                  
+                  messages_table.put_item(Item=message_item)
+                  
+                  # 対象ルームの全接続を取得
+                  room_connections = connections_table.query(
+                      IndexName='RoomConnectionsIndex',
+                      KeyConditionExpression=Key('roomId').eq(target_room)
+                  )
+                  
+                  # ブロードキャスト用メッセージ作成
+                  broadcast_message = {
+                      'type': 'message',
+                      'messageId': message_id,
+                      'roomId': target_room,
+                      'userId': sender_user_id,
+                      'message': message_content,
+                      'timestamp': timestamp,
+                      'messageType': message_type
+                  }
+                  
+                  # 各接続にメッセージを送信
+                  sent_count = 0
+                  failed_connections = []
+                  
+                  for connection in room_connections['Items']:
+                      target_connection_id = connection['connectionId']
+                      
+                      try:
+                          api_gateway.post_to_connection(
+                              ConnectionId=target_connection_id,
+                              Data=json.dumps(broadcast_message)
+                          )
+                          sent_count += 1
+                          
+                      except api_gateway.exceptions.GoneException:
+                          # 無効な接続を記録（後で削除）
+                          failed_connections.append(target_connection_id)
+                          print(f"Connection {target_connection_id} is gone")
+                          
+                      except Exception as conn_error:
+                          print(f"Failed to send to {target_connection_id}: {str(conn_error)}")
+                          failed_connections.append(target_connection_id)
+                  
+                  # 無効な接続をデータベースから削除
+                  for failed_conn_id in failed_connections:
+                      try:
+                          connections_table.delete_item(
+                              Key={'connectionId': failed_conn_id}
+                          )
+                      except Exception as e:
+                          print(f"Failed to remove connection {failed_conn_id}: {str(e)}")
+                  
+                  print(f"Message sent to {sent_count} connections, {len(failed_connections)} failed")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Message sent successfully',
+                          'messageId': message_id,
+                          'sentTo': sent_count,
+                          'failed': len(failed_connections)
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Send message error: {str(e)}")
+                  
+                  # 送信者にエラー通知
+                  try:
+                      error_response = {
+                          'type': 'error',
+                          'message': f"Failed to send message: {str(e)}"
+                      }
+                      api_gateway.post_to_connection(
+                          ConnectionId=connection_id,
+                          Data=json.dumps(error_response)
+                      )
+                  except:
+                      pass
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'message': 'Failed to send message',
+                          'error': str(e)
+                      })
+                  }
+
+  # ========================================
+  # Lambda権限設定
+  # ========================================
+  WebSocketLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-websocket-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WebSocketLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ConnectionsTable.Arn
+                  - !Sub '${ConnectionsTable.Arn}/index/*'
+                  - !GetAtt MessagesTable.Arn
+                  - !Sub '${MessagesTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # Lambda実行権限
+  ConnectFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ConnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  DisconnectFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DisconnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  DefaultFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DefaultFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  SendMessageFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SendMessageFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # ========================================
+  # CloudWatchログ設定
+  # ========================================
+  WebSocketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-${EnvironmentName}-websocket'
+      RetentionInDays: !If [IsProduction, 90, 7]
+
+  ConnectFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-connect'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  DisconnectFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-disconnect'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  DefaultFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-default'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  SendMessageFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-sendmessage'
+      RetentionInDays: !If [IsProduction, 30, 7]
+
+  # ========================================
+  # CloudWatchアラーム
+  # ========================================
+  # WebSocket接続エラーアラーム
+  WebSocketErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-websocket-errors'
+      AlarmDescription: WebSocket API接続エラー監視
+      MetricName: IntegrationError
+      Namespace: AWS/ApiGatewayV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WebSocketApi
+        - Name: Stage
+          Value: !Ref EnvironmentName
+
+  # DynamoDB接続テーブルスロットリングアラーム
+  ConnectionsTableThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-connections-throttle'
+      AlarmDescription: 接続テーブルスロットリング監視
+      MetricName: UserErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref ConnectionsTable
+
+  # Lambda関数エラーアラーム
+  SendMessageErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-sendmessage-errors'
+      AlarmDescription: メッセージ送信Lambda関数エラー監視
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SendMessageFunction
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # WebSocket API情報
+  WebSocketApiId:
+    Description: WebSocket API ID
+    Value: !Ref WebSocketApi
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketApi-ID'
+
+  WebSocketApiEndpoint:
+    Description: WebSocket API エンドポイントURL
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketApi-Endpoint'
+
+  WebSocketStage:
+    Description: WebSocket API ステージ
+    Value: !Ref WebSocketStage
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketStage'
+
+  # DynamoDBテーブル情報
+  ConnectionsTableName:
+    Description: 接続管理DynamoDBテーブル名
+    Value: !Ref ConnectionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectionsTable'
+
+  ConnectionsTableArn:
+    Description: 接続管理DynamoDBテーブルARN
+    Value: !GetAtt ConnectionsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectionsTable-Arn'
+
+  MessagesTableName:
+    Description: メッセージ履歴DynamoDBテーブル名
+    Value: !Ref MessagesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-MessagesTable'
+
+  MessagesTableArn:
+    Description: メッセージ履歴DynamoDBテーブルARN
+    Value: !GetAtt MessagesTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MessagesTable-Arn'
+
+  # Lambda関数情報
+  ConnectFunctionArn:
+    Description: 接続処理Lambda関数ARN
+    Value: !GetAtt ConnectFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectFunction-Arn'
+
+  SendMessageFunctionArn:
+    Description: メッセージ送信Lambda関数ARN
+    Value: !GetAtt SendMessageFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SendMessageFunction-Arn'
+
+  # IAMロール情報
+  WebSocketLambdaRoleArn:
+    Description: WebSocket Lambda関数用IAMロールARN
+    Value: !GetAtt WebSocketLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketLambdaRole-Arn'
+
+  # 接続情報
+  MaxConnections:
+    Description: 最大同時接続数設定
+    Value: !Ref MaxConnections
+    Export:
+      Name: !Sub '${AWS::StackName}-MaxConnections'
+
+  # 使用方法例
+  ConnectionExample:
+    Description: WebSocket接続の使用例
+    Value: !Sub |
+      // JavaScript WebSocket接続例
+      const ws = new WebSocket('wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}?userId=user123&roomId=general');
+      
+      // メッセージ送信例
+      ws.send(JSON.stringify({
+        action: 'sendmessage',
+        message: 'Hello World!',
+        roomId: 'general',
+        type: 'chat'
+      }));

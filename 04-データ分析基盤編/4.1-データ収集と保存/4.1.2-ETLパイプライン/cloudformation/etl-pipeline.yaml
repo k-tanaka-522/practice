@@ -1,0 +1,823 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  AWS Glue ETLパイプライン - データ変換と処理基盤
+  
+  このテンプレートは以下のリソースを作成します：
+  - AWS Glue Data Catalog（メタデータ管理）
+  - AWS Glue ETLジョブ（データ変換処理）
+  - AWS Glue Crawler（スキーマ自動検出）
+  - S3データレイク（Raw/Processed/Curated層）
+  - Lambda関数（ETLトリガー・監視）
+  - Step Functions（ワークフロー編成）
+  - CloudWatch監視とアラーム
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（コスト最適化）
+      - staging: ステージング環境（本番に近い設定）
+      - prod: 本番環境（高パフォーマンス・高可用性）
+
+  ProjectName:
+    Type: String
+    Default: etl-pipeline
+    Description: リソース命名に使用するプロジェクト名
+
+  DataRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 7
+    MaxValue: 2555
+    Description: |
+      データ保持期間（日数）
+      生データとプロセス済みデータの保存期間
+
+  GlueWorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues: [G.1X, G.2X, G.4X, G.8X]
+    Description: |
+      Glue ETLワーカータイプ
+      - G.1X: 4 vCPU, 16 GB RAM（開発・小規模）
+      - G.2X: 8 vCPU, 32 GB RAM（本番・中規模）
+      - G.4X: 16 vCPU, 64 GB RAM（大規模処理）
+      - G.8X: 32 vCPU, 128 GB RAM（超大規模処理）
+
+  MaxWorkers:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    MaxValue: 100
+    Description: |
+      ETLジョブの最大ワーカー数
+      処理データ量に応じて調整
+
+Conditions:
+  # 本番環境かどうか（高性能設定の制御）
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # 高性能ワーカーを使用するか
+  UseHighPerformanceWorkers: !Or
+    - !Equals [!Ref GlueWorkerType, 'G.4X']
+    - !Equals [!Ref GlueWorkerType, 'G.8X']
+
+Resources:
+  # ========================================
+  # S3データレイク（3層アーキテクチャ）
+  # ========================================
+  # Raw層（生データ）
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-raw-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 90
+          - Id: DeleteOldData
+            Status: Enabled
+            ExpirationInDays: !Ref DataRetentionDays
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref ETLLogGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataLayer
+          Value: Raw
+
+  # Processed層（処理済みデータ）
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-processed-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transition:
+              StorageClass: GLACIER
+              TransitionInDays: 180
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataLayer
+          Value: Processed
+
+  # Curated層（分析用最適化データ）
+  CuratedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-curated-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transition:
+              StorageClass: STANDARD_IA
+              TransitionInDays: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataLayer
+          Value: Curated
+
+  # ETLスクリプト保存用S3バケット
+  ScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-scripts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ETLScripts
+
+  # ========================================
+  # AWS Glue Data Catalog
+  # ========================================
+  # Glueデータベース（メタデータ管理）
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${EnvironmentName}_database'
+        Description: !Sub '${ProjectName} ${EnvironmentName} データカタログデータベース'
+
+  # ========================================
+  # AWS Glue Crawler（スキーマ自動検出）
+  # ========================================
+  # Rawデータ用Crawler
+  RawDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-raw-crawler'
+      Description: 生データのスキーマ自動検出
+      DatabaseName: !Ref GlueDatabase
+      Role: !GetAtt GlueServiceRole.Arn
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${RawDataBucket}/'
+            Exclusions:
+              - '**/_SUCCESS'
+              - '**/.DS_Store'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      Schedule:
+        ScheduleExpression: !If [IsProduction, 'cron(0 2 * * ? *)', 'cron(0 6 * * ? *)']
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+        DataLayer: Raw
+
+  # Processedデータ用Crawler
+  ProcessedDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-processed-crawler'
+      Description: 処理済みデータのスキーマ自動検出
+      DatabaseName: !Ref GlueDatabase
+      Role: !GetAtt GlueServiceRole.Arn
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${ProcessedDataBucket}/'
+            Exclusions:
+              - '**/_SUCCESS'
+              - '**/.DS_Store'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      Schedule:
+        ScheduleExpression: !If [IsProduction, 'cron(0 3 * * ? *)', 'cron(0 7 * * ? *)']
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+        DataLayer: Processed
+
+  # ========================================
+  # AWS Glue ETLジョブ
+  # ========================================
+  # データクレンジングジョブ
+  DataCleansingJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-data-cleansing'
+      Description: データクレンジングとバリデーション処理
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: '3.0'
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref MaxWorkers
+      MaxRetries: 3
+      Timeout: 2880  # 48時間
+      ExecutionProperty:
+        MaxConcurrentRuns: !If [IsProduction, 5, 2]
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${ScriptsBucket}/scripts/data_cleansing.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--TempDir': !Sub 's3://${ScriptsBucket}/temp/'
+        '--job-bookmark-option': 'job-bookmark-enable'
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${ScriptsBucket}/spark-logs/'
+        '--raw-bucket': !Ref RawDataBucket
+        '--processed-bucket': !Ref ProcessedDataBucket
+        '--database-name': !Ref GlueDatabase
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+        JobType: Cleansing
+
+  # データ変換ジョブ
+  DataTransformationJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-data-transformation'
+      Description: データ変換と集約処理
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: '3.0'
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref MaxWorkers
+      MaxRetries: 3
+      Timeout: 2880
+      ExecutionProperty:
+        MaxConcurrentRuns: !If [IsProduction, 5, 2]
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${ScriptsBucket}/scripts/data_transformation.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--TempDir': !Sub 's3://${ScriptsBucket}/temp/'
+        '--job-bookmark-option': 'job-bookmark-enable'
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${ScriptsBucket}/spark-logs/'
+        '--processed-bucket': !Ref ProcessedDataBucket
+        '--curated-bucket': !Ref CuratedDataBucket
+        '--database-name': !Ref GlueDatabase
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+        JobType: Transformation
+
+  # データ品質チェックジョブ
+  DataQualityJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-data-quality'
+      Description: データ品質チェックと検証
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: '3.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      MaxRetries: 1
+      Timeout: 480  # 8時間
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${ScriptsBucket}/scripts/data_quality.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--TempDir': !Sub 's3://${ScriptsBucket}/temp/'
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--processed-bucket': !Ref ProcessedDataBucket
+        '--curated-bucket': !Ref CuratedDataBucket
+        '--database-name': !Ref GlueDatabase
+        '--sns-topic': !Ref ETLNotificationTopic
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+        JobType: Quality
+
+  # ========================================
+  # Step Functions ワークフロー
+  # ========================================
+  # ETLワークフロー状態マシン
+  ETLWorkflowStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-${EnvironmentName}-etl-workflow'
+      DefinitionString: !Sub |
+        {
+          "Comment": "ETLデータ処理ワークフロー",
+          "StartAt": "StartCrawler",
+          "States": {
+            "StartCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${RawDataCrawler}"
+              },
+              "Next": "WaitForCrawler",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "Next": "CrawlerFailed"
+                }
+              ]
+            },
+            "WaitForCrawler": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckCrawlerStatus"
+            },
+            "CheckCrawlerStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${RawDataCrawler}"
+              },
+              "Next": "IsCrawlerReady"
+            },
+            "IsCrawlerReady": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "StartDataCleansing"
+                }
+              ],
+              "Default": "WaitForCrawler"
+            },
+            "StartDataCleansing": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${DataCleansingJob}"
+              },
+              "Next": "StartDataTransformation",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "Next": "ETLJobFailed"
+                }
+              ]
+            },
+            "StartDataTransformation": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${DataTransformationJob}"
+              },
+              "Next": "StartDataQuality",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "Next": "ETLJobFailed"
+                }
+              ]
+            },
+            "StartDataQuality": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${DataQualityJob}"
+              },
+              "Next": "StartProcessedCrawler",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "Next": "QualityCheckFailed"
+                }
+              ]
+            },
+            "StartProcessedCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${ProcessedDataCrawler}"
+              },
+              "Next": "ETLSuccess"
+            },
+            "ETLSuccess": {
+              "Type": "Pass",
+              "Result": "ETL処理が正常に完了しました",
+              "End": true
+            },
+            "CrawlerFailed": {
+              "Type": "Pass",
+              "Result": "Crawlerの実行に失敗しました",
+              "End": true
+            },
+            "ETLJobFailed": {
+              "Type": "Pass",
+              "Result": "ETLジョブの実行に失敗しました",
+              "End": true
+            },
+            "QualityCheckFailed": {
+              "Type": "Pass",
+              "Result": "データ品質チェックに失敗しました",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # Lambda関数（ETLトリガー）
+  # ========================================
+  # S3イベントトリガーLambda
+  ETLTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-etl-trigger'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ETLTriggerRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ETLWorkflowStateMachine
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          stepfunctions = boto3.client('stepfunctions')
+          
+          def lambda_handler(event, context):
+              """S3オブジェクト作成時のETLワークフロー起動"""
+              
+              try:
+                  state_machine_arn = os.environ['STATE_MACHINE_ARN']
+                  
+                  # S3イベントの処理
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = record['s3']['object']['key']
+                      
+                      print(f"Processing file: s3://{bucket}/{key}")
+                      
+                      # ETLワークフロー実行
+                      execution_name = f"etl-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+                      
+                      response = stepfunctions.start_execution(
+                          stateMachineArn=state_machine_arn,
+                          name=execution_name,
+                          input=json.dumps({
+                              'bucket': bucket,
+                              'key': key,
+                              'timestamp': datetime.utcnow().isoformat()
+                          })
+                      )
+                      
+                      print(f"Started ETL workflow: {response['executionArn']}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'ETL workflow started successfully',
+                          'processedFiles': len(event['Records'])
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error starting ETL workflow: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3イベント通知設定
+  S3BucketNotification:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref RawDataBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ETLTriggerFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: data/
+                  - Name: suffix
+                    Value: .json
+
+  # Lambda実行権限
+  ETLTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ETLTriggerFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${RawDataBucket}'
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  # Glueサービスロール
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-glue-service-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueETLPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${RawDataBucket}/*'
+                  - !Sub '${ProcessedDataBucket}/*'
+                  - !Sub '${CuratedDataBucket}/*'
+                  - !Sub '${ScriptsBucket}/*'
+                  - !GetAtt RawDataBucket.Arn
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !GetAtt CuratedDataBucket.Arn
+                  - !GetAtt ScriptsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ETLNotificationTopic
+
+  # Step Functions実行ロール
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsETLPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:BatchStopJobRun
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                Resource: '*'
+
+  # Lambda実行ロール
+  ETLTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ETLTriggerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref ETLWorkflowStateMachine
+
+  # ========================================
+  # SNS通知トピック
+  # ========================================
+  ETLNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-etl-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} ETL通知'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # CloudWatch監視
+  # ========================================
+  # CloudWatchロググループ
+  ETLLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/glue/${ProjectName}-${EnvironmentName}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # Glueジョブ失敗アラーム
+  GlueJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-glue-job-failures'
+      AlarmDescription: Glue ETLジョブ失敗監視
+      MetricName: glue.driver.aggregate.numFailedTasks
+      Namespace: Glue
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ETLNotificationTopic
+
+  # Step Functions実行失敗アラーム
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-stepfunctions-failures'
+      AlarmDescription: Step Functions実行失敗監視
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref ETLWorkflowStateMachine
+      AlarmActions:
+        - !Ref ETLNotificationTopic
+
+# ========================================
+# 出力値（他のスタックから参照可能）
+# ========================================
+Outputs:
+  # データレイクS3バケット
+  RawDataBucketName:
+    Description: Raw層S3バケット名
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucket'
+
+  ProcessedDataBucketName:
+    Description: Processed層S3バケット名
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucket'
+
+  CuratedDataBucketName:
+    Description: Curated層S3バケット名
+    Value: !Ref CuratedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CuratedDataBucket'
+
+  # Glueリソース情報
+  GlueDatabaseName:
+    Description: Glueデータベース名
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  DataCleansingJobName:
+    Description: データクレンジングジョブ名
+    Value: !Ref DataCleansingJob
+    Export:
+      Name: !Sub '${AWS::StackName}-DataCleansingJob'
+
+  DataTransformationJobName:
+    Description: データ変換ジョブ名
+    Value: !Ref DataTransformationJob
+    Export:
+      Name: !Sub '${AWS::StackName}-DataTransformationJob'
+
+  # ワークフロー情報
+  ETLWorkflowArn:
+    Description: ETLワークフロー状態マシンARN
+    Value: !Ref ETLWorkflowStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-ETLWorkflow'
+
+  # 通知トピック
+  ETLNotificationTopicArn:
+    Description: ETL通知用SNSトピックARN
+    Value: !Ref ETLNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ETLNotificationTopic'
+
+  # 管理情報
+  GlueConsoleURL:
+    Description: AWS Glue管理コンソールURL
+    Value: !Sub 'https://console.aws.amazon.com/glue/home?region=${AWS::Region}#catalog:tab=databases'
+
+  StepFunctionsConsoleURL:
+    Description: Step Functions管理コンソールURL
+    Value: !Sub 'https://console.aws.amazon.com/states/home?region=${AWS::Region}#/statemachines/view/${ETLWorkflowStateMachine}'
+
+  # ETLアーキテクチャ概要
+  ETLArchitecture:
+    Description: ETLパイプラインアーキテクチャ概要
+    Value: !Sub |
+      ETLパイプライン構成:
+      - Raw層: s3://${RawDataBucket}/
+      - Processed層: s3://${ProcessedDataBucket}/
+      - Curated層: s3://${CuratedDataBucket}/
+      - Glueデータベース: ${GlueDatabase}
+      - ワークフロー: ${ETLWorkflowStateMachine}
+      - 管理コンソール: https://console.aws.amazon.com/glue/home?region=${AWS::Region}
