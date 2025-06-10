@@ -1,0 +1,824 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DynamoDB Tables with Global Tables, Streams, and best practices'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: dynamodb-tables
+    Description: Project name for resource naming
+
+  BillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: DynamoDB billing mode
+
+  ReadCapacityUnits:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: Read capacity units (for provisioned mode)
+
+  WriteCapacityUnits:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+    Description: Write capacity units (for provisioned mode)
+
+  EnableStreams:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable DynamoDB Streams
+
+  EnableGlobalTables:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable Global Tables for multi-region replication
+
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    AllowedValues: [us-east-1, us-west-1, us-west-2, eu-west-1, eu-central-1, ap-southeast-1, ap-northeast-1]
+    Description: Secondary region for Global Tables
+
+  EnableBackup:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable point-in-time recovery
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  IsProvisioned: !Equals [!Ref BillingMode, 'PROVISIONED']
+  StreamsEnabled: !Equals [!Ref EnableStreams, 'true']
+  GlobalTablesEnabled: !And
+    - !Equals [!Ref EnableGlobalTables, 'true']
+    - !Condition IsProduction
+  BackupEnabled: !Or
+    - !Equals [!Ref EnableBackup, 'true']
+    - !Condition IsProduction
+
+Resources:
+  # KMS Key for DynamoDB encryption
+  DynamoDBKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName} ${EnvironmentName} DynamoDB encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow DynamoDB access
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DynamoDBKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${EnvironmentName}-dynamodb'
+      TargetKeyId: !Ref DynamoDBKMSKey
+
+  # Users Table
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-users'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+        - AttributeName: username
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref AWS::NoValue
+        - IndexName: UsernameIndex
+          KeySchema:
+            - AttributeName: username
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref AWS::NoValue
+        - IndexName: StatusCreatedIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref AWS::NoValue
+      ProvisionedThroughput: !If
+        - IsProvisioned
+        - ReadCapacityUnits: !Ref ReadCapacityUnits
+          WriteCapacityUnits: !Ref WriteCapacityUnits
+        - !Ref AWS::NoValue
+      StreamSpecification: !If
+        - StreamsEnabled
+        - StreamViewType: NEW_AND_OLD_IMAGES
+        - !Ref AWS::NoValue
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref BackupEnabled
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: TableType
+          Value: Users
+
+  # Products Table
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-products'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: price
+          AttributeType: N
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: brandId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CategoryPriceIndex
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: price
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref AWS::NoValue
+        - IndexName: BrandCreatedIndex
+          KeySchema:
+            - AttributeName: brandId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref AWS::NoValue
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref AWS::NoValue
+      ProvisionedThroughput: !If
+        - IsProvisioned
+        - ReadCapacityUnits: !Ref ReadCapacityUnits
+          WriteCapacityUnits: !Ref WriteCapacityUnits
+        - !Ref AWS::NoValue
+      StreamSpecification: !If
+        - StreamsEnabled
+        - StreamViewType: NEW_AND_OLD_IMAGES
+        - !Ref AWS::NoValue
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref BackupEnabled
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: TableType
+          Value: Products
+
+  # Orders Table
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-orders'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: totalAmount
+          AttributeType: N
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserOrdersIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref AWS::NoValue
+        - IndexName: StatusAmountIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: totalAmount
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisioned
+            - ReadCapacityUnits: !Ref ReadCapacityUnits
+              WriteCapacityUnits: !Ref WriteCapacityUnits
+            - !Ref AWS::NoValue
+      ProvisionedThroughput: !If
+        - IsProvisioned
+        - ReadCapacityUnits: !Ref ReadCapacityUnits
+          WriteCapacityUnits: !Ref WriteCapacityUnits
+        - !Ref AWS::NoValue
+      StreamSpecification: !If
+        - StreamsEnabled
+        - StreamViewType: NEW_AND_OLD_IMAGES
+        - !Ref AWS::NoValue
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref BackupEnabled
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: TableType
+          Value: Orders
+
+  # Session Store Table
+  SessionStoreTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-sessions'
+      BillingMode: PAY_PER_REQUEST  # Always on-demand for sessions
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserSessionsIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: TableType
+          Value: Sessions
+
+  # Analytics Events Table (for event sourcing)
+  AnalyticsEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-analytics-events'
+      BillingMode: PAY_PER_REQUEST  # On-demand for analytics
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: eventType
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EventTypeTimestampIndex
+          KeySchema:
+            - AttributeName: eventType
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: UserEventsIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification: !If
+        - StreamsEnabled
+        - StreamViewType: NEW_AND_OLD_IMAGES
+        - !Ref AWS::NoValue
+      SSESpecification:
+        SSEEnabled: true
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !Ref BackupEnabled
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: TableType
+          Value: Analytics
+
+  # Lambda function for DynamoDB Stream processing
+  StreamProcessorFunction:
+    Type: AWS::Lambda::Function
+    Condition: StreamsEnabled
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-stream-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt StreamProcessorRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          ANALYTICS_TABLE: !Ref AnalyticsEventsTable
+          SNS_TOPIC: !Ref StreamNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import uuid
+          
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              print(f"Stream processor received {len(event['Records'])} records")
+              
+              analytics_table = dynamodb.Table(os.environ['ANALYTICS_TABLE'])
+              sns_topic = os.environ['SNS_TOPIC']
+              
+              processed_events = []
+              
+              try:
+                  for record in event['Records']:
+                      # Extract event information
+                      event_name = record['eventName']
+                      source_table = record['eventSourceARN'].split('/')[-3]
+                      
+                      # Create analytics event
+                      analytics_event = {
+                          'eventId': str(uuid.uuid4()),
+                          'eventType': f'{source_table}_{event_name}',
+                          'timestamp': datetime.utcnow().isoformat(),
+                          'sourceTable': source_table,
+                          'eventName': event_name,
+                          'awsRegion': record['awsRegion'],
+                          'eventVersion': record['eventVersion']
+                      }
+                      
+                      # Add record data based on event type
+                      if event_name in ['INSERT', 'MODIFY']:
+                          if 'NewImage' in record['dynamodb']:
+                              # Extract key fields for analytics
+                              new_image = record['dynamodb']['NewImage']
+                              if 'userId' in new_image:
+                                  analytics_event['userId'] = new_image['userId']['S']
+                              if 'productId' in new_image:
+                                  analytics_event['productId'] = new_image['productId']['S']
+                              if 'orderId' in new_image:
+                                  analytics_event['orderId'] = new_image['orderId']['S']
+                      
+                      # Store analytics event
+                      analytics_table.put_item(Item=analytics_event)
+                      processed_events.append(analytics_event)
+                      
+                      # Send notifications for important events
+                      if should_notify(event_name, source_table):
+                          message = f"DynamoDB Stream Event: {event_name} on {source_table}"
+                          sns.publish(
+                              TopicArn=sns_topic,
+                              Message=json.dumps(analytics_event, indent=2),
+                              Subject=message
+                          )
+                  
+                  print(f"Successfully processed {len(processed_events)} events")
+                  return {
+                      'statusCode': 200,
+                      'processedEvents': len(processed_events)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing stream records: {str(e)}")
+                  # Send error notification
+                  sns.publish(
+                      TopicArn=sns_topic,
+                      Message=f"Error processing DynamoDB stream: {str(e)}",
+                      Subject="DynamoDB Stream Processing Error"
+                  )
+                  raise e
+          
+          def should_notify(event_name, source_table):
+              # Define notification rules
+              important_events = {
+                  'users': ['INSERT'],
+                  'orders': ['INSERT', 'MODIFY']
+              }
+              return source_table in important_events and event_name in important_events[source_table]
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Stream Processor Lambda
+  StreamProcessorRole:
+    Type: AWS::IAM::Role
+    Condition: StreamsEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StreamProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  - !GetAtt UsersTable.StreamArn
+                  - !GetAtt ProductsTable.StreamArn
+                  - !GetAtt OrdersTable.StreamArn
+                  - !GetAtt AnalyticsEventsTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AnalyticsEventsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref StreamNotificationTopic
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DynamoDBKMSKey.Arn
+
+  # Event Source Mappings for DynamoDB Streams
+  UsersStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: StreamsEnabled
+    Properties:
+      EventSourceArn: !GetAtt UsersTable.StreamArn
+      FunctionName: !Ref StreamProcessorFunction
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 2
+
+  OrdersStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: StreamsEnabled
+    Properties:
+      EventSourceArn: !GetAtt OrdersTable.StreamArn
+      FunctionName: !Ref StreamProcessorFunction
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      ParallelizationFactor: 2
+
+  # SNS Topic for Stream Notifications
+  StreamNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: StreamsEnabled
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-stream-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} Stream Notifications'
+      KmsMasterKeyId: !Ref DynamoDBKMSKey
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarms for DynamoDB Tables
+  UsersTableReadThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-users-read-throttle'
+      AlarmDescription: Users table read throttling
+      MetricName: ReadThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref UsersTable
+
+  UsersTableWriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-users-write-throttle'
+      AlarmDescription: Users table write throttling
+      MetricName: WriteThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref UsersTable
+
+  OrdersTableSystemErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-orders-system-errors'
+      AlarmDescription: Orders table system errors
+      MetricName: SystemErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref OrdersTable
+
+  # DynamoDB Auto Scaling (for provisioned mode)
+  UsersTableReadCapacityScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: IsProvisioned
+    Properties:
+      MaxCapacity: 100
+      MinCapacity: 5
+      ResourceId: !Sub 'table/${UsersTable}'
+      RoleARN: !GetAtt DynamoDBAutoscalingRole.Arn
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  UsersTableReadCapacityScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: IsProvisioned
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${EnvironmentName}-users-read-scaling-policy'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref UsersTableReadCapacityScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: DynamoDBReadCapacityUtilization
+        TargetValue: 70.0
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 60
+
+  # DynamoDB AutoScaling Role
+  DynamoDBAutoscalingRole:
+    Type: AWS::IAM::Role
+    Condition: IsProvisioned
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/DynamoDBAutoscaleRole
+
+  # Backup Vault for DynamoDB
+  DynamoDBBackupVault:
+    Type: AWS::Backup::BackupVault
+    Condition: BackupEnabled
+    Properties:
+      BackupVaultName: !Sub '${ProjectName}-${EnvironmentName}-dynamodb-backup-vault'
+      EncryptionKeyArn: !GetAtt DynamoDBKMSKey.Arn
+      BackupVaultTags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  # Backup Plan
+  DynamoDBBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Condition: BackupEnabled
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub '${ProjectName}-${EnvironmentName}-dynamodb-backup-plan'
+        BackupPlanRule:
+          - RuleName: DailyBackups
+            TargetBackupVault: !Ref DynamoDBBackupVault
+            ScheduleExpression: cron(0 5 ? * * *)
+            StartWindowMinutes: 480
+            CompletionWindowMinutes: 10080
+            Lifecycle:
+              DeleteAfterDays: !If [IsProduction, 30, 7]
+            RecoveryPointTags:
+              Environment: !Ref EnvironmentName
+              Project: !Ref ProjectName
+
+Outputs:
+  UsersTableName:
+    Description: Users DynamoDB Table Name
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UsersTable'
+
+  UsersTableArn:
+    Description: Users DynamoDB Table ARN
+    Value: !GetAtt UsersTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UsersTableArn'
+
+  ProductsTableName:
+    Description: Products DynamoDB Table Name
+    Value: !Ref ProductsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductsTable'
+
+  ProductsTableArn:
+    Description: Products DynamoDB Table ARN
+    Value: !GetAtt ProductsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProductsTableArn'
+
+  OrdersTableName:
+    Description: Orders DynamoDB Table Name
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTable'
+
+  OrdersTableArn:
+    Description: Orders DynamoDB Table ARN
+    Value: !GetAtt OrdersTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableArn'
+
+  SessionStoreTableName:
+    Description: Session Store DynamoDB Table Name
+    Value: !Ref SessionStoreTable
+    Export:
+      Name: !Sub '${AWS::StackName}-SessionStoreTable'
+
+  AnalyticsEventsTableName:
+    Description: Analytics Events DynamoDB Table Name
+    Value: !Ref AnalyticsEventsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsEventsTable'
+
+  DynamoDBKMSKeyId:
+    Description: DynamoDB KMS Key ID
+    Value: !Ref DynamoDBKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBKMSKey'
+
+  DynamoDBKMSKeyArn:
+    Description: DynamoDB KMS Key ARN
+    Value: !GetAtt DynamoDBKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBKMSKeyArn'
+
+  StreamProcessorFunctionArn:
+    Condition: StreamsEnabled
+    Description: Stream Processor Lambda Function ARN
+    Value: !GetAtt StreamProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamProcessorFunction'
+
+  StreamNotificationTopicArn:
+    Condition: StreamsEnabled
+    Description: Stream Notification Topic ARN
+    Value: !Ref StreamNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-StreamNotificationTopic'
+
+  UsersTableStreamArn:
+    Condition: StreamsEnabled
+    Description: Users Table Stream ARN
+    Value: !GetAtt UsersTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-UsersTableStream'
+
+  OrdersTableStreamArn:
+    Condition: StreamsEnabled
+    Description: Orders Table Stream ARN
+    Value: !GetAtt OrdersTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-OrdersTableStream'

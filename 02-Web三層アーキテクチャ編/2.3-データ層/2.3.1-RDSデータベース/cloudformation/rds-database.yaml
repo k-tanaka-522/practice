@@ -1,0 +1,707 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RDS Database with best practices, read replicas, and monitoring'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: rds-database
+    Description: Project name for resource naming
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for the database
+
+  DatabaseSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of database subnet IDs
+
+  DatabaseEngine:
+    Type: String
+    Default: postgres
+    AllowedValues: [mysql, postgres, mariadb]
+    Description: Database engine
+
+  DatabaseVersion:
+    Type: String
+    Default: '15.4'
+    Description: Database engine version
+
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium, db.t3.large, db.r6g.large, db.r6g.xlarge]
+    Description: Database instance class
+
+  DatabaseName:
+    Type: String
+    Default: appdb
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    MaxLength: 64
+    Description: Database name
+
+  MasterUsername:
+    Type: String
+    Default: dbadmin
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    MaxLength: 16
+    Description: Master username
+
+  AllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: Allocated storage in GB
+
+  MaxAllocatedStorage:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 1000
+    Description: Maximum allocated storage for autoscaling
+
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 35
+    Description: Backup retention period in days
+
+  MultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable Multi-AZ deployment
+
+  CreateReadReplica:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create read replica
+
+  EnablePerformanceInsights:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable Performance Insights
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  IsMySQL: !Equals [!Ref DatabaseEngine, 'mysql']
+  IsPostgreSQL: !Equals [!Ref DatabaseEngine, 'postgres']
+  IsMariaDB: !Equals [!Ref DatabaseEngine, 'mariadb']
+  ShouldCreateReadReplica: !And
+    - !Equals [!Ref CreateReadReplica, 'true']
+    - !Condition IsProduction
+  EnableMultiAZ: !Or
+    - !Equals [!Ref MultiAZ, 'true']
+    - !Condition IsProduction
+  EnablePI: !Or
+    - !Equals [!Ref EnablePerformanceInsights, 'true']
+    - !Condition IsProduction
+
+Resources:
+  # Random password for database
+  DatabaseMasterUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-db-master-password'
+      Description: !Sub 'Master password for ${ProjectName} ${EnvironmentName} database'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Database Subnet Group
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-${EnvironmentName}-db-subnet-group'
+      DBSubnetGroupDescription: !Sub 'Subnet group for ${ProjectName} ${EnvironmentName} database'
+      SubnetIds: !Ref DatabaseSubnetIds
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Database Security Group
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${EnvironmentName}-db-sg'
+      GroupDescription: Security group for RDS database
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !If [IsPostgreSQL, 5432, !If [IsMySQL, 3306, 3306]]
+          ToPort: !If [IsPostgreSQL, 5432, !If [IsMySQL, 3306, 3306]]
+          SourceSecurityGroupId: !Ref ApplicationSecurityGroup
+          Description: Database access from application layer
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-db-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Application Security Group (referenced by database SG)
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${EnvironmentName}-app-sg'
+      GroupDescription: Security group for application servers accessing database
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-app-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Database Parameter Group
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${ProjectName}-${EnvironmentName}-db-params'
+      Description: !Sub 'Parameter group for ${ProjectName} ${EnvironmentName} database'
+      Family: !If 
+        - IsPostgreSQL
+        - postgres15
+        - !If 
+          - IsMySQL
+          - mysql8.0
+          - mariadb10.6
+      Parameters: !If
+        - IsPostgreSQL
+        - log_statement: 'all'
+          log_min_duration_statement: '1000'
+          shared_preload_libraries: 'pg_stat_statements'
+          log_line_prefix: '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+          log_checkpoints: '1'
+          log_connections: '1'
+          log_disconnections: '1'
+          log_lock_waits: '1'
+        - !If
+          - IsMySQL
+          - slow_query_log: '1'
+            long_query_time: '2'
+            log_queries_not_using_indexes: '1'
+            innodb_buffer_pool_size: '{DBInstanceClassMemory*3/4}'
+          - slow_query_log: '1'
+            long_query_time: '2'
+            log_queries_not_using_indexes: '1'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Option Group (for MySQL/MariaDB)
+  DatabaseOptionGroup:
+    Type: AWS::RDS::OptionGroup
+    Condition: IsMySQL
+    Properties:
+      OptionGroupName: !Sub '${ProjectName}-${EnvironmentName}-db-options'
+      OptionGroupDescription: !Sub 'Option group for ${ProjectName} ${EnvironmentName} database'
+      EngineName: !Ref DatabaseEngine
+      MajorEngineVersion: !If [IsMySQL, '8.0', '10.6']
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # KMS Key for database encryption
+  DatabaseKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName} ${EnvironmentName} database encryption'
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow RDS access
+            Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DatabaseKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${EnvironmentName}-database'
+      TargetKeyId: !Ref DatabaseKMSKey
+
+  # Enhanced Monitoring Role
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-rds-monitoring-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # Main Database Instance
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: !If [IsProduction, Snapshot, Delete]
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${EnvironmentName}-database'
+      DBName: !Ref DatabaseName
+      Engine: !Ref DatabaseEngine
+      EngineVersion: !Ref DatabaseVersion
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      MaxAllocatedStorage: !Ref MaxAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !Ref DatabaseKMSKey
+      
+      # Network Configuration
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      
+      # Authentication
+      MasterUsername: !Ref MasterUsername
+      ManageMasterUserPassword: true
+      MasterUserSecret:
+        SecretArn: !Ref DatabaseMasterUserSecret
+      
+      # Parameter and Option Groups
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      OptionGroupName: !If [IsMySQL, !Ref DatabaseOptionGroup, !Ref AWS::NoValue]
+      
+      # Backup Configuration
+      BackupRetentionPeriod: !If [IsProduction, 30, !Ref BackupRetentionPeriod]
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      DeleteAutomatedBackups: !If [IsProduction, false, true]
+      
+      # High Availability
+      MultiAZ: !If [EnableMultiAZ, true, false]
+      
+      # Monitoring
+      MonitoringInterval: !If [IsProduction, 60, 0]
+      MonitoringRoleArn: !If [IsProduction, !GetAtt EnhancedMonitoringRole.Arn, !Ref AWS::NoValue]
+      EnablePerformanceInsights: !If [EnablePI, true, false]
+      PerformanceInsightsRetentionPeriod: !If [EnablePI, !If [IsProduction, 731, 7], !Ref AWS::NoValue]
+      PerformanceInsightsKMSKeyId: !If [EnablePI, !Ref DatabaseKMSKey, !Ref AWS::NoValue]
+      
+      # Logging
+      EnableCloudwatchLogsExports: !If
+        - IsPostgreSQL
+        - [postgresql]
+        - !If
+          - IsMySQL
+          - [error, general, slowquery]
+          - [error, slowquery]
+      
+      # Maintenance
+      AutoMinorVersionUpgrade: !If [IsProduction, false, true]
+      AllowMajorVersionUpgrade: false
+      DeletionProtection: !If [IsProduction, true, false]
+      
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Backup
+          Value: Required
+
+  # Read Replica (for production)
+  DatabaseReadReplica:
+    Type: AWS::RDS::DBInstance
+    Condition: ShouldCreateReadReplica
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${EnvironmentName}-database-replica'
+      SourceDBInstanceIdentifier: !Ref DatabaseInstance
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      PubliclyAccessible: false
+      
+      # Monitoring
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt EnhancedMonitoringRole.Arn
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 731
+      PerformanceInsightsKMSKeyId: !Ref DatabaseKMSKey
+      
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Role
+          Value: ReadReplica
+
+  # CloudWatch Log Groups for database logs
+  DatabaseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/rds/instance/${ProjectName}-${EnvironmentName}-database/${DatabaseEngine}'
+      RetentionInDays: !If [IsProduction, 90, 30]
+
+  # CloudWatch Alarms
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-database-high-cpu'
+      AlarmDescription: Database high CPU utilization
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      AlarmActions:
+        - !Ref DatabaseAlarmTopic
+
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-database-high-connections'
+      AlarmDescription: Database high connection count
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      AlarmActions:
+        - !Ref DatabaseAlarmTopic
+
+  DatabaseFreeStorageSpaceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-database-low-storage'
+      AlarmDescription: Database low free storage space
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2000000000  # 2GB in bytes
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      AlarmActions:
+        - !Ref DatabaseAlarmTopic
+
+  DatabaseReadLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-database-high-read-latency'
+      AlarmDescription: Database high read latency
+      MetricName: ReadLatency
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.2
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      AlarmActions:
+        - !Ref DatabaseAlarmTopic
+
+  DatabaseWriteLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-database-high-write-latency'
+      AlarmDescription: Database high write latency
+      MetricName: WriteLatency
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.2
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      AlarmActions:
+        - !Ref DatabaseAlarmTopic
+
+  # SNS Topic for Database Alarms
+  DatabaseAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-database-alarms'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} Database Alarms'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Database Migration Role (for DMS if needed)
+  DatabaseMigrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-dms-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dms.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole
+        - arn:aws:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole
+
+  # Lambda function for database maintenance tasks
+  DatabaseMaintenanceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-db-maintenance'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt DatabaseMaintenanceRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DB_INSTANCE_ID: !Ref DatabaseInstance
+          SNS_TOPIC: !Ref DatabaseAlarmTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          
+          rds = boto3.client('rds')
+          sns = boto3.client('sns')
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              db_instance_id = os.environ['DB_INSTANCE_ID']
+              sns_topic = os.environ['SNS_TOPIC']
+              
+              try:
+                  # Get database metrics
+                  end_time = datetime.utcnow()
+                  start_time = end_time - timedelta(hours=1)
+                  
+                  # Check CPU utilization
+                  cpu_metrics = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/RDS',
+                      MetricName='CPUUtilization',
+                      Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_instance_id}],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Average']
+                  )
+                  
+                  # Check connection count
+                  connection_metrics = cloudwatch.get_metric_statistics(
+                      Namespace='AWS/RDS',
+                      MetricName='DatabaseConnections',
+                      Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_instance_id}],
+                      StartTime=start_time,
+                      EndTime=end_time,
+                      Period=300,
+                      Statistics=['Average']
+                  )
+                  
+                  # Generate report
+                  report = {
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'database_instance': db_instance_id,
+                      'cpu_utilization': {
+                          'average': sum(point['Average'] for point in cpu_metrics['Datapoints']) / len(cpu_metrics['Datapoints']) if cpu_metrics['Datapoints'] else 0,
+                          'max': max(point['Average'] for point in cpu_metrics['Datapoints']) if cpu_metrics['Datapoints'] else 0
+                      },
+                      'connections': {
+                          'average': sum(point['Average'] for point in connection_metrics['Datapoints']) / len(connection_metrics['Datapoints']) if connection_metrics['Datapoints'] else 0,
+                          'max': max(point['Average'] for point in connection_metrics['Datapoints']) if connection_metrics['Datapoints'] else 0
+                      }
+                  }
+                  
+                  # Send report if there are concerning metrics
+                  if report['cpu_utilization']['max'] > 70 or report['connections']['max'] > 40:
+                      sns.publish(
+                          TopicArn=sns_topic,
+                          Message=json.dumps(report, indent=2),
+                          Subject=f'Database Maintenance Report - {db_instance_id}'
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(report)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in database maintenance: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for Database Maintenance Lambda
+  DatabaseMaintenanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DatabaseMaintenancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - cloudwatch:GetMetricStatistics
+                  - sns:Publish
+                Resource: '*'
+
+  # EventBridge Rule for scheduled maintenance
+  DatabaseMaintenanceSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-db-maintenance-schedule'
+      Description: Schedule for database maintenance checks
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DatabaseMaintenanceFunction.Arn
+          Id: DatabaseMaintenanceTarget
+
+  # Permission for EventBridge to invoke Lambda
+  DatabaseMaintenanceLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DatabaseMaintenanceFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DatabaseMaintenanceSchedule.Arn
+
+Outputs:
+  DatabaseInstanceId:
+    Description: RDS Database Instance ID
+    Value: !Ref DatabaseInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseInstanceId'
+
+  DatabaseEndpoint:
+    Description: RDS Database Endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+
+  DatabasePort:
+    Description: RDS Database Port
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+
+  DatabaseArn:
+    Description: RDS Database ARN
+    Value: !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${DatabaseInstance}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseArn'
+
+  DatabaseSecretArn:
+    Description: Database Master Password Secret ARN
+    Value: !Ref DatabaseMasterUserSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecretArn'
+
+  DatabaseSecurityGroupId:
+    Description: Database Security Group ID
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSecurityGroup'
+
+  ApplicationSecurityGroupId:
+    Description: Application Security Group ID
+    Value: !Ref ApplicationSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationSecurityGroup'
+
+  DatabaseSubnetGroupName:
+    Description: Database Subnet Group Name
+    Value: !Ref DatabaseSubnetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseSubnetGroup'
+
+  ReadReplicaEndpoint:
+    Condition: ShouldCreateReadReplica
+    Description: Read Replica Endpoint
+    Value: !GetAtt DatabaseReadReplica.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ReadReplicaEndpoint'
+
+  DatabaseAlarmTopicArn:
+    Description: SNS Topic ARN for database alarms
+    Value: !Ref DatabaseAlarmTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseAlarmTopic'
+
+  DatabaseMaintenanceFunctionArn:
+    Description: Database Maintenance Lambda Function ARN
+    Value: !GetAtt DatabaseMaintenanceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseMaintenanceFunction'

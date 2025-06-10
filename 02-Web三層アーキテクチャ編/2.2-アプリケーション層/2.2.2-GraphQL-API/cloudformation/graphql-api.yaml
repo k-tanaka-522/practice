@@ -1,0 +1,775 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'GraphQL API with AWS AppSync, DynamoDB, and Lambda resolvers'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: graphql-api
+    Description: Project name for resource naming
+
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito User Pool ID for authentication
+    Default: ''
+
+  EnableSubscriptions:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable GraphQL subscriptions
+
+  ApiKeyRequired:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Require API key for access
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  UseCognito: !Not [!Equals [!Ref CognitoUserPoolId, '']]
+  EnableSubs: !Equals [!Ref EnableSubscriptions, 'true']
+  RequireApiKey: !Equals [!Ref ApiKeyRequired, 'true']
+
+Resources:
+  # GraphQL API
+  GraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-graphql'
+      AuthenticationType: !If [UseCognito, AMAZON_COGNITO_USER_POOLS, API_KEY]
+      UserPoolConfig: !If
+        - UseCognito
+        - UserPoolId: !Ref CognitoUserPoolId
+          AwsRegion: !Ref AWS::Region
+          DefaultAction: ALLOW
+        - !Ref AWS::NoValue
+      AdditionalAuthenticationProviders: !If
+        - RequireApiKey
+        - - AuthenticationType: API_KEY
+        - !Ref AWS::NoValue
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncServiceRole.Arn
+        FieldLogLevel: ALL
+      XrayEnabled: !If [IsProduction, true, false]
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+  # API Key (if required)
+  GraphQLApiKey:
+    Type: AWS::AppSync::ApiKey
+    Condition: RequireApiKey
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Description: !Sub 'API Key for ${ProjectName} ${EnvironmentName}'
+      Expires: !If 
+        - IsProduction
+        - 31536000  # 1 year
+        - 2592000   # 30 days
+
+  # GraphQL Schema
+  GraphQLSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Definition: |
+        type User {
+          id: ID!
+          email: String!
+          name: String!
+          posts: [Post!]! @connection(keyName: "byUser", fields: ["id"])
+          createdAt: AWSDateTime!
+          updatedAt: AWSDateTime!
+        }
+
+        type Post {
+          id: ID!
+          title: String!
+          content: String!
+          authorId: ID! @index(name: "byUser", sortKeyFields: ["createdAt"])
+          author: User! @connection(fields: ["authorId"])
+          comments: [Comment!]! @connection(keyName: "byPost", fields: ["id"])
+          status: PostStatus!
+          tags: [String!]
+          createdAt: AWSDateTime!
+          updatedAt: AWSDateTime!
+        }
+
+        type Comment {
+          id: ID!
+          content: String!
+          postId: ID! @index(name: "byPost", sortKeyFields: ["createdAt"])
+          post: Post! @connection(fields: ["postId"])
+          authorId: ID!
+          author: User! @connection(fields: ["authorId"])
+          createdAt: AWSDateTime!
+          updatedAt: AWSDateTime!
+        }
+
+        enum PostStatus {
+          DRAFT
+          PUBLISHED
+          ARCHIVED
+        }
+
+        input CreateUserInput {
+          email: String!
+          name: String!
+        }
+
+        input UpdateUserInput {
+          id: ID!
+          name: String
+        }
+
+        input CreatePostInput {
+          title: String!
+          content: String!
+          authorId: ID!
+          status: PostStatus = DRAFT
+          tags: [String!]
+        }
+
+        input UpdatePostInput {
+          id: ID!
+          title: String
+          content: String
+          status: PostStatus
+          tags: [String!]
+        }
+
+        input CreateCommentInput {
+          content: String!
+          postId: ID!
+          authorId: ID!
+        }
+
+        type Query {
+          getUser(id: ID!): User
+          listUsers(limit: Int, nextToken: String): UserConnection
+          getPost(id: ID!): Post
+          listPosts(limit: Int, nextToken: String): PostConnection
+          listPostsByUser(authorId: ID!, limit: Int, nextToken: String): PostConnection
+          getComment(id: ID!): Comment
+          listCommentsByPost(postId: ID!, limit: Int, nextToken: String): CommentConnection
+          searchPosts(query: String!, limit: Int, nextToken: String): PostConnection
+        }
+
+        type Mutation {
+          createUser(input: CreateUserInput!): User
+          updateUser(input: UpdateUserInput!): User
+          deleteUser(id: ID!): User
+          createPost(input: CreatePostInput!): Post
+          updatePost(input: UpdatePostInput!): Post
+          deletePost(id: ID!): Post
+          createComment(input: CreateCommentInput!): Comment
+          deleteComment(id: ID!): Comment
+        }
+
+        type Subscription {
+          onCreatePost: Post @aws_subscribe(mutations: ["createPost"])
+          onUpdatePost: Post @aws_subscribe(mutations: ["updatePost"])
+          onDeletePost: Post @aws_subscribe(mutations: ["deletePost"])
+          onCreateComment(postId: ID!): Comment @aws_subscribe(mutations: ["createComment"])
+        }
+
+        type UserConnection {
+          items: [User!]!
+          nextToken: String
+        }
+
+        type PostConnection {
+          items: [Post!]!
+          nextToken: String
+        }
+
+        type CommentConnection {
+          items: [Comment!]!
+          nextToken: String
+        }
+
+  # DynamoDB Tables
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-users'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: byEmail
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PostsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-posts'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: authorId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: byUser
+          KeySchema:
+            - AttributeName: authorId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: byStatus
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CommentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-comments'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: postId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: byPost
+          KeySchema:
+            - AttributeName: postId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # AppSync Service Role
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !Sub '${UsersTable.Arn}/index/*'
+                  - !GetAtt PostsTable.Arn
+                  - !Sub '${PostsTable.Arn}/index/*'
+                  - !GetAtt CommentsTable.Arn
+                  - !Sub '${CommentsTable.Arn}/index/*'
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt SearchFunction.Arn
+                  - !GetAtt NotificationFunction.Arn
+
+  # Data Sources
+  UsersDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: UsersDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref UsersTable
+        AwsRegion: !Ref AWS::Region
+
+  PostsDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: PostsDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref PostsTable
+        AwsRegion: !Ref AWS::Region
+
+  CommentsDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: CommentsDataSource
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      DynamoDBConfig:
+        TableName: !Ref CommentsTable
+        AwsRegion: !Ref AWS::Region
+
+  SearchDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: SearchDataSource
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt SearchFunction.Arn
+
+  NotificationDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: NotificationDataSource
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt NotificationFunction.Arn
+
+  # Lambda Functions
+  SearchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-search'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref PostsTable
+          USERS_TABLE: !Ref UsersTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from boto3.dynamodb.conditions import Key, Attr
+          
+          dynamodb = boto3.resource('dynamodb')
+          
+          def lambda_handler(event, context):
+              print(f"Search function received: {json.dumps(event)}")
+              
+              posts_table = dynamodb.Table(os.environ['POSTS_TABLE'])
+              query = event['arguments']['query'].lower()
+              limit = event['arguments'].get('limit', 10)
+              
+              try:
+                  # Simple text search in title and content
+                  response = posts_table.scan(
+                      FilterExpression=Attr('title').contains(query) | Attr('content').contains(query),
+                      Limit=limit
+                  )
+                  
+                  # Sort by relevance (simple scoring)
+                  items = response['Items']
+                  for item in items:
+                      score = 0
+                      title_matches = item.get('title', '').lower().count(query)
+                      content_matches = item.get('content', '').lower().count(query)
+                      score = title_matches * 3 + content_matches  # Title matches weighted higher
+                      item['_relevance_score'] = score
+                  
+                  # Sort by relevance score
+                  items.sort(key=lambda x: x.get('_relevance_score', 0), reverse=True)
+                  
+                  # Remove the score field before returning
+                  for item in items:
+                      item.pop('_relevance_score', None)
+                  
+                  return {
+                      'items': items,
+                      'nextToken': response.get('LastEvaluatedKey')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in search: {str(e)}")
+                  raise e
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-notifications'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              print(f"Notification function received: {json.dumps(event)}")
+              
+              topic_arn = os.environ['SNS_TOPIC']
+              
+              try:
+                  # Extract event type and data
+                  field_name = event.get('fieldName', '')
+                  arguments = event.get('arguments', {})
+                  
+                  if field_name == 'createPost':
+                      message = f"New post created: {arguments.get('input', {}).get('title', 'Untitled')}"
+                      subject = "New Post Notification"
+                  elif field_name == 'createComment':
+                      message = f"New comment added to post {arguments.get('input', {}).get('postId', '')}"
+                      subject = "New Comment Notification"
+                  else:
+                      message = f"Activity detected: {field_name}"
+                      subject = "GraphQL API Notification"
+                  
+                  # Send notification
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Message=message,
+                      Subject=subject
+                  )
+                  
+                  return {
+                      'success': True,
+                      'message': 'Notification sent'
+                  }
+                  
+              except Exception as e:
+                  print(f"Error sending notification: {str(e)}")
+                  return {
+                      'success': False,
+                      'error': str(e)
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt PostsTable.Arn
+                  - !Sub '${PostsTable.Arn}/index/*'
+                  - !GetAtt UsersTable.Arn
+                  - !Sub '${UsersTable.Arn}/index/*'
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-graphql-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} GraphQL Notifications'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # GraphQL Resolvers (simplified - in production, use separate files)
+  GetUserResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: getUser
+      DataSourceName: !GetAtt UsersDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "GetItem",
+          "key": {
+            "id": $util.dynamodb.toDynamoDBJson($ctx.args.id)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  ListUsersResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: listUsers
+      DataSourceName: !GetAtt UsersDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Scan",
+          "limit": $util.defaultIfNull($ctx.args.limit, 20),
+          "nextToken": $util.toJson($util.defaultIfNullOrEmpty($ctx.args.nextToken, null))
+        }
+      ResponseMappingTemplate: |
+        {
+          "items": $util.toJson($ctx.result.items),
+          "nextToken": $util.toJson($util.defaultIfNullOrEmpty($ctx.result.nextToken, null))
+        }
+
+  CreateUserResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: createUser
+      DataSourceName: !GetAtt UsersDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "PutItem",
+          "key": {
+            "id": $util.dynamodb.toDynamoDBJson($util.autoId())
+          },
+          "attributeValues": {
+            "email": $util.dynamodb.toDynamoDBJson($ctx.args.input.email),
+            "name": $util.dynamodb.toDynamoDBJson($ctx.args.input.name),
+            "createdAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601()),
+            "updatedAt": $util.dynamodb.toDynamoDBJson($util.time.nowISO8601())
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  # Similar resolvers for Posts and Comments would follow...
+  SearchPostsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: searchPosts
+      DataSourceName: !GetAtt SearchDataSource.Name
+      RequestMappingTemplate: |
+        {
+          "version": "2017-02-28",
+          "operation": "Invoke",
+          "payload": {
+            "arguments": $util.toJson($ctx.args),
+            "identity": $util.toJson($ctx.identity)
+          }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($ctx.result)
+
+  # CloudWatch Log Groups
+  SearchFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-search'
+      RetentionInDays: !If [IsProduction, 90, 7]
+
+  NotificationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-notifications'
+      RetentionInDays: !If [IsProduction, 90, 7]
+
+  AppSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/appsync/apis/${GraphQLApi.ApiId}'
+      RetentionInDays: !If [IsProduction, 90, 7]
+
+  # CloudWatch Alarms
+  GraphQLErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-graphql-errors'
+      AlarmDescription: GraphQL API errors
+      MetricName: 4XXError
+      Namespace: AWS/AppSync
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: GraphQLAPIId
+          Value: !GetAtt GraphQLApi.ApiId
+
+  SearchFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-search-errors'
+      AlarmDescription: Search function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SearchFunction
+
+Outputs:
+  GraphQLApiId:
+    Description: GraphQL API ID
+    Value: !GetAtt GraphQLApi.ApiId
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLApiId'
+
+  GraphQLApiUrl:
+    Description: GraphQL API URL
+    Value: !GetAtt GraphQLApi.GraphQLUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLApiUrl'
+
+  GraphQLApiKey:
+    Condition: RequireApiKey
+    Description: GraphQL API Key
+    Value: !GetAtt GraphQLApiKey.ApiKey
+    Export:
+      Name: !Sub '${AWS::StackName}-GraphQLApiKey'
+
+  UsersTableName:
+    Description: Users DynamoDB Table Name
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UsersTable'
+
+  PostsTableName:
+    Description: Posts DynamoDB Table Name
+    Value: !Ref PostsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PostsTable'
+
+  CommentsTableName:
+    Description: Comments DynamoDB Table Name
+    Value: !Ref CommentsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CommentsTable'
+
+  NotificationTopicArn:
+    Description: SNS Topic ARN for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  SearchFunctionArn:
+    Description: Search Lambda Function ARN
+    Value: !GetAtt SearchFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SearchFunction'
