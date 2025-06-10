@@ -1,79 +1,117 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'DynamoDB Tables with Global Tables, Streams, and best practices'
+Description: |
+  包括的なDynamoDBテーブル構成のテンプレート
+  
+  このテンプレートは以下のリソースを作成します：
+  - DynamoDBテーブル（Users、Products、Orders、Sessions、Analytics Events）
+  - KMS暗号化キー（データベース暗号化用）
+  - DynamoDBストリーム処理Lambda関数
+  - CloudWatchアラーム（スロットリング・エラー監視）
+  - Auto Scaling設定（プロビジョンドモード用）
+  - バックアップ設定（AWS Backup使用）
+  - SNSトピック（ストリーム通知用）
 
 Parameters:
   EnvironmentName:
     Type: String
     Default: dev
     AllowedValues: [dev, staging, prod]
-    Description: Environment name
+    Description: |
+      環境名
+      - dev: 開発環境（コスト最適化）
+      - staging: ステージング環境（本番に近い設定）
+      - prod: 本番環境（高可用性・セキュリティ重視）
 
   ProjectName:
     Type: String
     Default: dynamodb-tables
-    Description: Project name for resource naming
+    Description: リソース命名に使用するプロジェクト名
 
   BillingMode:
     Type: String
     Default: PAY_PER_REQUEST
     AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
-    Description: DynamoDB billing mode
+    Description: |
+      DynamoDB課金モード
+      - PAY_PER_REQUEST: オンデマンド（使用量課金）
+      - PROVISIONED: プロビジョンド（固定容量課金）
 
   ReadCapacityUnits:
     Type: Number
     Default: 5
     MinValue: 1
     MaxValue: 1000
-    Description: Read capacity units (for provisioned mode)
+    Description: |
+      読み取りキャパシティユニット（プロビジョンドモード用）
+      1ユニット = 4KBまでの強整合性読み取り/秒
 
   WriteCapacityUnits:
     Type: Number
     Default: 5
     MinValue: 1
     MaxValue: 1000
-    Description: Write capacity units (for provisioned mode)
+    Description: |
+      書き込みキャパシティユニット（プロビジョンドモード用）
+      1ユニット = 1KBまでの書き込み/秒
 
   EnableStreams:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
-    Description: Enable DynamoDB Streams
+    Description: |
+      DynamoDBストリームの有効化
+      リアルタイムデータ変更追跡とイベント処理に使用
 
   EnableGlobalTables:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
-    Description: Enable Global Tables for multi-region replication
+    Description: |
+      グローバルテーブルの有効化
+      マルチリージョンレプリケーション（本番環境のみ推奨）
 
   SecondaryRegion:
     Type: String
     Default: us-west-2
     AllowedValues: [us-east-1, us-west-1, us-west-2, eu-west-1, eu-central-1, ap-southeast-1, ap-northeast-1]
-    Description: Secondary region for Global Tables
+    Description: グローバルテーブル用のセカンダリリージョン
 
   EnableBackup:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
-    Description: Enable point-in-time recovery
+    Description: |
+      ポイントインタイムリカバリの有効化
+      データ紛失防止のため推奨
 
 Conditions:
+  # 本番環境かどうか（高可用性設定の制御）
   IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # プロビジョンドモードかどうか（Auto Scaling設定の制御）
   IsProvisioned: !Equals [!Ref BillingMode, 'PROVISIONED']
+  
+  # DynamoDBストリームが有効かどうか
   StreamsEnabled: !Equals [!Ref EnableStreams, 'true']
+  
+  # グローバルテーブルが有効かどうか（本番環境のみ許可）
   GlobalTablesEnabled: !And
     - !Equals [!Ref EnableGlobalTables, 'true']
     - !Condition IsProduction
+  
+  # バックアップが有効かどうか（本番環境は強制有効）
   BackupEnabled: !Or
     - !Equals [!Ref EnableBackup, 'true']
     - !Condition IsProduction
 
 Resources:
-  # KMS Key for DynamoDB encryption
+  # ========================================
+  # KMS暗号化キー（DynamoDBデータ暗号化用）
+  # ========================================
   DynamoDBKMSKey:
     Type: AWS::KMS::Key
     Properties:
-      Description: !Sub 'KMS key for ${ProjectName} ${EnvironmentName} DynamoDB encryption'
+      Description: !Sub '${ProjectName} ${EnvironmentName} DynamoDB暗号化用KMSキー'
       KeyPolicy:
         Version: '2012-10-17'
         Statement:
@@ -103,7 +141,9 @@ Resources:
       AliasName: !Sub 'alias/${ProjectName}-${EnvironmentName}-dynamodb'
       TargetKeyId: !Ref DynamoDBKMSKey
 
-  # Users Table
+  # ========================================
+  # ユーザーテーブル（認証・プロファイル管理用）
+  # ========================================
   UsersTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -111,49 +151,49 @@ Resources:
       BillingMode: !Ref BillingMode
       AttributeDefinitions:
         - AttributeName: userId
-          AttributeType: S
+          AttributeType: S    # プライマリキー：ユーザーID
         - AttributeName: email
-          AttributeType: S
+          AttributeType: S    # GSI用：メールアドレス（ユニーク）
         - AttributeName: username
-          AttributeType: S
+          AttributeType: S    # GSI用：ユーザー名（ユニーク）
         - AttributeName: createdAt
-          AttributeType: S
+          AttributeType: S    # GSI用：作成日時（ソートキー）
         - AttributeName: status
-          AttributeType: S
+          AttributeType: S    # GSI用：ステータス（active/inactive/suspended）
       KeySchema:
         - AttributeName: userId
-          KeyType: HASH
+          KeyType: HASH       # パーティションキー
       GlobalSecondaryIndexes:
-        - IndexName: EmailIndex
+        - IndexName: EmailIndex          # メールアドレスによる検索用GSI
           KeySchema:
             - AttributeName: email
-              KeyType: HASH
+              KeyType: HASH              # メールアドレスでパーティション
           Projection:
-            ProjectionType: ALL
+            ProjectionType: ALL          # 全属性を投影（クエリ効率化）
           ProvisionedThroughput: !If
             - IsProvisioned
             - ReadCapacityUnits: !Ref ReadCapacityUnits
               WriteCapacityUnits: !Ref WriteCapacityUnits
             - !Ref AWS::NoValue
-        - IndexName: UsernameIndex
+        - IndexName: UsernameIndex       # ユーザー名による検索用GSI
           KeySchema:
             - AttributeName: username
-              KeyType: HASH
+              KeyType: HASH              # ユーザー名でパーティション
           Projection:
-            ProjectionType: ALL
+            ProjectionType: ALL          # 全属性を投影
           ProvisionedThroughput: !If
             - IsProvisioned
             - ReadCapacityUnits: !Ref ReadCapacityUnits
               WriteCapacityUnits: !Ref WriteCapacityUnits
             - !Ref AWS::NoValue
-        - IndexName: StatusCreatedIndex
+        - IndexName: StatusCreatedIndex  # ステータス別・作成日時順検索用GSI
           KeySchema:
             - AttributeName: status
-              KeyType: HASH
+              KeyType: HASH              # ステータスでパーティション
             - AttributeName: createdAt
-              KeyType: RANGE
+              KeyType: RANGE             # 作成日時でソート
           Projection:
-            ProjectionType: ALL
+            ProjectionType: ALL          # 全属性を投影
           ProvisionedThroughput: !If
             - IsProvisioned
             - ReadCapacityUnits: !Ref ReadCapacityUnits
@@ -170,9 +210,10 @@ Resources:
         - !Ref AWS::NoValue
       SSESpecification:
         SSEEnabled: true
+        SSEType: KMS
         KMSMasterKeyId: !Ref DynamoDBKMSKey
       PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: !Ref BackupEnabled
+        PointInTimeRecoveryEnabled: !If [BackupEnabled, true, false]
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
@@ -255,9 +296,10 @@ Resources:
         - !Ref AWS::NoValue
       SSESpecification:
         SSEEnabled: true
+        SSEType: KMS
         KMSMasterKeyId: !Ref DynamoDBKMSKey
       PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: !Ref BackupEnabled
+        PointInTimeRecoveryEnabled: !If [BackupEnabled, true, false]
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -324,9 +366,10 @@ Resources:
         - !Ref AWS::NoValue
       SSESpecification:
         SSEEnabled: true
+        SSEType: KMS
         KMSMasterKeyId: !Ref DynamoDBKMSKey
       PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: !Ref BackupEnabled
+        PointInTimeRecoveryEnabled: !If [BackupEnabled, true, false]
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -362,6 +405,7 @@ Resources:
             ProjectionType: ALL
       SSESpecification:
         SSEEnabled: true
+        SSEType: KMS
         KMSMasterKeyId: !Ref DynamoDBKMSKey
       TimeToLiveSpecification:
         AttributeName: expiresAt
@@ -415,9 +459,10 @@ Resources:
         - !Ref AWS::NoValue
       SSESpecification:
         SSEEnabled: true
+        SSEType: KMS
         KMSMasterKeyId: !Ref DynamoDBKMSKey
       PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: !Ref BackupEnabled
+        PointInTimeRecoveryEnabled: !If [BackupEnabled, true, false]
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -437,7 +482,6 @@ Resources:
       Role: !GetAtt StreamProcessorRole.Arn
       Timeout: 300
       MemorySize: 512
-      ReservedConcurrencyLimit: 10
       Environment:
         Variables:
           ANALYTICS_TABLE: !Ref AnalyticsEventsTable
