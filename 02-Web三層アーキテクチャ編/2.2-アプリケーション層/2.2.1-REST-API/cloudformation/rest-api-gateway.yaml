@@ -1,0 +1,964 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'REST API with API Gateway, Lambda, and comprehensive features'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: rest-api
+    Description: Project name for resource naming
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for Lambda functions
+    Default: ''
+
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Description: List of private subnet IDs for VPC Lambda functions
+    Default: ''
+
+  CognitoUserPoolArn:
+    Type: String
+    Description: Cognito User Pool ARN for authentication
+    Default: ''
+
+  ApiKeyRequired:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Require API key for requests
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  UseVPC: !Not [!Equals [!Ref VpcId, '']]
+  UseCognito: !Not [!Equals [!Ref CognitoUserPoolArn, '']]
+  RequireApiKey: !Equals [!Ref ApiKeyRequired, 'true']
+
+Resources:
+  # API Gateway REST API
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-api'
+      Description: !Sub 'REST API for ${ProjectName} ${EnvironmentName}'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy: !If
+        - RequireApiKey
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: '*'
+              Action: execute-api:Invoke
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  'aws:RequestedRegion': !Ref AWS::Region
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Cognito Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Condition: UseCognito
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-cognito-authorizer'
+      RestApiId: !Ref RestApi
+      Type: COGNITO_USER_POOLS
+      ProviderARNs:
+        - !Ref CognitoUserPoolArn
+      IdentitySource: method.request.header.Authorization
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-lambda-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !If 
+          - UseVPC
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: RestApiLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt ItemsTable.Arn
+                  - !Sub '${ItemsTable.Arn}/index/*'
+                  - !GetAtt UsersTable.Arn
+                  - !Sub '${UsersTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${FileStorageBucket}/*'
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  # Security Group for Lambda Functions
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseVPC
+    Properties:
+      GroupName: !Sub '${ProjectName}-${EnvironmentName}-lambda-sg'
+      GroupDescription: Security group for REST API Lambda functions
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-lambda-sg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Users Lambda Function
+  UsersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-users'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig: !If
+        - UseVPC
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds: !Ref PrivateSubnetIds
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref EnvironmentName
+          USERS_TABLE: !Ref UsersTable
+          ITEMS_TABLE: !Ref ItemsTable
+          SNS_TOPIC: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import uuid
+          
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              print(f"Users API received: {json.dumps(event, default=str)}")
+              
+              table_name = os.environ['USERS_TABLE']
+              table = dynamodb.Table(table_name)
+              sns_topic = os.environ['SNS_TOPIC']
+              
+              http_method = event['httpMethod']
+              path_parameters = event.get('pathParameters') or {}
+              query_parameters = event.get('queryStringParameters') or {}
+              body = json.loads(event.get('body', '{}'))
+              
+              try:
+                  if http_method == 'GET':
+                      if 'userId' in path_parameters:
+                          # Get specific user
+                          response = table.get_item(Key={'id': path_parameters['userId']})
+                          if 'Item' in response:
+                              return {
+                                  'statusCode': 200,
+                                  'headers': {'Content-Type': 'application/json'},
+                                  'body': json.dumps(response['Item'], default=str)
+                              }
+                          else:
+                              return {
+                                  'statusCode': 404,
+                                  'headers': {'Content-Type': 'application/json'},
+                                  'body': json.dumps({'error': 'User not found'})
+                              }
+                      else:
+                          # List users
+                          limit = int(query_parameters.get('limit', 10))
+                          response = table.scan(Limit=limit)
+                          return {
+                              'statusCode': 200,
+                              'headers': {'Content-Type': 'application/json'},
+                              'body': json.dumps({
+                                  'users': response['Items'],
+                                  'count': len(response['Items'])
+                              }, default=str)
+                          }
+                  
+                  elif http_method == 'POST':
+                      # Create user
+                      user_id = str(uuid.uuid4())
+                      user = {
+                          'id': user_id,
+                          'email': body.get('email'),
+                          'name': body.get('name'),
+                          'status': 'active',
+                          'created_at': datetime.utcnow().isoformat(),
+                          'updated_at': datetime.utcnow().isoformat()
+                      }
+                      
+                      table.put_item(Item=user)
+                      
+                      # Send notification
+                      sns.publish(
+                          TopicArn=sns_topic,
+                          Message=f"New user created: {user['email']}",
+                          Subject="New User Registration"
+                      )
+                      
+                      return {
+                          'statusCode': 201,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps(user, default=str)
+                      }
+                  
+                  elif http_method == 'PUT':
+                      # Update user
+                      user_id = path_parameters['userId']
+                      update_expr = "SET #name = :name, updated_at = :updated_at"
+                      expr_attr_names = {'#name': 'name'}
+                      expr_attr_values = {
+                          ':name': body.get('name'),
+                          ':updated_at': datetime.utcnow().isoformat()
+                      }
+                      
+                      if 'status' in body:
+                          update_expr += ", #status = :status"
+                          expr_attr_names['#status'] = 'status'
+                          expr_attr_values[':status'] = body['status']
+                      
+                      response = table.update_item(
+                          Key={'id': user_id},
+                          UpdateExpression=update_expr,
+                          ExpressionAttributeNames=expr_attr_names,
+                          ExpressionAttributeValues=expr_attr_values,
+                          ReturnValues='ALL_NEW'
+                      )
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps(response['Attributes'], default=str)
+                      }
+                  
+                  elif http_method == 'DELETE':
+                      # Delete user
+                      user_id = path_parameters['userId']
+                      table.delete_item(Key={'id': user_id})
+                      
+                      return {
+                          'statusCode': 204,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': ''
+                      }
+                  
+                  else:
+                      return {
+                          'statusCode': 405,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'Method not allowed'})
+                      }
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Items Lambda Function
+  ItemsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-items'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig: !If
+        - UseVPC
+        - SecurityGroupIds:
+            - !Ref LambdaSecurityGroup
+          SubnetIds: !Ref PrivateSubnetIds
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref EnvironmentName
+          ITEMS_TABLE: !Ref ItemsTable
+          S3_BUCKET: !Ref FileStorageBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import uuid
+          
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              print(f"Items API received: {json.dumps(event, default=str)}")
+              
+              table_name = os.environ['ITEMS_TABLE']
+              table = dynamodb.Table(table_name)
+              bucket_name = os.environ['S3_BUCKET']
+              
+              http_method = event['httpMethod']
+              path_parameters = event.get('pathParameters') or {}
+              query_parameters = event.get('queryStringParameters') or {}
+              body = json.loads(event.get('body', '{}'))
+              
+              try:
+                  if http_method == 'GET':
+                      if 'itemId' in path_parameters:
+                          # Get specific item
+                          response = table.get_item(Key={'id': path_parameters['itemId']})
+                          if 'Item' in response:
+                              return {
+                                  'statusCode': 200,
+                                  'headers': {'Content-Type': 'application/json'},
+                                  'body': json.dumps(response['Item'], default=str)
+                              }
+                          else:
+                              return {
+                                  'statusCode': 404,
+                                  'headers': {'Content-Type': 'application/json'},
+                                  'body': json.dumps({'error': 'Item not found'})
+                              }
+                      else:
+                          # List items with filtering
+                          filter_expr = None
+                          expr_attr_values = {}
+                          
+                          if 'category' in query_parameters:
+                              filter_expr = "category = :category"
+                              expr_attr_values[':category'] = query_parameters['category']
+                          
+                          if 'status' in query_parameters:
+                              if filter_expr:
+                                  filter_expr += " AND #status = :status"
+                              else:
+                                  filter_expr = "#status = :status"
+                              expr_attr_values[':status'] = query_parameters['status']
+                          
+                          scan_kwargs = {
+                              'Limit': int(query_parameters.get('limit', 10))
+                          }
+                          
+                          if filter_expr:
+                              scan_kwargs['FilterExpression'] = filter_expr
+                              scan_kwargs['ExpressionAttributeValues'] = expr_attr_values
+                              if '#status' in filter_expr:
+                                  scan_kwargs['ExpressionAttributeNames'] = {'#status': 'status'}
+                          
+                          response = table.scan(**scan_kwargs)
+                          
+                          return {
+                              'statusCode': 200,
+                              'headers': {'Content-Type': 'application/json'},
+                              'body': json.dumps({
+                                  'items': response['Items'],
+                                  'count': len(response['Items'])
+                              }, default=str)
+                          }
+                  
+                  elif http_method == 'POST':
+                      # Create item
+                      item_id = str(uuid.uuid4())
+                      item = {
+                          'id': item_id,
+                          'name': body.get('name'),
+                          'description': body.get('description'),
+                          'category': body.get('category', 'general'),
+                          'price': body.get('price', 0),
+                          'status': 'active',
+                          'created_at': datetime.utcnow().isoformat(),
+                          'updated_at': datetime.utcnow().isoformat()
+                      }
+                      
+                      table.put_item(Item=item)
+                      
+                      return {
+                          'statusCode': 201,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps(item, default=str)
+                      }
+                  
+                  elif http_method == 'PUT':
+                      # Update item
+                      item_id = path_parameters['itemId']
+                      update_expr = "SET updated_at = :updated_at"
+                      expr_attr_values = {':updated_at': datetime.utcnow().isoformat()}
+                      
+                      if 'name' in body:
+                          update_expr += ", #name = :name"
+                          expr_attr_values[':name'] = body['name']
+                      
+                      if 'description' in body:
+                          update_expr += ", description = :description"
+                          expr_attr_values[':description'] = body['description']
+                      
+                      if 'price' in body:
+                          update_expr += ", price = :price"
+                          expr_attr_values[':price'] = body['price']
+                      
+                      if 'status' in body:
+                          update_expr += ", #status = :status"
+                          expr_attr_values[':status'] = body['status']
+                      
+                      expr_attr_names = {}
+                      if '#name' in update_expr:
+                          expr_attr_names['#name'] = 'name'
+                      if '#status' in update_expr:
+                          expr_attr_names['#status'] = 'status'
+                      
+                      update_kwargs = {
+                          'Key': {'id': item_id},
+                          'UpdateExpression': update_expr,
+                          'ExpressionAttributeValues': expr_attr_values,
+                          'ReturnValues': 'ALL_NEW'
+                      }
+                      
+                      if expr_attr_names:
+                          update_kwargs['ExpressionAttributeNames'] = expr_attr_names
+                      
+                      response = table.update_item(**update_kwargs)
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps(response['Attributes'], default=str)
+                      }
+                  
+                  elif http_method == 'DELETE':
+                      # Delete item
+                      item_id = path_parameters['itemId']
+                      table.delete_item(Key={'id': item_id})
+                      
+                      return {
+                          'statusCode': 204,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': ''
+                      }
+                  
+                  else:
+                      return {
+                          'statusCode': 405,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'Method not allowed'})
+                      }
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DynamoDB Tables
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-users'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-items'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: category-created-index
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for File Storage
+  FileStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-files-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} Notifications'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API Gateway Resources and Methods
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: users
+
+  UserResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref UsersResource
+      PathPart: '{userId}'
+
+  ItemsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: items
+
+  ItemResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ItemsResource
+      PathPart: '{itemId}'
+
+  # API Gateway Methods
+  UsersGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: GET
+      AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UsersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UsersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UserGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UserResource
+      HttpMethod: GET
+      AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UserPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UserResource
+      HttpMethod: PUT
+      AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  UserDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UserResource
+      HttpMethod: DELETE
+      AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
+
+  ItemsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ItemsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ItemsFunction.Arn}/invocations'
+
+  ItemsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ItemsResource
+      HttpMethod: POST
+      AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ItemsFunction.Arn}/invocations'
+
+  ItemGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ItemResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ItemsFunction.Arn}/invocations'
+
+  ItemPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ItemResource
+      HttpMethod: PUT
+      AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ItemsFunction.Arn}/invocations'
+
+  ItemDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ItemResource
+      HttpMethod: DELETE
+      AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
+      AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
+      ApiKeyRequired: !Ref RequireApiKey
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ItemsFunction.Arn}/invocations'
+
+  # Lambda Permissions
+  UsersLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UsersFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${RestApi.Arn}/*/*'
+
+  ItemsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ItemsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${RestApi.Arn}/*/*'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UsersGetMethod
+      - UsersPostMethod
+      - UserGetMethod
+      - UserPutMethod
+      - UserDeleteMethod
+      - ItemsGetMethod
+      - ItemsPostMethod
+      - ItemGetMethod
+      - ItemPutMethod
+      - ItemDeleteMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: !Ref EnvironmentName
+
+  # API Key (if required)
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Condition: RequireApiKey
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-api-key'
+      Description: !Sub 'API Key for ${ProjectName} ${EnvironmentName}'
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref RestApi
+          StageName: !Ref EnvironmentName
+
+  # Usage Plan
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Condition: RequireApiKey
+    Properties:
+      UsagePlanName: !Sub '${ProjectName}-${EnvironmentName}-usage-plan'
+      Description: !Sub 'Usage plan for ${ProjectName} ${EnvironmentName}'
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: !Ref EnvironmentName
+      Throttle:
+        BurstLimit: 1000
+        RateLimit: 500
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  # Usage Plan Key
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Condition: RequireApiKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # CloudWatch Log Groups
+  UsersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-users'
+      RetentionInDays: !If [IsProduction, 90, 7]
+
+  ItemsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-items'
+      RetentionInDays: !If [IsProduction, 90, 7]
+
+  # CloudWatch Alarms
+  UsersErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-users-errors'
+      AlarmDescription: Users Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref UsersFunction
+
+  ItemsErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-items-errors'
+      AlarmDescription: Items Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ItemsFunction
+
+  Api5xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-api-5xx-errors'
+      AlarmDescription: API Gateway 5xx errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref RestApi
+
+Outputs:
+  RestApiId:
+    Description: REST API ID
+    Value: !Ref RestApi
+    Export:
+      Name: !Sub '${AWS::StackName}-RestApiId'
+
+  RestApiUrl:
+    Description: REST API URL
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-RestApiUrl'
+
+  UsersTableName:
+    Description: Users DynamoDB Table Name
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UsersTable'
+
+  ItemsTableName:
+    Description: Items DynamoDB Table Name
+    Value: !Ref ItemsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ItemsTable'
+
+  FileStorageBucket:
+    Description: S3 Bucket for file storage
+    Value: !Ref FileStorageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-FileStorageBucket'
+
+  NotificationTopicArn:
+    Description: SNS Topic ARN for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  ApiKeyId:
+    Condition: RequireApiKey
+    Description: API Key ID
+    Value: !Ref ApiKey
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiKeyId'

@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Base template for nested stack architecture'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Description: Project name for resource naming
+
+  TemplatesBucketName:
+    Type: String
+    Description: S3 bucket containing nested templates
+
+  TemplatesBucketPrefix:
+    Type: String
+    Default: 'cloudformation/templates'
+    Description: S3 prefix for nested templates
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+
+Resources:
+  # Network Stack
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesBucketPrefix}/network.yaml'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ProjectName: !Ref ProjectName
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: StackType
+          Value: Network
+
+  # Security Stack
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkStack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesBucketPrefix}/security.yaml'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt NetworkStack.Outputs.VPCId
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: StackType
+          Value: Security
+
+  # Compute Stack
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: 
+      - NetworkStack
+      - SecurityStack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplatesBucketName}.s3.amazonaws.com/${TemplatesBucketPrefix}/compute.yaml'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        ProjectName: !Ref ProjectName
+        VpcId: !GetAtt NetworkStack.Outputs.VPCId
+        PublicSubnets: !GetAtt NetworkStack.Outputs.PublicSubnets
+        PrivateSubnets: !GetAtt NetworkStack.Outputs.PrivateSubnets
+        SecurityGroups: !GetAtt SecurityStack.Outputs.SecurityGroups
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: StackType
+          Value: Compute
+
+Outputs:
+  VPCId:
+    Description: VPC ID from Network Stack
+    Value: !GetAtt NetworkStack.Outputs.VPCId
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
+
+  PublicSubnets:
+    Description: Public Subnets from Network Stack
+    Value: !GetAtt NetworkStack.Outputs.PublicSubnets
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnets'
+
+  PrivateSubnets:
+    Description: Private Subnets from Network Stack
+    Value: !GetAtt NetworkStack.Outputs.PrivateSubnets
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnets'
+
+  SecurityGroups:
+    Description: Security Groups from Security Stack
+    Value: !GetAtt SecurityStack.Outputs.SecurityGroups
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroups'
+
+  ComputeResources:
+    Description: Compute Resources from Compute Stack
+    Value: !GetAtt ComputeStack.Outputs.ComputeResources
+    Export:
+      Name: !Sub '${AWS::StackName}-ComputeResources'

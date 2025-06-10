@@ -5,6 +5,7 @@
 ### プロジェクト名
 **AWS AI-Driven Development Practice** - クラウドネイティブ×AI駆動開発の総合学習プラットフォーム
 
+
 ### ビジョン
 AI技術とAWSクラウドインフラストラクチャを組み合わせた次世代の開発手法を、実践を通じて体系的に習得する包括的な学習プログラムです。
 
@@ -407,6 +408,8 @@ cd ai-driven-development-practice
 [![AWS](https://img.shields.io/badge/AWS-Certified-orange.svg)](https://aws.amazon.com/)
 [![Bedrock](https://img.shields.io/badge/Bedrock-AI-blue.svg)](https://aws.amazon.com/bedrock/)
 
-</div>#   p r a c t i c e  
- #   p r a c t i c e  
+</div>#   p r a c t i c e 
+ 
+ #   p r a c t i c e 
+ 
  

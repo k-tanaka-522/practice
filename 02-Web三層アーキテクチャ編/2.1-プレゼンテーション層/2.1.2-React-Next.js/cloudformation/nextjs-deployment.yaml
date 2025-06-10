@@ -1,0 +1,535 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Next.js Application Deployment with Amplify and CloudFront'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: nextjs-app
+    Description: Project name for resource naming
+
+  GitHubRepoUrl:
+    Type: String
+    Description: GitHub repository URL for the Next.js application
+    Default: 'https://github.com/your-org/nextjs-app'
+
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub personal access token for repository access
+    Default: ''
+
+  DomainName:
+    Type: String
+    Description: Custom domain name (optional)
+    Default: ''
+
+  NodeVersion:
+    Type: String
+    Default: '18'
+    AllowedValues: ['16', '18', '20']
+    Description: Node.js version for the application
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  HasGitHubToken: !Not [!Equals [!Ref GitHubToken, '']]
+  HasDomain: !Not [!Equals [!Ref DomainName, '']]
+
+Resources:
+  # Amplify App
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}'
+      Repository: !Ref GitHubRepoUrl
+      AccessToken: !If [HasGitHubToken, !Ref GitHubToken, !Ref AWS::NoValue]
+      Platform: WEB
+      BuildSpec: |
+        version: 1
+        applications:
+          - frontend:
+              phases:
+                preBuild:
+                  commands:
+                    - npm ci
+                build:
+                  commands:
+                    - npm run build
+              artifacts:
+                baseDirectory: .next
+                files:
+                  - '**/*'
+              cache:
+                paths:
+                  - node_modules/**/*
+                  - .next/cache/**/*
+      EnvironmentVariables:
+        - Name: NODE_ENV
+          Value: !Ref EnvironmentName
+        - Name: NEXT_PUBLIC_ENV
+          Value: !Ref EnvironmentName
+        - Name: AMPLIFY_MONOREPO_APP_ROOT
+          Value: '.'
+        - Name: _LIVE_UPDATES
+          Value: '[{"name":"Node.js version","pkg":"node","type":"nvm","version":"18"}]'
+      CustomRules:
+        - Source: /_next/static/*
+          Target: /_next/static/*
+          Status: '200'
+        - Source: /api/*
+          Target: /api/*
+          Status: '200'
+        - Source: '/<*>'
+          Target: '/index.html'
+          Status: '200'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Amplify Branch
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !If [IsProduction, 'main', !Ref EnvironmentName]
+      EnableAutoBuild: true
+      EnablePullRequestPreview: !If [IsProduction, false, true]
+      EnvironmentVariables:
+        - Name: ENVIRONMENT
+          Value: !Ref EnvironmentName
+        - Name: API_ENDPOINT
+          Value: !Sub '{{resolve:ssm:/${ProjectName}/${EnvironmentName}/api-endpoint:1}}'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Amplify Domain (if custom domain is specified)
+  AmplifyDomain:
+    Type: AWS::Amplify::Domain
+    Condition: HasDomain
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      DomainName: !Ref DomainName
+      SubDomainSettings:
+        - Prefix: !If [IsProduction, '', !Ref EnvironmentName]
+          BranchName: !GetAtt AmplifyBranch.BranchName
+
+  # S3 Bucket for Application Assets
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-assets-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Assets Bucket Policy
+  AssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${AssetsBucket}/*'
+
+  # CloudFront Distribution for Assets
+  AssetsCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        DefaultCacheBehavior:
+          TargetOriginId: AssetsS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # Managed-CORS-S3Origin
+        Origins:
+          - Id: AssetsS3Origin
+            DomainName: !GetAtt AssetsBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${AssetsOriginAccessIdentity}'
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Origin Access Identity for Assets
+  AssetsOriginAccessIdentity:
+    Type: AWS::CloudFront::OriginAccessIdentity
+    Properties:
+      OriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${ProjectName}-${EnvironmentName}-assets'
+
+  # API Gateway for Next.js API Routes
+  NextjsApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-api'
+      Description: API Gateway for Next.js API routes
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API Gateway Resource for API routes
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref NextjsApiGateway
+      ParentId: !GetAtt NextjsApiGateway.RootResourceId
+      PathPart: '{proxy+}'
+
+  # API Gateway Method
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref NextjsApiGateway
+      ResourceId: !Ref ApiResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${NextjsApiFunction.Arn}/invocations'
+
+  # Lambda Function for API Routes
+  NextjsApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-api'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          NODE_ENV: !Ref EnvironmentName
+          ENVIRONMENT: !Ref EnvironmentName
+          ASSETS_BUCKET: !Ref AssetsBucket
+          DYNAMODB_TABLE: !Ref NextjsDataTable
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event, context) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              const { httpMethod, path, queryStringParameters, body } = event;
+              const tableName = process.env.DYNAMODB_TABLE;
+              
+              try {
+                  // Simple API routing
+                  if (path === '/api/health') {
+                      return {
+                          statusCode: 200,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                              'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+                          },
+                          body: JSON.stringify({
+                              status: 'healthy',
+                              timestamp: new Date().toISOString(),
+                              environment: process.env.ENVIRONMENT
+                          })
+                      };
+                  }
+                  
+                  if (path.startsWith('/api/data')) {
+                      if (httpMethod === 'GET') {
+                          // Get data
+                          const result = await dynamodb.scan({
+                              TableName: tableName,
+                              Limit: 10
+                          }).promise();
+                          
+                          return {
+                              statusCode: 200,
+                              headers: {
+                                  'Content-Type': 'application/json',
+                                  'Access-Control-Allow-Origin': '*'
+                              },
+                              body: JSON.stringify(result.Items)
+                          };
+                      }
+                      
+                      if (httpMethod === 'POST') {
+                          // Create data
+                          const data = JSON.parse(body || '{}');
+                          const item = {
+                              id: AWS.util.uuid.v4(),
+                              timestamp: new Date().toISOString(),
+                              ...data
+                          };
+                          
+                          await dynamodb.put({
+                              TableName: tableName,
+                              Item: item
+                          }).promise();
+                          
+                          return {
+                              statusCode: 201,
+                              headers: {
+                                  'Content-Type': 'application/json',
+                                  'Access-Control-Allow-Origin': '*'
+                              },
+                              body: JSON.stringify(item)
+                          };
+                      }
+                  }
+                  
+                  // Default response
+                  return {
+                      statusCode: 404,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({
+                          message: 'API endpoint not found',
+                          path: path,
+                          method: httpMethod
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({
+                          message: 'Internal server error',
+                          error: error.message
+                      })
+                  };
+              }
+          };
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NextjsApiPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt NextjsDataTable.Arn
+                  - !Sub '${NextjsDataTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${AssetsBucket}/*'
+
+  # Lambda Permission for API Gateway
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NextjsApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${NextjsApiGateway.Arn}/*/*'
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiMethod
+    Properties:
+      RestApiId: !Ref NextjsApiGateway
+      StageName: !Ref EnvironmentName
+
+  # DynamoDB Table for Next.js Data
+  NextjsDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-data'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: timestamp-index
+          KeySchema:
+            - AttributeName: timestamp
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SSM Parameter for API Endpoint
+  ApiEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${EnvironmentName}/api-endpoint'
+      Type: String
+      Value: !Sub 'https://${NextjsApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+      Description: API Gateway endpoint for Next.js application
+
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${EnvironmentName}-api'
+      RetentionInDays: !If [IsProduction, 90, 7]
+
+  # CloudWatch Alarms
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-lambda-errors'
+      AlarmDescription: Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NextjsApiFunction
+
+  ApiGatewayErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-api-gateway-errors'
+      AlarmDescription: API Gateway 5xx errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref NextjsApiGateway
+
+Outputs:
+  AmplifyAppId:
+    Description: Amplify App ID
+    Value: !GetAtt AmplifyApp.AppId
+    Export:
+      Name: !Sub '${AWS::StackName}-AmplifyAppId'
+
+  AmplifyAppURL:
+    Description: Amplify App URL
+    Value: !Sub 'https://${AmplifyBranch.BranchName}.${AmplifyApp.AppId}.amplifyapp.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-AmplifyURL'
+
+  CustomDomainURL:
+    Condition: HasDomain
+    Description: Custom Domain URL
+    Value: !If 
+      - IsProduction
+      - !Sub 'https://${DomainName}'
+      - !Sub 'https://${EnvironmentName}.${DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomDomainURL'
+
+  ApiGatewayURL:
+    Description: API Gateway URL
+    Value: !Sub 'https://${NextjsApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayURL'
+
+  AssetsBucketName:
+    Description: Assets S3 Bucket Name
+    Value: !Ref AssetsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AssetsBucket'
+
+  AssetsCloudFrontURL:
+    Description: Assets CloudFront URL
+    Value: !Sub 'https://${AssetsCloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AssetsCloudFrontURL'
+
+  DynamoDBTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref NextjsDataTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTable'

@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'GitHub Actions and AWS Integration with OIDC and IAM Roles'
+
+Parameters:
+  GitHubOrganization:
+    Type: String
+    Description: GitHub organization name
+    Default: 'your-org'
+
+  GitHubRepository:
+    Type: String
+    Description: GitHub repository name
+    Default: 'your-repo'
+
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: github-actions
+    Description: Project name for resource naming
+
+Resources:
+  # OIDC Identity Provider for GitHub Actions
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCIdentityProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${EnvironmentName}-github-oidc'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for GitHub Actions Deployment
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-github-deploy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOrganization}/${GitHubRepository}:*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: GitHubActionsIAMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:ListRoles
+                  - iam:PassRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService':
+                      - lambda.amazonaws.com
+                      - ecs-tasks.amazonaws.com
+                      - ec2.amazonaws.com
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for GitHub Actions Read-Only Access
+  GitHubActionsReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-github-readonly-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOrganization}/${GitHubRepository}:*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3 Bucket for Build Artifacts
+  BuildArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-build-artifacts-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group for GitHub Actions
+  GitHubActionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/github-actions/${ProjectName}-${EnvironmentName}'
+      RetentionInDays: !If 
+        - IsProduction
+        - 90
+        - 7
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Policy for CloudFormation Operations
+  CloudFormationDeployPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${EnvironmentName}-cloudformation-deploy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DeleteStack
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResources
+              - cloudformation:ValidateTemplate
+              - cloudformation:GetTemplate
+              - cloudformation:ListStacks
+            Resource: !Sub 'arn:aws:cloudformation:*:${AWS::AccountId}:stack/${ProjectName}-*/*'
+          - Effect: Allow
+            Action:
+              - cloudformation:ListStacks
+              - cloudformation:ValidateTemplate
+            Resource: '*'
+
+  # IAM Policy for ECR Operations
+  ECRDeployPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${EnvironmentName}-ecr-deploy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+            Resource: '*'
+
+  # Attach CloudFormation Policy to Deploy Role
+  AttachCloudFormationPolicy:
+    Type: AWS::IAM::RolePolicyAttachment
+    Properties:
+      PolicyArn: !Ref CloudFormationDeployPolicy
+      RoleName: !Ref GitHubActionsDeployRole
+
+  # Attach ECR Policy to Deploy Role
+  AttachECRPolicy:
+    Type: AWS::IAM::RolePolicyAttachment
+    Properties:
+      PolicyArn: !Ref ECRDeployPolicy
+      RoleName: !Ref GitHubActionsDeployRole
+
+  # Parameter Store for GitHub Actions Configuration
+  GitHubActionsConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${EnvironmentName}/github-actions/config'
+      Type: String
+      Value: !Sub |
+        {
+          "roleArn": "${GitHubActionsDeployRole.Arn}",
+          "readOnlyRoleArn": "${GitHubActionsReadOnlyRole.Arn}",
+          "artifactsBucket": "${BuildArtifactsBucket}",
+          "logGroup": "${GitHubActionsLogGroup}",
+          "region": "${AWS::Region}"
+        }
+      Description: GitHub Actions configuration parameters
+      Tags:
+        Environment: !Ref EnvironmentName
+        Project: !Ref ProjectName
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+
+Outputs:
+  GitHubOIDCProviderArn:
+    Description: GitHub OIDC Provider ARN
+    Value: !Ref GitHubOIDCProvider
+    Export:
+      Name: !Sub '${AWS::StackName}-GitHubOIDCProvider'
+
+  GitHubActionsDeployRoleArn:
+    Description: GitHub Actions Deploy Role ARN
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DeployRoleArn'
+
+  GitHubActionsReadOnlyRoleArn:
+    Description: GitHub Actions Read-Only Role ARN
+    Value: !GetAtt GitHubActionsReadOnlyRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ReadOnlyRoleArn'
+
+  BuildArtifactsBucket:
+    Description: S3 Bucket for build artifacts
+    Value: !Ref BuildArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucket'
+
+  LogGroupName:
+    Description: CloudWatch Log Group for GitHub Actions
+    Value: !Ref GitHubActionsLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+
+  ConfigurationParameter:
+    Description: SSM Parameter with GitHub Actions configuration
+    Value: !Ref GitHubActionsConfig
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigParameter'
