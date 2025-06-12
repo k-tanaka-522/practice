@@ -1,3 +1,15 @@
+# ===========================================
+# VPCネットワークインフラストラクチャー
+# ===========================================
+# このテンプレートは、AWS上に完全なネットワーク基盤を構築します。
+# マルチAZ構成により高可用性を実現し、セキュリティベストプラクティスに準拠しています。
+#
+# アーキテクチャ概要:
+# - パブリックサブネット: インターネット接続が必要なリソース（ALB、NAT Gateway等）
+# - プライベートサブネット: アプリケーションサーバー等の保護されたリソース
+# - データベースサブネット: RDS等のデータベース専用（インターネット接続なし）
+# ===========================================
+
 AWSTemplateFormatVersion: '2010-09-09'
 Description: |
   包括的なVPCネットワークインフラストラクチャのテンプレート
@@ -15,7 +27,14 @@ Description: |
   - VPCフローログ
   - ネットワークACL
 
+# ===========================================
+# パラメータ定義
+# ===========================================
+# これらのパラメータを使用して、環境ごとに異なる設定を適用できます。
+# 本番環境では高可用性とセキュリティを重視し、開発環境ではコスト最適化を優先します。
 Parameters:
+  # 環境名パラメータ
+  # この値によってリソースの命名規則やサイジング、セキュリティ設定が変更されます
   EnvironmentName:
     Type: String
     Default: dev
@@ -31,6 +50,11 @@ Parameters:
     Default: vpc-network
     Description: リソース命名に使用するプロジェクト名
 
+  # VPCネットワーク範囲
+  # CIDR（Classless Inter-Domain Routing）ブロックを指定します
+  # /16 = 65,536個のIPアドレス（大規模環境向け）
+  # /20 = 4,096個のIPアドレス（中規模環境向け）
+  # /24 = 256個のIPアドレス（小規模環境向け）
   VpcCidr:
     Type: String
     Default: 10.0.0.0/16
@@ -39,6 +63,11 @@ Parameters:
       VPCのCIDRブロック
       推奨: 10.0.0.0/16 (65,536 IPアドレス)
 
+  # NATゲートウェイ設定
+  # NATゲートウェイは、プライベートサブネット内のリソースがインターネットに
+  # アクセスするための重要なコンポーネントです。本番環境では必須ですが、
+  # 開発環境ではコスト削減のために無効化することも可能です。
+  # 注意: NATゲートウェイは時間単位で課金されるため、コストに影響します
   EnableNatGateway:
     Type: String
     Default: 'true'
@@ -48,23 +77,37 @@ Parameters:
       - true: プライベートサブネットからインターネットアクセス可能
       - false: コスト削減（開発環境向け）
 
+# ===========================================
+# 条件定義
+# ===========================================
+# CloudFormationの条件機能を使用して、パラメータの値に基づいて
+# リソースの作成や設定を動的に制御します
 Conditions:
-  # NATゲートウェイを作成するかどうか
+  # NATゲートウェイ作成条件
+  # 開発環境ではコスト削減のため、NATゲートウェイを作成しない選択も可能
   CreateNatGateway: !Equals [!Ref EnableNatGateway, 'true']
   
-  # 本番環境かどうか（ログ保持期間などに影響）
+  # 本番環境判定条件
+  # この条件により、ログ保持期間、バックアップ設定、モニタリング設定などが変更されます
   IsProduction: !Equals [!Ref EnvironmentName, 'prod']
 
 Resources:
   # ========================================
-  # VPC
+  # VPC（Virtual Private Cloud）
+  # ========================================
+  # VPCはAWS上の仮想ネットワークです。
+  # すべてのAWSリソースはこのVPC内に配置されます。
+  # 
+  # 重要な設定:
+  # - EnableDnsHostnames: EC2インスタンスにDNS名を自動割り当て
+  # - EnableDnsSupport: VPC内でのDNS解決を有効化（必須）
   # ========================================
   VPC:
     Type: AWS::EC2::VPC
     Properties:
       CidrBlock: !Ref VpcCidr
-      EnableDnsHostnames: true  # DNSホスト名の解決を有効化
-      EnableDnsSupport: true    # DNS解決を有効化
+      EnableDnsHostnames: true  # DNSホスト名の解決を有効化（RDS等で必要）
+      EnableDnsSupport: true    # DNS解決を有効化（VPC内通信で必須）
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-${EnvironmentName}-vpc'
@@ -74,7 +117,14 @@ Resources:
           Value: !Ref ProjectName
 
   # ========================================
-  # インターネットゲートウェイ
+  # インターネットゲートウェイ（IGW）
+  # ========================================
+  # IGWはVPCとインターネット間の通信を可能にするゲートウェイです。
+  # パブリックサブネット内のリソースがインターネットと通信するために必要です。
+  # 
+  # セキュリティ上の注意点:
+  # - IGWは双方向の通信を許可します
+  # - セキュリティグループとNACLで適切にアクセス制御することが重要です
   # ========================================
   InternetGateway:
     Type: AWS::EC2::InternetGateway
@@ -86,6 +136,7 @@ Resources:
           Value: !Ref EnvironmentName
 
   # IGWをVPCにアタッチ
+  # この関連付けにより、VPCがインターネットに接続可能になります
   InternetGatewayAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
@@ -95,12 +146,22 @@ Resources:
   # ========================================
   # パブリックサブネット（インターネット接続可能）
   # ========================================
+  # パブリックサブネットは、インターネットからの直接アクセスが可能なサブネットです。
+  # 主に以下のリソースを配置します:
+  # - Application Load Balancer (ALB)
+  # - NAT Gateway
+  # - Bastion Host（踏み台サーバー）
+  # 
+  # セキュリティ上の重要な設定:
+  # - MapPublicIpOnLaunch: 自動的にパブリックIPを割り当て（ELB等で必要）
+  # - 必要最小限のリソースのみ配置し、適切なセキュリティグループで保護
+  # ========================================
   PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      AvailabilityZone: !Select [0, !GetAZs '']  # 最初のAZ
-      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]  # 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']  # リージョン内の最初のAZ（例: ap-northeast-1a）
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]  # 10.0.0.0/24（256個のIP）
       MapPublicIpOnLaunch: true  # 起動時にパブリックIPを自動割り当て
       Tags:
         - Key: Name
@@ -110,12 +171,14 @@ Resources:
         - Key: Environment
           Value: !Ref EnvironmentName
 
+  # 高可用性のための2つ目のパブリックサブネット
+  # マルチAZ構成により、1つのAZに障害が発生しても継続してサービスを提供できます
   PublicSubnet2:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      AvailabilityZone: !Select [1, !GetAZs '']  # 2番目のAZ
-      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]  # 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']  # リージョン内の2番目のAZ（例: ap-northeast-1c）
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]  # 10.0.1.0/24（256個のIP）
       MapPublicIpOnLaunch: true
       Tags:
         - Key: Name
@@ -128,12 +191,26 @@ Resources:
   # ========================================
   # プライベートサブネット（NATゲートウェイ経由）
   # ========================================
+  # プライベートサブネットは、インターネットから直接アクセスできないサブネットです。
+  # 主に以下のリソースを配置します:
+  # - EC2インスタンス（アプリケーションサーバー）
+  # - ECSタスク
+  # - Lambda関数（VPC内実行）
+  # 
+  # インターネットアクセス:
+  # - アウトバウンド通信: NATゲートウェイ経由で可能
+  # - インバウンド通信: ロードバランサー経由でのみ可能
+  # 
+  # セキュリティ上の利点:
+  # - インターネットから直接アクセスできないため、攻撃対象になりにくい
+  # - 必要な通信のみNATゲートウェイ経由で許可
+  # ========================================
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       AvailabilityZone: !Select [0, !GetAZs '']
-      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]  # 10.0.2.0/24
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]  # 10.0.2.0/24（256個のIP）
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-${EnvironmentName}-private-subnet-1'
@@ -159,12 +236,28 @@ Resources:
   # ========================================
   # データベースサブネット（インターネット接続なし）
   # ========================================
+  # データベースサブネットは、最も保護されたサブネットです。
+  # 主に以下のリソースを配置します:
+  # - RDS（リレーショナルデータベース）
+  # - ElastiCache（キャッシュサーバー）
+  # - DocumentDB、Neptune等のマネージドデータベース
+  # 
+  # セキュリティ上の重要な特徴:
+  # - インターネットへの接続経路が一切ない（NATゲートウェイも経由しない）
+  # - アプリケーション層からのみアクセス可能
+  # - データベース用セキュリティグループで厳密にアクセス制御
+  # 
+  # 本番環境での推奨設定:
+  # - 暗号化を有効化（保存時・転送時）
+  # - 自動バックアップを設定
+  # - マルチAZ配置で高可用性を確保
+  # ========================================
   DatabaseSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       AvailabilityZone: !Select [0, !GetAZs '']
-      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]  # 10.0.4.0/24
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]  # 10.0.4.0/24（256個のIP）
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-${EnvironmentName}-database-subnet-1'
@@ -190,11 +283,29 @@ Resources:
   # ========================================
   # NATゲートウェイ（高可用性のため2つ）
   # ========================================
+  # NATゲートウェイは、プライベートサブネット内のリソースが
+  # インターネットにアクセスするための重要なコンポーネントです。
+  # 
+  # 主な用途:
+  # - OSアップデート、パッチ適用
+  # - 外部APIへのアクセス
+  # - パッケージのダウンロード
+  # 
+  # コスト最適化のヒント:
+  # - 開発環境では1つのNATゲートウェイで十分な場合もある
+  # - 使用していない時間帯は削除してコスト削減可能
+  # - NATインスタンスを使用する選択肢もある（管理は複雑）
+  # 
+  # 本番環境での推奨:
+  # - 各AZに1つずつ配置（高可用性）
+  # - CloudWatchでトラフィックを監視
+  # ========================================
   # Elastic IPアドレス（NATゲートウェイ用）
+  # 固定IPアドレスにより、外部サービスのIPホワイトリストに登録可能
   NatGateway1EIP:
     Type: AWS::EC2::EIP
     Condition: CreateNatGateway
-    DependsOn: InternetGatewayAttachment  # IGWアタッチ後に作成
+    DependsOn: InternetGatewayAttachment  # IGWアタッチ後に作成（依存関係）
     Properties:
       Domain: vpc
       Tags:
@@ -211,13 +322,15 @@ Resources:
         - Key: Name
           Value: !Sub '${ProjectName}-${EnvironmentName}-nat2-eip'
 
-  # NATゲートウェイ（各AZに1つずつ）
+  # NATゲートウェイ（AZ1用）
+  # パブリックサブネットに配置し、同じAZ内のプライベートサブネットからの
+  # アウトバウンド通信を処理します
   NatGateway1:
     Type: AWS::EC2::NatGateway
     Condition: CreateNatGateway
     Properties:
       AllocationId: !GetAtt NatGateway1EIP.AllocationId
-      SubnetId: !Ref PublicSubnet1  # パブリックサブネットに配置
+      SubnetId: !Ref PublicSubnet1  # 必ずパブリックサブネットに配置
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-${EnvironmentName}-nat-gateway-1'
@@ -235,7 +348,16 @@ Resources:
   # ========================================
   # ルートテーブル
   # ========================================
+  # ルートテーブルは、サブネット内のトラフィックの経路を定義します。
+  # 各サブネットは1つのルートテーブルに関連付けられます。
+  # 
+  # ルートテーブルの種類:
+  # 1. パブリックルートテーブル: IGW経由でインターネットアクセス
+  # 2. プライベートルートテーブル: NAT Gateway経由でインターネットアクセス
+  # 3. データベースルートテーブル: インターネットアクセスなし（VPC内のみ）
+  # ========================================
   # パブリックルートテーブル
+  # インターネットゲートウェイへのルートを含みます
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -247,12 +369,14 @@ Resources:
           Value: !Ref EnvironmentName
 
   # インターネットへのデフォルトルート
+  # 0.0.0.0/0は「すべてのIPアドレス」を意味します
+  # VPC内の通信以外はすべてインターネットゲートウェイに転送されます
   DefaultPublicRoute:
     Type: AWS::EC2::Route
     DependsOn: InternetGatewayAttachment
     Properties:
       RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
+      DestinationCidrBlock: 0.0.0.0/0  # すべての宛先（インターネット）
       GatewayId: !Ref InternetGateway
 
   # パブリックサブネットをルートテーブルに関連付け
@@ -269,6 +393,7 @@ Resources:
       SubnetId: !Ref PublicSubnet2
 
   # プライベートルートテーブル（AZ1）
+  # プライベートサブネット用のルートテーブル
   PrivateRouteTable1:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -280,6 +405,9 @@ Resources:
           Value: !Ref EnvironmentName
 
   # NATゲートウェイ経由のデフォルトルート
+  # プライベートサブネットからのインターネット向け通信は
+  # すべてNATゲートウェイを経由します
+  # 注意: NATゲートウェイが無効の場合、インターネットアクセスは不可能になります
   DefaultPrivateRoute1:
     Type: AWS::EC2::Route
     Condition: CreateNatGateway
@@ -320,6 +448,8 @@ Resources:
       SubnetId: !Ref PrivateSubnet2
 
   # データベース用ルートテーブル（インターネット接続なし）
+  # このルートテーブルにはインターネットへのルートが含まれません
+  # VPC内の通信のみ可能で、最高レベルのセキュリティを提供します
   DatabaseRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -345,7 +475,17 @@ Resources:
   # ========================================
   # セキュリティグループ
   # ========================================
+  # セキュリティグループは、インスタンスレベルのファイアウォールです。
+  # ステートフルな特性を持ち、許可したインバウンド通信の戻り通信は自動的に許可されます。
+  # 
+  # ベストプラクティス:
+  # - 最小権限の原則に従い、必要最小限のポートのみ開放
+  # - 送信元IPアドレスを可能な限り制限
+  # - セキュリティグループ間の参照を使用して管理を簡素化
+  # - 各ルールに説明を追加して可読性を向上
+  # ========================================
   # Webサーバー用セキュリティグループ
+  # ALBやWebサーバーに適用するセキュリティグループ
   WebServerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -356,22 +496,26 @@ Resources:
         - SSH (22) はBastionホストからのみ許可
       VpcId: !Ref VPC
       SecurityGroupIngress:
+        # HTTP通信（本番環境ではHTTPSへのリダイレクト推奨）
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
           Description: HTTP from anywhere
+        # HTTPS通信（SSL/TLS暗号化通信）
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
           Description: HTTPS from anywhere
+        # SSH通信（管理用）- Bastionホストからのみ許可
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           SourceSecurityGroupId: !Ref BastionSecurityGroup
           Description: SSH from bastion
       SecurityGroupEgress:
+        # すべてのアウトバウンド通信を許可（必要に応じて制限可能）
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
           Description: All outbound traffic
@@ -382,6 +526,8 @@ Resources:
           Value: !Ref EnvironmentName
 
   # アプリケーションサーバー用セキュリティグループ
+  # プライベートサブネット内のアプリケーションサーバーに適用
+  # Webレイヤーからのみアクセスを許可し、多層防御を実現
   ApplicationSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -392,11 +538,14 @@ Resources:
         - SSH (22) はBastionホストからのみ許可
       VpcId: !Ref VPC
       SecurityGroupIngress:
+        # アプリケーションポート（例: Tomcat, Spring Boot等）
+        # ポート番号は実際のアプリケーションに合わせて変更してください
         - IpProtocol: tcp
           FromPort: 8080
           ToPort: 8080
           SourceSecurityGroupId: !Ref WebServerSecurityGroup
           Description: App port from web servers
+        # 管理用SSH（Bastionホスト経由のみ）
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
@@ -413,6 +562,8 @@ Resources:
           Value: !Ref EnvironmentName
 
   # データベース用セキュリティグループ
+  # 最も厳格なセキュリティ設定を適用
+  # アプリケーション層からのみアクセスを許可
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -422,16 +573,20 @@ Resources:
         - MySQL (3306) とPostgreSQL (5432) をアプリケーションサーバーから許可
       VpcId: !Ref VPC
       SecurityGroupIngress:
+        # MySQL/MariaDB用ポート
         - IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
           SourceSecurityGroupId: !Ref ApplicationSecurityGroup
           Description: MySQL from application servers
+        # PostgreSQL用ポート
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
           SourceSecurityGroupId: !Ref ApplicationSecurityGroup
           Description: PostgreSQL from application servers
+      # アウトバウンドルールを意図的に設定しない（デフォルト拒否）
+      # データベースからの外部通信は原則不要
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-${EnvironmentName}-db-sg'
@@ -439,6 +594,14 @@ Resources:
           Value: !Ref EnvironmentName
 
   # Bastionホスト用セキュリティグループ
+  # 踏み台サーバーは、プライベートサブネット内のリソースに
+  # 安全にアクセスするための中継点です
+  # 
+  # セキュリティ強化の推奨事項:
+  # 1. 本番環境では必ず送信元IPを制限（会社のIPアドレス等）
+  # 2. Session Manager使用時は不要（より安全）
+  # 3. 多要素認証（MFA）の設定
+  # 4. アクセスログの記録と監視
   BastionSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -451,7 +614,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
-          CidrIp: 0.0.0.0/0  # 本番環境では特定のIPに制限
+          CidrIp: 0.0.0.0/0  # 警告: 本番環境では必ず特定のIPに制限してください
           Description: SSH from anywhere (restrict in production)
       SecurityGroupEgress:
         - IpProtocol: -1
@@ -465,6 +628,18 @@ Resources:
 
   # ========================================
   # RDS用データベースサブネットグループ
+  # ========================================
+  # RDSインスタンスを作成する際に必要なサブネットグループです。
+  # 複数のAZにまたがるサブネットを含める必要があります。
+  # 
+  # マルチAZ配置の利点:
+  # - 自動フェイルオーバー（プライマリDBに障害時）
+  # - メンテナンス時のダウンタイム最小化
+  # - データの同期レプリケーション
+  # 
+  # 注意事項:
+  # - 最低2つの異なるAZのサブネットが必要
+  # - サブネットは同じVPC内である必要がある
   # ========================================
   DatabaseSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
@@ -485,7 +660,21 @@ Resources:
   # ========================================
   # VPCエンドポイント（プライベート接続）
   # ========================================
+  # VPCエンドポイントを使用することで、インターネットを経由せずに
+  # AWSサービスにプライベート接続できます。
+  # 
+  # メリット:
+  # - セキュリティ向上（インターネット経由しない）
+  # - データ転送コスト削減
+  # - レイテンシー改善
+  # - NATゲートウェイの負荷軽減
+  # 
+  # エンドポイントの種類:
+  # - ゲートウェイ型: S3、DynamoDB用（無料）
+  # - インターフェース型: その他のAWSサービス用（有料）
+  # ========================================
   # S3用VPCエンドポイント（ゲートウェイ型）
+  # S3へのアクセスをVPC内で完結させます
   S3VPCEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -511,6 +700,21 @@ Resources:
   # ========================================
   # VPCフローログ
   # ========================================
+  # VPCフローログは、VPC内のネットワークトラフィックを記録します。
+  # セキュリティ監査、トラブルシューティング、コンプライアンス対応に使用。
+  # 
+  # 記録される情報:
+  # - 送信元・宛先IPアドレス
+  # - 送信元・宛先ポート番号
+  # - プロトコル
+  # - パケット数・バイト数
+  # - アクション（ACCEPT/REJECT）
+  # 
+  # 本番環境での活用:
+  # - 不正アクセスの検知
+  # - トラフィックパターンの分析
+  # - セキュリティグループの効果検証
+  # ========================================
   # フローログ用IAMロール
   VPCFlowLogsRole:
     Type: AWS::IAM::Role
@@ -526,11 +730,13 @@ Resources:
         - arn:aws:iam::aws:policy/service-role/VPCFlowLogsDeliveryRolePolicy
 
   # CloudWatchロググループ
+  # フローログの保存先となるロググループ
+  # 保持期間は環境によって自動調整されます
   VPCFlowLogsLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub '/aws/vpc/flowlogs/${ProjectName}-${EnvironmentName}'
-      RetentionInDays: !If [IsProduction, 90, 7]  # 本番: 90日、その他: 7日
+      RetentionInDays: !If [IsProduction, 90, 7]  # 本番: 90日（コンプライアンス要件）、その他: 7日（コスト削減）
 
   # VPCフローログ
   VPCFlowLogs:
@@ -538,7 +744,7 @@ Resources:
     Properties:
       ResourceType: VPC
       ResourceId: !Ref VPC
-      TrafficType: ALL  # すべてのトラフィックを記録
+      TrafficType: ALL  # ACCEPT、REJECT両方のトラフィックを記録（セキュリティ分析に重要）
       LogDestinationType: cloud-watch-logs
       LogGroupName: !Ref VPCFlowLogsLogGroup
       DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
@@ -551,6 +757,18 @@ Resources:
   # ========================================
   # ネットワークACL（追加のセキュリティレイヤー）
   # ========================================
+  # ネットワークACL（NACL）は、サブネットレベルのファイアウォールです。
+  # セキュリティグループとは異なり、ステートレスで番号順にルールが評価されます。
+  # 
+  # セキュリティグループとの違い:
+  # - NACL: サブネットレベル、ステートレス、明示的な許可・拒否が必要
+  # - SG: インスタンスレベル、ステートフル、戻り通信は自動許可
+  # 
+  # 使用する場面:
+  # - 特定のIPアドレスやポートを完全にブロック
+  # - サブネット間の通信制御
+  # - 多層防御の実装
+  # ========================================
   PublicNetworkAcl:
     Type: AWS::EC2::NetworkAcl
     Properties:
@@ -562,16 +780,19 @@ Resources:
           Value: !Ref EnvironmentName
 
   # インバウンドルール（すべて許可）
+  # 初期設定では全許可ですが、本番環境では必要に応じて制限を追加してください
+  # ルール番号が小さいほど優先度が高くなります（100, 200, 300...）
   PublicInboundRule:
     Type: AWS::EC2::NetworkAclEntry
     Properties:
       NetworkAclId: !Ref PublicNetworkAcl
       RuleNumber: 100
-      Protocol: -1  # すべてのプロトコル
+      Protocol: -1  # すべてのプロトコル（TCP、UDP、ICMP等）
       RuleAction: allow
       CidrBlock: 0.0.0.0/0
 
   # アウトバウンドルール（すべて許可）
+  # エフェメラルポート（1024-65535）の戻り通信を含むすべての通信を許可
   PublicOutboundRule:
     Type: AWS::EC2::NetworkAclEntry
     Properties:
@@ -597,6 +818,13 @@ Resources:
 
 # ========================================
 # 出力値（他のスタックから参照可能）
+# ========================================
+# これらの出力値は、他のCloudFormationスタックから
+# Fn::ImportValue関数を使用して参照できます。
+# 例: !ImportValue 'vpc-network-dev-VPC-ID'
+# 
+# 出力値の命名規則:
+# ${スタック名}-${リソース種別}-${識別子}
 # ========================================
 Outputs:
   # VPC情報

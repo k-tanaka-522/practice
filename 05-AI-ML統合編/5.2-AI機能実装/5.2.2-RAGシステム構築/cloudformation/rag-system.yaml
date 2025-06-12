@@ -1007,14 +1007,7 @@ Resources:
               context = "\n\n".join(context_parts)
               
               # プロンプト構築
-              prompt = f"""以下の文書に基づいて、質問に対して正確で役立つ回答を提供してください。
-
-文書内容:
-{context}
-
-質問: {query}
-
-回答:"""
+              prompt = f"以下の文書に基づいて、質問に対して正確で役立つ回答を提供してください。\\n\\n文書内容:\\n{context}\\n\\n質問: {query}\\n\\n回答:"
               
               # Claude 3で回答生成
               try:

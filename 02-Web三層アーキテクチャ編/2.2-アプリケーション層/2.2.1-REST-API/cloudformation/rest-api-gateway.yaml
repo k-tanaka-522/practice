@@ -1,55 +1,173 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'REST API with API Gateway, Lambda, and comprehensive features'
+Description: |
+  REST API Gateway - 包括的なAPIバックエンドシステム
+  
+  このテンプレートはスケーラブルなREST APIを構築します：
+  
+  【アーキテクチャ概要】
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    REST API アーキテクチャ                      │
+  ├─────────────────────────────────────────────────────────────┤
+  │ Client → API Gateway → Lambda → DynamoDB/S3/SNS            │
+  │   ↑           ↑           ↑          ↑                      │
+  │ CORS      スロットリング  統合      データストア              │
+  │ 認証      レート制限     エラー     通知システム             │
+  │ API Key   キャッシュ     ハンドリング                        │
+  └─────────────────────────────────────────────────────────────┘
+  
+  【主要コンポーネント】
+  ◆ API Gateway (RESTful API)
+    - Regional エンドポイント（低レイテンシ）
+    - Cognito統合認証（JWT トークン検証）
+    - API Key による追加認証
+    - スロットリング・レート制限
+    - CORS設定（ブラウザ対応）
+    - CloudWatch統合監視
+  
+  ◆ Lambda Functions（ビジネスロジック）
+    - Users API: ユーザー管理（CRUD操作）
+    - Items API: アイテム管理（検索・フィルタリング）
+    - VPC統合対応（セキュリティ強化）
+    - 環境変数による設定管理
+    - 詳細エラーハンドリング
+  
+  ◆ DynamoDB（NoSQLデータベース）
+    - Pay-per-request課金（コスト最適化）
+    - グローバルセカンダリインデックス（高速検索）
+    - Point-in-time Recovery（データ保護）
+    - 暗号化有効（セキュリティ）
+    - DynamoDB Streams（変更追跡）
+  
+  ◆ S3（ファイルストレージ）
+    - サーバーサイド暗号化
+    - バージョニング（データ履歴）
+    - ライフサイクル管理（コスト削減）
+    - パブリックアクセス無効（セキュリティ）
+  
+  ◆ SNS（通知システム）
+    - 非同期メッセージ配信
+    - メール・SMS・Lambda統合
+    - 高可用性・耐久性
+  
+  【セキュリティ機能】
+  ✓ 多層認証（Cognito + API Key）
+  ✓ IAM最小権限の原則
+  ✓ VPC内Lambda実行
+  ✓ 暗号化（保存時・転送時）
+  ✓ API レート制限
+  ✓ CloudWatch監視・アラート
+  
+  【パフォーマンス最適化】
+  ✓ Regional API Gateway（低レイテンシ）
+  ✓ Lambda同時実行制御
+  ✓ DynamoDB GSI活用
+  ✓ S3ライフサイクル管理
+  ✓ CloudWatch ログ保持期間設定
 
 Parameters:
+  # ========================================
+  # 環境・基本設定パラメータ
+  # ========================================
   EnvironmentName:
     Type: String
     Default: dev
     AllowedValues: [dev, staging, prod]
-    Description: Environment name
+    Description: |
+      デプロイ環境名
+      - dev: 開発環境（基本機能、短いログ保持）
+      - staging: ステージング環境（本番同等設定）
+      - prod: 本番環境（高可用性、長期ログ保持）
 
   ProjectName:
     Type: String
     Default: rest-api
-    Description: Project name for resource naming
+    Description: |
+      プロジェクト名（リソース命名に使用）
+      例: rest-api → rest-api-dev-users-table
+      命名規則: {ProjectName}-{Environment}-{ResourceType}
 
+  # ========================================
+  # ネットワーク設定パラメータ
+  # ========================================
   VpcId:
     Type: AWS::EC2::VPC::Id
-    Description: VPC ID for Lambda functions
+    Description: |
+      Lambda関数を配置するVPC ID
+      - 指定時: VPC内でLambda実行（セキュリティ強化）
+      - 未指定時: パブリック実行（シンプル構成）
+      ※VPC使用時は NAT Gateway が必要
     Default: ''
 
   PrivateSubnetIds:
     Type: CommaDelimitedList
-    Description: List of private subnet IDs for VPC Lambda functions
+    Description: |
+      Lambda関数用プライベートサブネットIDリスト
+      - 複数AZ指定で高可用性確保
+      - プライベートサブネット推奨（セキュリティ）
+      - NAT Gateway経由でインターネットアクセス
+      例: subnet-12345,subnet-67890
     Default: ''
 
+  # ========================================
+  # 認証・セキュリティ設定パラメータ  
+  # ========================================
   CognitoUserPoolArn:
     Type: String
-    Description: Cognito User Pool ARN for authentication
+    Description: |
+      Cognito User Pool ARN（JWT認証用）
+      - 指定時: JWT トークン認証有効
+      - 未指定時: 認証なし（パブリックAPI）
+      例: arn:aws:cognito-idp:region:account:userpool/pool-id
     Default: ''
 
   ApiKeyRequired:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
-    Description: Require API key for requests
+    Description: |
+      API Key認証の必須化
+      - true: API Key + Usage Plan でレート制限
+      - false: 認証なし（開発・テスト用）
+      ※本番環境では true 推奨
 
+# ========================================
+# 条件分岐設定
+# パラメータ値に基づく設定の動的変更
+# ========================================
 Conditions:
+  # 本番環境かどうか（ログ保持期間、アラーム設定に影響）
   IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # VPC使用有無（Lambda配置場所、セキュリティグループ作成に影響）
   UseVPC: !Not [!Equals [!Ref VpcId, '']]
+  
+  # Cognito認証使用有無（API Gateway認証設定に影響） 
   UseCognito: !Not [!Equals [!Ref CognitoUserPoolArn, '']]
+  
+  # API Key必須化（Usage Plan、API Key作成に影響）
   RequireApiKey: !Equals [!Ref ApiKeyRequired, 'true']
 
 Resources:
+  # ========================================
   # API Gateway REST API
+  # メインのAPIエンドポイントとスロットリング設定
+  # ========================================
   RestApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
       Name: !Sub '${ProjectName}-${EnvironmentName}-api'
       Description: !Sub 'REST API for ${ProjectName} ${EnvironmentName}'
+      
+      # エンドポイントタイプ: REGIONALを使用
+      # - REGIONAL: 同一リージョンからのアクセスに最適化（低レイテンシ）
+      # - EDGE: CloudFront配信（グローバルアクセスに最適）
+      # - PRIVATE: VPC内アクセスのみ（最高セキュリティ） 
       EndpointConfiguration:
         Types:
           - REGIONAL
+      
+      # APIポリシー: API Key必須時のリージョン制限
+      # セキュリティ強化: 特定リージョンからのみアクセス許可
       Policy: !If
         - RequireApiKey
         - Version: '2012-10-17'
@@ -61,30 +179,46 @@ Resources:
               Condition:
                 StringEquals:
                   'aws:RequestedRegion': !Ref AWS::Region
-        - !Ref AWS::NoValue
+        - !Ref 'AWS::NoValue'
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
 
-  # Cognito Authorizer
+  # ========================================
+  # Cognito JWT 認証オーソライザー
+  # JWT トークンを使用したユーザー認証
+  # ========================================
   CognitoAuthorizer:
     Type: AWS::ApiGateway::Authorizer
     Condition: UseCognito
     Properties:
       Name: !Sub '${ProjectName}-${EnvironmentName}-cognito-authorizer'
       RestApiId: !Ref RestApi
+      
+      # Cognito User Pool 認証タイプ
+      # JWT トークンの検証とユーザー情報抽出を自動化
       Type: COGNITO_USER_POOLS
+      
+      # 認証プロバイダー: 複数のUser Pool指定可能
       ProviderARNs:
         - !Ref CognitoUserPoolArn
+      
+      # トークン取得元: Authorization ヘッダーから JWT 抽出
+      # 形式: "Bearer {JWT_TOKEN}"
       IdentitySource: method.request.header.Authorization
 
-  # Lambda Execution Role
+  # ========================================
+  # Lambda 実行ロール
+  # 最小権限の原則に基づく設計
+  # ========================================
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub '${ProjectName}-${EnvironmentName}-lambda-execution-role'
+      
+      # Lambdaサービスがこのロールを使用可能にする信頼ポリシー
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -92,47 +226,66 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+      
+      # AWS管理ポリシーのアタッチ
       ManagedPolicyArns:
+        # 基本CloudWatch Logs権限（ログ出力用）
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        # VPC内実行時のネットワークインターフェース管理権限
         - !If 
           - UseVPC
           - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
           - !Ref AWS::NoValue
+      # カスタムポリシー: アプリケーション固有の権限設定
       Policies:
         - PolicyName: RestApiLambdaPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # DynamoDBアクセス権限（CRUD操作 + インデックス検索）
               - Effect: Allow
                 Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                  - dynamodb:Query
-                  - dynamodb:Scan
+                  - dynamodb:GetItem        # 単一アイテム取得
+                  - dynamodb:PutItem        # アイテム作成
+                  - dynamodb:UpdateItem     # アイテム更新
+                  - dynamodb:DeleteItem     # アイテム削除
+                  - dynamodb:Query          # プライマリキー/GSI検索
+                  - dynamodb:Scan           # テーブルスキャン
+                # メインテーブル + グローバルセカンダリインデックスへのアクセス
                 Resource: 
-                  - !GetAtt ItemsTable.Arn
-                  - !Sub '${ItemsTable.Arn}/index/*'
-                  - !GetAtt UsersTable.Arn
-                  - !Sub '${UsersTable.Arn}/index/*'
+                  - !GetAtt ItemsTable.Arn           # Itemsテーブル
+                  - !Sub '${ItemsTable.Arn}/index/*'  # Items GSI
+                  - !GetAtt UsersTable.Arn           # Usersテーブル
+                  - !Sub '${UsersTable.Arn}/index/*'  # Users GSI
+              
+              # S3ファイルストレージ権限（アップロード/ダウンロード/削除）
               - Effect: Allow
                 Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:DeleteObject
+                  - s3:GetObject    # ファイル取得（ダウンロード）
+                  - s3:PutObject    # ファイルアップロード
+                  - s3:DeleteObject # ファイル削除
+                # ファイルストレージバケット内の全オブジェクト
                 Resource: !Sub '${FileStorageBucket}/*'
+              
+              # SESメール送信権限（通知機能）
               - Effect: Allow
                 Action:
-                  - ses:SendEmail
-                  - ses:SendRawEmail
+                  - ses:SendEmail     # シンプルメール送信
+                  - ses:SendRawEmail  # 添付ファイル付きメール送信
+                # 全メールアドレスへの送信許可（本番では制限推奨）
                 Resource: '*'
+              
+              # SNSプッシュ通知権限（非同期処理）
               - Effect: Allow
                 Action:
-                  - sns:Publish
+                  - sns:Publish # メッセージ発行
+                # 特定の通知トピックのみアクセス許可
                 Resource: !Ref NotificationTopic
 
-  # Security Group for Lambda Functions
+  # ========================================
+  # Lambda用セキュリティグループ
+  # VPC内Lambdaのネットワークアクセス制御
+  # ========================================
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Condition: UseVPC
@@ -140,9 +293,13 @@ Resources:
       GroupName: !Sub '${ProjectName}-${EnvironmentName}-lambda-sg'
       GroupDescription: Security group for REST API Lambda functions
       VpcId: !Ref VpcId
+      
+      # アウトバウンドルール: 全トラフィック許可
+      # Lambdaが外部APIやAWSサービスにアクセスするため必要
+      # 本番では必要なポートのみ許可することを推奨
       SecurityGroupEgress:
-        - IpProtocol: -1
-          CidrIp: 0.0.0.0/0
+        - IpProtocol: -1            # 全プロトコル
+          CidrIp: 0.0.0.0/0         # 全IPアドレス
           Description: All outbound traffic
       Tags:
         - Key: Name
@@ -150,28 +307,37 @@ Resources:
         - Key: Environment
           Value: !Ref EnvironmentName
 
-  # Users Lambda Function
+  # ========================================
+  # Users API Lambda関数
+  # ユーザー管理のCRUD操作を提供
+  # ========================================
   UsersFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub '${ProjectName}-${EnvironmentName}-users'
-      Runtime: python3.9
-      Handler: index.lambda_handler
-      Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 30
-      MemorySize: 256
+      Runtime: python3.9              # Python 3.9 ランタイム（安定版）
+      Handler: index.lambda_handler     # エントリーポイント関数
+      Role: !GetAtt LambdaExecutionRole.Arn  # 実行ロールのARN
+      
+      # パフォーマンス設定
+      Timeout: 30      # 30秒タイムアウト（API Gatewayの最大値）
+      MemorySize: 256  # 256MBメモリ（コストとパフォーマンスのバランス）
+      
+      # VPC設定（セキュリティ強化時のみ）
       VpcConfig: !If
         - UseVPC
         - SecurityGroupIds:
-            - !Ref LambdaSecurityGroup
-          SubnetIds: !Ref PrivateSubnetIds
-        - !Ref AWS::NoValue
+            - !Ref LambdaSecurityGroup  # ネットワークアクセス制御
+          SubnetIds: !Ref PrivateSubnetIds  # プライベートサブネット配置
+        - !Ref AWS::NoValue  # VPC使用しない場合は設定なし
+      
+      # 環境変数（アプリケーション設定）
       Environment:
         Variables:
-          ENVIRONMENT: !Ref EnvironmentName
-          USERS_TABLE: !Ref UsersTable
-          ITEMS_TABLE: !Ref ItemsTable
-          SNS_TOPIC: !Ref NotificationTopic
+          ENVIRONMENT: !Ref EnvironmentName   # デプロイ環境
+          USERS_TABLE: !Ref UsersTable         # ユーザーテーブル名
+          ITEMS_TABLE: !Ref ItemsTable         # アイテムテーブル名
+          SNS_TOPIC: !Ref NotificationTopic    # 通知トピックARN
       Code:
         ZipFile: |
           import json
@@ -312,7 +478,10 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # Items Lambda Function
+  # ========================================
+  # Items API Lambda関数 
+  # アイテム管理のCRUD操作と高度な検索機能を提供
+  # ========================================
   ItemsFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -509,63 +678,94 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # DynamoDB Tables
+  # ========================================
+  # DynamoDBテーブル群
+  # NoSQLデータベースで高パフォーマンスを実現
+  # ========================================
+  
+  # ユーザー情報テーブル
   UsersTable:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub '${ProjectName}-${EnvironmentName}-users'
+      
+      # 課金モード: リクエスト単位課金（コスト最適化）
+      # - PAY_PER_REQUEST: 使用量に応じた課金（予測不可能なワークロードに最適）
+      # - PROVISIONED: 事前容量設定（予測可能な安定ワークロードに最適）
       BillingMode: PAY_PER_REQUEST
+      
+      # テーブル属性定義（インデックスで使用する属性のみ定義）
       AttributeDefinitions:
-        - AttributeName: id
-          AttributeType: S
-        - AttributeName: email
-          AttributeType: S
+        - AttributeName: id      # ユーザーID（プライマリキー）
+          AttributeType: S       # String型
+        - AttributeName: email   # メールアドレス（GSI用）
+          AttributeType: S       # String型
+      
+      # プライマリキースキーマ（ユニークアクセスパターン）
       KeySchema:
         - AttributeName: id
-          KeyType: HASH
+          KeyType: HASH          # パーティションキー（分散処理用）
+      
+      # グローバルセカンダリインデックス（別のアクセスパターン）
       GlobalSecondaryIndexes:
-        - IndexName: email-index
+        - IndexName: email-index     # メールアドレスでの検索用
           KeySchema:
             - AttributeName: email
-              KeyType: HASH
+              KeyType: HASH          # emailでの一意検索
           Projection:
-            ProjectionType: ALL
+            ProjectionType: ALL      # 全属性をインデックスに含める
+      
+      # DynamoDB Streams（データ変更イベントストリーム）
       StreamSpecification:
-        StreamViewType: NEW_AND_OLD_IMAGES
+        StreamViewType: NEW_AND_OLD_IMAGES  # 変更前後の値を両方記録
+      
+      # Point-in-Time Recovery（ポイントインタイムリカバリ）
+      # 35日間の任意の時点へのデータ復元が可能
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
+      
+      # 暗号化設定（保存時暗号化）
       SSESpecification:
-        SSEEnabled: true
+        SSEEnabled: true  # AWS管理キーでの暗号化有効
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
 
+  # アイテム情報テーブル（複合インデックス例）
   ItemsTable:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub '${ProjectName}-${EnvironmentName}-items'
       BillingMode: PAY_PER_REQUEST
+      
+      # 属性定義（複合インデックス用）
       AttributeDefinitions:
-        - AttributeName: id
+        - AttributeName: id          # アイテムID（プライマリキー）
           AttributeType: S
-        - AttributeName: category
+        - AttributeName: category    # カテゴリ（GSIパーティションキー）
+          AttributeType: S  
+        - AttributeName: created_at  # 作成日時（GSIソートキー）
           AttributeType: S
-        - AttributeName: created_at
-          AttributeType: S
+      
+      # プライマリキースキーマ
       KeySchema:
         - AttributeName: id
           KeyType: HASH
+      
+      # 複合インデックス（カテゴリ別時系列検索）
       GlobalSecondaryIndexes:
         - IndexName: category-created-index
           KeySchema:
-            - AttributeName: category
+            - AttributeName: category    # パーティションキー（カテゴリ別分散）
               KeyType: HASH
-            - AttributeName: created_at
+            - AttributeName: created_at  # ソートキー（時系列ソート）
               KeyType: RANGE
           Projection:
-            ProjectionType: ALL
+            ProjectionType: ALL  # 全属性投影（追加クエリ不要）
+      
+      # データ保護機能（Usersテーブルと同様）
       StreamSpecification:
         StreamViewType: NEW_AND_OLD_IMAGES
       PointInTimeRecoverySpecification:
@@ -578,26 +778,39 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # S3 Bucket for File Storage
+  # ========================================
+  # S3 ファイルストレージ
+  # セキュアでコスト効率的なファイル保存
+  # ========================================
   FileStorageBucket:
     Type: AWS::S3::Bucket
     Properties:
+      # グローバルユニークなバケット名（AWSアカウントID含む）
       BucketName: !Sub '${ProjectName}-${EnvironmentName}-files-${AWS::AccountId}'
+      
+      # サーバーサイド暗号化（保存時暗号化）
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+              SSEAlgorithm: AES256  # AWS S3マネージドキーで暗号化
+      
+      # パブリックアクセス禁止（セキュリティ強化）
       PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
+        BlockPublicAcls: true          # パブリックACL禁止
+        BlockPublicPolicy: true        # パブリックポリシー禁止
+        IgnorePublicAcls: true         # パブリックACL無視
+        RestrictPublicBuckets: true    # パブリックバケット制限
+      
+      # バージョニング（ファイル履歴管理）
       VersioningConfiguration:
-        Status: Enabled
+        Status: Enabled  # ファイル更新時に旧バージョン保持
+      
+      # ライフサイクル管理（コスト最適化）
       LifecycleConfiguration:
         Rules:
           - Id: DeleteOldVersions
             Status: Enabled
+            # 30日後に古いバージョンを自動削除
             NoncurrentVersionExpirationInDays: 30
       Tags:
         - Key: Environment
@@ -605,75 +818,109 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # SNS Topic for Notifications
+  # ========================================
+  # SNS 通知トピック
+  # 非同期メッセージ配信システム
+  # ========================================
   NotificationTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub '${ProjectName}-${EnvironmentName}-notifications'
       DisplayName: !Sub '${ProjectName} ${EnvironmentName} Notifications'
+      # メッセージ配信先:
+      # - メール通知
+      # - SMS通知  
+      # - Lambda関数トリガー
+      # - SQSキュー送信
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
 
-  # API Gateway Resources and Methods
+  # ========================================
+  # API Gateway リソース構造
+  # RESTful URL構造の定義（/users, /users/{id}, /items, /items/{id}）
+  # ========================================
+  
+  # /users リソース（ユーザー一覧・作成）
   UsersResource:
     Type: AWS::ApiGateway::Resource
     Properties:
       RestApiId: !Ref RestApi
-      ParentId: !GetAtt RestApi.RootResourceId
-      PathPart: users
+      ParentId: !GetAtt RestApi.RootResourceId  # ルートリソース（/）からの子リソース
+      PathPart: users  # URLパス: /users
 
+  # /users/{userId} リソース（個別ユーザー操作）
   UserResource:
     Type: AWS::ApiGateway::Resource
     Properties:
       RestApiId: !Ref RestApi
-      ParentId: !Ref UsersResource
-      PathPart: '{userId}'
+      ParentId: !Ref UsersResource  # /users の子リソース
+      PathPart: '{userId}'  # パスパラメータ: ユーザーID
 
+  # /items リソース（アイテム一覧・作成）
   ItemsResource:
     Type: AWS::ApiGateway::Resource
     Properties:
       RestApiId: !Ref RestApi
-      ParentId: !GetAtt RestApi.RootResourceId
-      PathPart: items
+      ParentId: !GetAtt RestApi.RootResourceId  # ルートリソースからの子リソース
+      PathPart: items  # URLパス: /items
 
+  # /items/{itemId} リソース（個別アイテム操作）
   ItemResource:
     Type: AWS::ApiGateway::Resource
     Properties:
       RestApiId: !Ref RestApi
-      ParentId: !Ref ItemsResource
-      PathPart: '{itemId}'
+      ParentId: !Ref ItemsResource  # /items の子リソース
+      PathPart: '{itemId}'  # パスパラメータ: アイテムID
 
-  # API Gateway Methods
+  # ========================================
+  # API Gateway HTTP メソッド定義
+  # Lambda統合と認証設定
+  # ========================================
+  
+  # GET /users - ユーザー一覧取得（認証必要）
   UsersGetMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref RestApi
       ResourceId: !Ref UsersResource
       HttpMethod: GET
+      
+      # 認証設定: Cognito使用時はJWT認証、未使用時は認証なし
       AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
       AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
-      ApiKeyRequired: !Ref RequireApiKey
+      
+      # API Key必須設定: レート制限と組み合わせて使用
+      ApiKeyRequired: !If [RequireApiKey, true, false]
+      
+      # Lambda統合設定
       Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
+        Type: AWS_PROXY  # Lambda Proxy統合（リクエスト/レスポンス自動変換）
+        IntegrationHttpMethod: POST  # Lambda呼び出しは常にPOST
+        # Lambda関数ARN（実行用URI）
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
 
+  # POST /users - ユーザー作成（認証不要 - 登録用）
   UsersPostMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref RestApi
       ResourceId: !Ref UsersResource
       HttpMethod: POST
+      
+      # ユーザー登録は認証不要（アカウント作成のため）
       AuthorizationType: NONE
-      ApiKeyRequired: !Ref RequireApiKey
+      ApiKeyRequired: !If [RequireApiKey, true, false]
+      
+      # 同じLambda関数でメソッド別処理を分岐
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersFunction.Arn}/invocations'
 
+  # GET /users/{userId} - 個別ユーザー取得（認証必要）
   UserGetMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -682,7 +929,7 @@ Resources:
       HttpMethod: GET
       AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
       AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
-      ApiKeyRequired: !Ref RequireApiKey
+      ApiKeyRequired: !If [RequireApiKey, true, false]
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -696,7 +943,7 @@ Resources:
       HttpMethod: PUT
       AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
       AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
-      ApiKeyRequired: !Ref RequireApiKey
+      ApiKeyRequired: !If [RequireApiKey, true, false]
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -710,7 +957,7 @@ Resources:
       HttpMethod: DELETE
       AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
       AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
-      ApiKeyRequired: !Ref RequireApiKey
+      ApiKeyRequired: !If [RequireApiKey, true, false]
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -723,7 +970,7 @@ Resources:
       ResourceId: !Ref ItemsResource
       HttpMethod: GET
       AuthorizationType: NONE
-      ApiKeyRequired: !Ref RequireApiKey
+      ApiKeyRequired: !If [RequireApiKey, true, false]
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -737,7 +984,7 @@ Resources:
       HttpMethod: POST
       AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
       AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
-      ApiKeyRequired: !Ref RequireApiKey
+      ApiKeyRequired: !If [RequireApiKey, true, false]
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -750,7 +997,7 @@ Resources:
       ResourceId: !Ref ItemResource
       HttpMethod: GET
       AuthorizationType: NONE
-      ApiKeyRequired: !Ref RequireApiKey
+      ApiKeyRequired: !If [RequireApiKey, true, false]
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -764,7 +1011,7 @@ Resources:
       HttpMethod: PUT
       AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
       AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
-      ApiKeyRequired: !Ref RequireApiKey
+      ApiKeyRequired: !If [RequireApiKey, true, false]
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -778,7 +1025,7 @@ Resources:
       HttpMethod: DELETE
       AuthorizationType: !If [UseCognito, COGNITO_USER_POOLS, NONE]
       AuthorizerId: !If [UseCognito, !Ref CognitoAuthorizer, !Ref AWS::NoValue]
-      ApiKeyRequired: !Ref RequireApiKey
+      ApiKeyRequired: !If [RequireApiKey, true, false]
       Integration:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
@@ -831,22 +1078,33 @@ Resources:
         - RestApiId: !Ref RestApi
           StageName: !Ref EnvironmentName
 
-  # Usage Plan
+  # ========================================
+  # API Gateway スロットリング・レート制限
+  # API Keyと組み合わせた使用量制御
+  # ========================================
+  
+  # 使用量プラン（スロットリングとクォータ設定）
   UsagePlan:
     Type: AWS::ApiGateway::UsagePlan
     Condition: RequireApiKey
     Properties:
       UsagePlanName: !Sub '${ProjectName}-${EnvironmentName}-usage-plan'
       Description: !Sub 'Usage plan for ${ProjectName} ${EnvironmentName}'
+      
+      # 適用APIステージ
       ApiStages:
         - ApiId: !Ref RestApi
           Stage: !Ref EnvironmentName
+      
+      # スロットリング設定（突発トラフィック対応）
       Throttle:
-        BurstLimit: 1000
-        RateLimit: 500
+        BurstLimit: 1000  # バースト制限: 1000リクエスト/秒
+        RateLimit: 500    # 継続レート制限: 500リクエスト/秒
+      
+      # クォータ設定（日次利用制限）
       Quota:
-        Limit: 10000
-        Period: DAY
+        Limit: 10000  # 1日あたり10,000リクエストまで
+        Period: DAY   # 日次リセット
 
   # Usage Plan Key
   UsagePlanKey:

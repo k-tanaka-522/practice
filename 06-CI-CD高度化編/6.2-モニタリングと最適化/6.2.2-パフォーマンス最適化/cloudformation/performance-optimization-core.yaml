@@ -1,0 +1,751 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  パフォーマンス最適化基盤 - コア機能
+  
+  このテンプレートは以下のリソースを作成します：
+  - CloudWatch（カスタムメトリクス・アラーム）
+  - Lambda関数（パフォーマンス分析・最適化推奨）
+  - DynamoDB（パフォーマンスデータ・推奨事項）
+  - EventBridge（パフォーマンス監視・自動対応）
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: |
+      環境名
+      - dev: 開発環境（基本監視）
+      - staging: ステージング環境（詳細分析）
+      - prod: 本番環境（フル最適化）
+
+  ProjectName:
+    Type: String
+    Default: performance-optimization
+    Description: リソース命名に使用するプロジェクト名
+
+  # パフォーマンス閾値設定
+  ResponseTimeThreshold:
+    Type: Number
+    Default: 2000
+    MinValue: 100
+    MaxValue: 30000
+    Description: |
+      レスポンス時間閾値（ミリ秒）
+      この値を超えると最適化が推奨される
+
+  ThroughputThreshold:
+    Type: Number
+    Default: 1000
+    MinValue: 10
+    MaxValue: 100000
+    Description: |
+      スループット閾値（リクエスト/秒）
+      この値を下回ると最適化が推奨される
+
+  ErrorRateThreshold:
+    Type: Number
+    Default: 1.0
+    MinValue: 0.1
+    MaxValue: 10.0
+    Description: |
+      エラー率閾値（%）
+      この値を超えると緊急対応が必要
+
+  # 自動最適化設定
+  AutoOptimizationEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: |
+      自動最適化の有効化
+      true: 自動でパフォーマンス調整
+      false: 推奨のみ提示
+
+  # 通知設定
+  NotificationEmail:
+    Type: String
+    Default: performance-team@example.com
+    Description: |
+      パフォーマンス問題通知先メール
+      アラート・推奨事項の送信先
+
+Conditions:
+  # 本番環境かどうか
+  IsProduction: !Equals [!Ref EnvironmentName, 'prod']
+  
+  # 自動最適化が有効かどうか
+  UseAutoOptimization: !Equals [!Ref AutoOptimizationEnabled, 'true']
+
+Resources:
+  # ========================================
+  # DynamoDB テーブル（パフォーマンスデータ）
+  # ========================================
+  # パフォーマンスメトリクステーブル
+  PerformanceMetricsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-performance-metrics'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: metricId
+          AttributeType: S
+        - AttributeName: resourceType
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: metricName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: metricId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ResourceTypeIndex
+          KeySchema:
+            - AttributeName: resourceType
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: MetricNameIndex
+          KeySchema:
+            - AttributeName: metricName
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 最適化推奨事項テーブル
+  OptimizationRecommendationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-optimization-recommendations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: recommendationId
+          AttributeType: S
+        - AttributeName: resourceId
+          AttributeType: S
+        - AttributeName: priority
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: recommendationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ResourceIdIndex
+          KeySchema:
+            - AttributeName: resourceId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: PriorityIndex
+          KeySchema:
+            - AttributeName: priority
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # Lambda関数（パフォーマンス分析）
+  # ========================================
+  # パフォーマンス分析Lambda関数
+  PerformanceAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-performance-analyzer'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt PerformanceAnalyzerRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          METRICS_TABLE: !Ref PerformanceMetricsTable
+          RECOMMENDATIONS_TABLE: !Ref OptimizationRecommendationsTable
+          RESPONSE_TIME_THRESHOLD: !Ref ResponseTimeThreshold
+          THROUGHPUT_THRESHOLD: !Ref ThroughputThreshold
+          ERROR_RATE_THRESHOLD: !Ref ErrorRateThreshold
+          SNS_TOPIC: !Ref PerformanceNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          import uuid
+          
+          cloudwatch = boto3.client('cloudwatch')
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              print(f"Performance analyzer started: {datetime.utcnow().isoformat()}")
+              
+              try:
+                  # メトリクス収集
+                  metrics = collect_performance_metrics()
+                  
+                  # 分析実行
+                  analysis_results = analyze_performance(metrics)
+                  
+                  # 推奨事項生成
+                  recommendations = generate_recommendations(analysis_results)
+                  
+                  # 結果保存
+                  save_analysis_results(metrics, recommendations)
+                  
+                  # 通知送信（必要時）
+                  send_notifications(recommendations)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Performance analysis completed',
+                          'metrics_analyzed': len(metrics),
+                          'recommendations_generated': len(recommendations)
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in performance analysis: {str(e)}")
+                  # エラー通知
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC'],
+                      Message=f"Performance analysis error: {str(e)}",
+                      Subject="Performance Analysis Error"
+                  )
+                  raise e
+          
+          def collect_performance_metrics():
+              """パフォーマンスメトリクスの収集"""
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(minutes=15)
+              
+              metrics = []
+              
+              # Lambda関数メトリクス
+              lambda_metrics = cloudwatch.get_metric_statistics(
+                  Namespace='AWS/Lambda',
+                  MetricName='Duration',
+                  Dimensions=[],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=300,
+                  Statistics=['Average', 'Maximum']
+              )
+              
+              for metric in lambda_metrics['Datapoints']:
+                  metrics.append({
+                      'metricType': 'lambda_duration',
+                      'value': metric['Average'],
+                      'timestamp': metric['Timestamp'].isoformat(),
+                      'resourceType': 'lambda'
+                  })
+              
+              return metrics
+          
+          def analyze_performance(metrics):
+              """パフォーマンス分析"""
+              analysis_results = []
+              
+              for metric in metrics:
+                  result = {
+                      'metricId': str(uuid.uuid4()),
+                      'resourceType': metric['resourceType'],
+                      'metricType': metric['metricType'],
+                      'currentValue': metric['value'],
+                      'timestamp': metric['timestamp'],
+                      'threshold': float(os.environ['RESPONSE_TIME_THRESHOLD']),
+                      'status': 'normal'
+                  }
+                  
+                  # 閾値チェック
+                  if metric['value'] > result['threshold']:
+                      result['status'] = 'warning'
+                      if metric['value'] > result['threshold'] * 1.5:
+                          result['status'] = 'critical'
+                  
+                  analysis_results.append(result)
+              
+              return analysis_results
+          
+          def generate_recommendations(analysis_results):
+              """最適化推奨事項の生成"""
+              recommendations = []
+              
+              for result in analysis_results:
+                  if result['status'] != 'normal':
+                      recommendation = {
+                          'recommendationId': str(uuid.uuid4()),
+                          'resourceId': result['metricId'],
+                          'priority': result['status'],
+                          'createdAt': datetime.utcnow().isoformat(),
+                          'title': f"Performance optimization for {result['resourceType']}",
+                          'description': f"Current {result['metricType']}: {result['currentValue']}, Threshold: {result['threshold']}",
+                          'recommendedActions': get_recommended_actions(result),
+                          'status': 'pending'
+                      }
+                      recommendations.append(recommendation)
+              
+              return recommendations
+          
+          def get_recommended_actions(result):
+              """推奨アクションの取得"""
+              if result['resourceType'] == 'lambda':
+                  return [
+                      "Increase Lambda memory allocation",
+                      "Optimize code execution paths",
+                      "Implement connection pooling",
+                      "Consider provisioned concurrency"
+                  ]
+              return ["General performance optimization"]
+          
+          def save_analysis_results(metrics, recommendations):
+              """分析結果の保存"""
+              metrics_table = dynamodb.Table(os.environ['METRICS_TABLE'])
+              recommendations_table = dynamodb.Table(os.environ['RECOMMENDATIONS_TABLE'])
+              
+              # メトリクス保存
+              for metric in metrics:
+                  metric['metricId'] = str(uuid.uuid4())
+                  metric['ttl'] = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+                  metrics_table.put_item(Item=metric)
+              
+              # 推奨事項保存
+              for recommendation in recommendations:
+                  recommendation['ttl'] = int((datetime.utcnow() + timedelta(days=90)).timestamp())
+                  recommendations_table.put_item(Item=recommendation)
+          
+          def send_notifications(recommendations):
+              """通知送信"""
+              critical_recommendations = [r for r in recommendations if r['priority'] == 'critical']
+              
+              if critical_recommendations:
+                  message = f"Critical performance issues detected:\n\n"
+                  for rec in critical_recommendations:
+                      message += f"- {rec['title']}: {rec['description']}\n"
+                  
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC'],
+                      Message=message,
+                      Subject="Critical Performance Alert"
+                  )
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # 自動最適化Lambda関数（自動最適化有効時のみ）
+  AutoOptimizationFunction:
+    Type: AWS::Lambda::Function
+    Condition: UseAutoOptimization
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-auto-optimization'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoOptimizationRole.Arn
+      Timeout: 600
+      MemorySize: 1024
+      Environment:
+        Variables:
+          RECOMMENDATIONS_TABLE: !Ref OptimizationRecommendationsTable
+          SNS_TOPIC: !Ref PerformanceNotificationTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          
+          dynamodb = boto3.resource('dynamodb')
+          lambda_client = boto3.client('lambda')
+          autoscaling = boto3.client('application-autoscaling')
+          sns = boto3.client('sns')
+          
+          def lambda_handler(event, context):
+              print(f"Auto optimization started: {datetime.utcnow().isoformat()}")
+              
+              try:
+                  # 未処理の推奨事項を取得
+                  pending_recommendations = get_pending_recommendations()
+                  
+                  # 自動最適化実行
+                  optimization_results = []
+                  for recommendation in pending_recommendations:
+                      result = apply_optimization(recommendation)
+                      optimization_results.append(result)
+                  
+                  # 結果通知
+                  send_optimization_report(optimization_results)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Auto optimization completed',
+                          'optimizations_applied': len(optimization_results)
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in auto optimization: {str(e)}")
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC'],
+                      Message=f"Auto optimization error: {str(e)}",
+                      Subject="Auto Optimization Error"
+                  )
+                  raise e
+          
+          def get_pending_recommendations():
+              """未処理の推奨事項を取得"""
+              table = dynamodb.Table(os.environ['RECOMMENDATIONS_TABLE'])
+              
+              response = table.scan(
+                  FilterExpression='#status = :status',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={':status': 'pending'}
+              )
+              
+              return response['Items']
+          
+          def apply_optimization(recommendation):
+              """最適化の適用"""
+              result = {
+                  'recommendationId': recommendation['recommendationId'],
+                  'status': 'failed',
+                  'message': 'Unknown optimization type'
+              }
+              
+              try:
+                  if 'lambda' in recommendation.get('resourceId', ''):
+                      result = optimize_lambda_function(recommendation)
+                  
+                  # 推奨事項のステータス更新
+                  update_recommendation_status(recommendation['recommendationId'], result['status'])
+                  
+              except Exception as e:
+                  result['message'] = str(e)
+                  result['status'] = 'failed'
+              
+              return result
+          
+          def optimize_lambda_function(recommendation):
+              """Lambda関数の最適化"""
+              # 実際の最適化ロジックはここに実装
+              # この例では、メモリ増加のシミュレーション
+              return {
+                  'recommendationId': recommendation['recommendationId'],
+                  'status': 'completed',
+                  'message': 'Lambda memory optimized (simulation)',
+                  'actions_taken': ['Memory increased by 128MB']
+              }
+          
+          def update_recommendation_status(recommendation_id, status):
+              """推奨事項ステータスの更新"""
+              table = dynamodb.Table(os.environ['RECOMMENDATIONS_TABLE'])
+              
+              table.update_item(
+                  Key={'recommendationId': recommendation_id},
+                  UpdateExpression='SET #status = :status, updatedAt = :updated',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': status,
+                      ':updated': datetime.utcnow().isoformat()
+                  }
+              )
+          
+          def send_optimization_report(results):
+              """最適化レポートの送信"""
+              completed = [r for r in results if r['status'] == 'completed']
+              failed = [r for r in results if r['status'] == 'failed']
+              
+              message = f"Auto Optimization Report:\n\n"
+              message += f"Completed: {len(completed)}\n"
+              message += f"Failed: {len(failed)}\n\n"
+              
+              if completed:
+                  message += "Successfully Applied Optimizations:\n"
+                  for result in completed:
+                      message += f"- {result['message']}\n"
+              
+              if failed:
+                  message += "\nFailed Optimizations:\n"
+                  for result in failed:
+                      message += f"- {result['message']}\n"
+              
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC'],
+                  Message=message,
+                  Subject="Auto Optimization Report"
+              )
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ========================================
+  # IAMロール
+  # ========================================
+  # パフォーマンス分析Lambda実行ロール
+  PerformanceAnalyzerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PerformanceAnalyzerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt PerformanceMetricsTable.Arn
+                  - !Sub '${PerformanceMetricsTable.Arn}/index/*'
+                  - !GetAtt OptimizationRecommendationsTable.Arn
+                  - !Sub '${OptimizationRecommendationsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PerformanceNotificationTopic
+
+  # 自動最適化Lambda実行ロール
+  AutoOptimizationRole:
+    Type: AWS::IAM::Role
+    Condition: UseAutoOptimization
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AutoOptimizationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt OptimizationRecommendationsTable.Arn
+                  - !Sub '${OptimizationRecommendationsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:ListFunctions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - application-autoscaling:RegisterScalableTarget
+                  - application-autoscaling:PutScalingPolicy
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref PerformanceNotificationTopic
+
+  # ========================================
+  # EventBridge（スケジュール実行）
+  # ========================================
+  # パフォーマンス分析スケジュール
+  PerformanceAnalysisSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-performance-analysis'
+      Description: 'Schedule for performance analysis execution'
+      ScheduleExpression: 'rate(15 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PerformanceAnalyzerFunction.Arn
+          Id: PerformanceAnalyzerTarget
+
+  # 自動最適化スケジュール（有効時のみ）
+  AutoOptimizationSchedule:
+    Type: AWS::Events::Rule
+    Condition: UseAutoOptimization
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-auto-optimization'
+      Description: 'Schedule for auto optimization execution'
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoOptimizationFunction.Arn
+          Id: AutoOptimizationTarget
+
+  # Lambda権限（EventBridge）
+  AnalyzerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PerformanceAnalyzerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PerformanceAnalysisSchedule.Arn
+
+  OptimizationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: UseAutoOptimization
+    Properties:
+      FunctionName: !Ref AutoOptimizationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutoOptimizationSchedule.Arn
+
+  # ========================================
+  # SNS通知
+  # ========================================
+  # パフォーマンス通知トピック
+  PerformanceNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${EnvironmentName}-performance-notifications'
+      DisplayName: !Sub '${ProjectName} ${EnvironmentName} Performance Notifications'
+
+  # メール通知サブスクリプション
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PerformanceNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ========================================
+  # CloudWatch アラーム
+  # ========================================
+  # パフォーマンス分析失敗アラーム
+  AnalyzerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${EnvironmentName}-analyzer-errors'
+      AlarmDescription: Performance analyzer function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PerformanceAnalyzerFunction
+      AlarmActions:
+        - !Ref PerformanceNotificationTopic
+
+Outputs:
+  # メイン関数ARN
+  PerformanceAnalyzerFunctionArn:
+    Description: パフォーマンス分析Lambda関数ARN
+    Value: !GetAtt PerformanceAnalyzerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceAnalyzerFunction'
+
+  # 自動最適化関数ARN（条件付き）
+  AutoOptimizationFunctionArn:
+    Condition: UseAutoOptimization
+    Description: 自動最適化Lambda関数ARN
+    Value: !GetAtt AutoOptimizationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoOptimizationFunction'
+
+  # DynamoDB テーブル名
+  PerformanceMetricsTableName:
+    Description: パフォーマンスメトリクステーブル名
+    Value: !Ref PerformanceMetricsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceMetricsTable'
+
+  OptimizationRecommendationsTableName:
+    Description: 最適化推奨事項テーブル名
+    Value: !Ref OptimizationRecommendationsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-OptimizationRecommendationsTable'
+
+  # SNS通知トピック
+  PerformanceNotificationTopicArn:
+    Description: パフォーマンス通知SNSトピックARN
+    Value: !Ref PerformanceNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PerformanceNotificationTopic'
+
+  # 使用方法ガイド
+  PerformanceOptimizationUsageGuide:
+    Description: パフォーマンス最適化使用方法
+    Value: !Sub |
+      パフォーマンス最適化システムの使用方法:
+      
+      1. 手動分析実行:
+      aws lambda invoke --function-name ${PerformanceAnalyzerFunction} response.json
+      
+      2. 推奨事項確認:
+      aws dynamodb scan --table-name ${OptimizationRecommendationsTable}
+      
+      3. システム設定:
+      - 自動最適化: ${AutoOptimizationEnabled}
+      - レスポンス時間閾値: ${ResponseTimeThreshold}ms
+      - スループット閾値: ${ThroughputThreshold}/sec
+      - エラー率閾値: ${ErrorRateThreshold}%
+      - 通知先: ${NotificationEmail}
+
+  # 設定情報
+  PerformanceOptimizationConfiguration:
+    Description: パフォーマンス最適化設定情報
+    Value: !Sub |
+      Performance Optimization Configuration:
+      - Response Time Threshold: ${ResponseTimeThreshold}ms
+      - Throughput Threshold: ${ThroughputThreshold}/sec
+      - Error Rate Threshold: ${ErrorRateThreshold}%
+      - Auto Optimization: ${AutoOptimizationEnabled}
+      - Notifications: ${NotificationEmail}

@@ -2,13 +2,85 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: |
   Bedrock 画像生成システム - AI画像生成・編集基盤
   
-  このテンプレートは以下のリソースを作成します：
-  - Lambda関数（画像生成・編集・スタイル変換）
-  - API Gateway（REST・WebSocket API）
-  - S3（画像保存・バージョン管理）
-  - DynamoDB（生成履歴・リクエスト管理）
-  - SQS（非同期処理・バッチ生成）
-  - CloudFront（画像配信・CDN）
+  【システム概要】
+  Amazon Bedrockの画像生成AIモデルを活用した、スケーラブルな画像生成サービス
+  
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                    AI画像生成 アーキテクチャ                        │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │ Client → API Gateway → Lambda → Bedrock AI → S3 → CloudFront      │
+  │   ↑           ↑          ↑         ↑         ↑         ↑           │
+  │ Web UI    レート制限   非同期処理  AI推論    画像保存   CDN配信      │
+  │ Mobile    認証        SQSキュー   モデル    暗号化    グローバル     │
+  │ API       制限        バッチ処理   選択      バージョン  キャッシュ   │
+  └─────────────────────────────────────────────────────────────────────┘
+  
+  【主要コンポーネント】
+  ◆ API Gateway
+    - REST API（同期・非同期リクエスト）
+    - レート制限（ユーザー別・時間別）
+    - CORS設定（ブラウザ対応）
+    - 認証・認可（API Key）
+  
+  ◆ Lambda Functions
+    - Generation API: リクエスト受付・バリデーション・キュー送信
+    - Generation Worker: Bedrock呼び出し・画像生成・S3保存
+    - 非同期処理パターン（高スループット）
+    - 同時実行制御（コスト・リソース管理）
+  
+  ◆ Amazon Bedrock（AI推論エンジン）
+    - Stable Diffusion XL: 高品質画像生成
+    - Amazon Titan Image: 高速生成・AWS最適化
+    - プロンプトエンジニアリング対応
+    - ネガティブプロンプト・スタイル制御
+  
+  ◆ S3 + CloudFront（画像配信CDN）
+    - 生成画像保存（暗号化・バージョニング）
+    - グローバルCDN配信（低レイテンシ）
+    - ライフサイクル管理（コスト最適化）
+    - 入力画像一時保存
+  
+  ◆ DynamoDB（メタデータ管理）
+    - 生成履歴・ステータス管理
+    - レート制限カウンター
+    - GSI活用（高速検索）
+    - TTL自動削除
+  
+  ◆ SQS（非同期処理キュー）
+    - FIFO保証（順序維持）
+    - デッドレターキュー（エラー処理）
+    - 可視性タイムアウト（長時間処理対応）
+    - 重複排除（冪等性保証）
+  
+  【AI機能詳細】
+  ✓ テキストから画像生成（Text-to-Image）
+  ✓ 画像編集・変換（Image-to-Image）
+  ✓ スタイル転送
+  ✓ 解像度・アスペクト比選択
+  ✓ 品質・ステップ数調整
+  ✓ シード値制御（再現性）
+  
+  【セキュリティ機能】
+  ✓ API Key認証
+  ✓ レート制限（分・日単位）
+  ✓ 暗号化（保存時・転送時）
+  ✓ VPC分離（オプション）
+  ✓ 不適切コンテンツフィルタ
+  ✓ 監査ログ・追跡
+  
+  【スケーラビリティ】
+  ✓ オートスケーリング（Lambda・DynamoDB）
+  ✓ 同時生成数制御
+  ✓ キューイングシステム
+  ✓ CDNキャッシング
+  ✓ 地理的分散
+  
+  【コスト最適化】
+  ✓ Pay-per-use課金
+  ✓ 自動ライフサイクル管理
+  ✓ 画像圧縮・最適化
+  ✓ 使用量制限・アラート
+  ✓ リザーブドキャパシティ（オプション）
 
 Parameters:
   EnvironmentName:
@@ -33,7 +105,9 @@ Parameters:
       Bedrockセットアップスタック名
       bedrock-setup.yamlで作成されたスタック名
 
-  # 画像生成設定
+  # ========================================
+  # Bedrock AI モデル設定パラメータ
+  # ========================================
   DefaultImageModel:
     Type: String
     Default: stability.stable-diffusion-xl-v1:0
@@ -41,53 +115,122 @@ Parameters:
       - stability.stable-diffusion-xl-v1:0
       - amazon.titan-image-generator-v1
     Description: |
-      デフォルト画像生成モデル
-      - Stable Diffusion XL: 高品質・詳細画像
-      - Titan Image Generator: Amazon製・高速生成
+      デフォルト画像生成AIモデル
+      
+      【Stable Diffusion XL v1.0】
+      - 開発元: Stability AI
+      - 特徴: 最高品質の画像生成
+      - 解像度: 1024x1024まで対応
+      - 用途: アート・デザイン・クリエイティブ
+      - 処理時間: 15-30秒程度
+      - コスト: 高品質だが料金も高め
+      
+      【Amazon Titan Image Generator v1】
+      - 開発元: Amazon
+      - 特徴: AWS最適化・高速処理
+      - 解像度: 複数サイズ対応
+      - 用途: ビジネス・Webコンテンツ
+      - 処理時間: 5-15秒程度
+      - コスト: バランス型・AWS統合最適化
 
-  # 画像設定
+  # ========================================
+  # 画像品質・解像度設定パラメータ
+  # ========================================
   DefaultImageSize:
     Type: String
     Default: 1024x1024
     AllowedValues: 
-      - 512x512
-      - 768x768
-      - 1024x1024
-      - 1152x896
-      - 1216x832
-      - 1344x768
-      - 1536x640
+      - 512x512    # 低解像度・高速生成
+      - 768x768    # 中解像度・バランス型
+      - 1024x1024  # 高解像度・標準推奨
+      - 1152x896   # ポートレート向け
+      - 1216x832   # 16:10 ワイド画面
+      - 1344x768   # 21:9 超ワイド
+      - 1536x640   # パノラマ・バナー用
     Description: |
-      デフォルト画像サイズ
-      モデルによってサポートサイズが異なる
+      デフォルト画像解像度
+      
+      【解像度とパフォーマンス】
+      - 512x512: 高速生成(5-10秒)、低コスト、プロトタイプ用
+      - 768x768: 中速生成(10-20秒)、中コスト、一般用途
+      - 1024x1024: 高品質(15-30秒)、高コスト、本格用途
+      
+      【アスペクト比用途】
+      - 1:1 (1024x1024): SNS投稿、アイコン、正方形コンテンツ
+      - 4:3 (1152x896): 印刷物、プレゼンテーション
+      - 16:10 (1216x832): PC画面、Webヘッダー
+      - 21:9 (1536x640): 映画的構図、パノラマビュー
+      
+      ※モデルによりサポート解像度が異なる場合があります
 
+  # ========================================
+  # システム性能・制限設定パラメータ
+  # ========================================
   MaxConcurrentGenerations:
     Type: Number
     Default: 10
     MinValue: 1
     MaxValue: 100
     Description: |
-      同時生成可能な最大画像数
-      リクエスト制限とコスト管理
+      同時実行可能な最大画像生成数
+      
+      【パフォーマンス vs コスト】
+      - 1-5: 低コスト、順次処理、小規模サービス
+      - 10-20: バランス型、中規模サービス推奨
+      - 50-100: 高パフォーマンス、大規模サービス
+      
+      【設定の影響】
+      - Lambda予約済み同時実行数
+      - Bedrockモデル呼び出し制限
+      - 全体的なシステムコスト
+      - レスポンス時間・スループット
+      
+      ※本番環境では段階的に増加させることを推奨
 
   ImageRetentionDays:
     Type: Number
     Default: 90
     MinValue: 7
-    MaxValue: 2555
+    MaxValue: 2555  # 約7年
     Description: |
-      画像保持期間（日数）
-      自動削除によるストレージコスト最適化
+      画像自動削除期間（日数）
+      
+      【保持期間とコスト】
+      - 7-30日: 一時的コンテンツ、テスト環境
+      - 90日: 標準的なWebコンテンツ（推奨）
+      - 365日: 重要なビジネスコンテンツ
+      - 2555日: アーカイブ・法的要件対応
+      
+      【ストレージクラス移行】
+      - 0-30日: S3 Standard（高速アクセス）
+      - 30-90日: S3 IA（中頻度アクセス）
+      - 90日以降: S3 Glacier（アーカイブ）
+      
+      ※削除後は復元不可、バックアップ戦略を検討
 
-  # API制限設定
+  # ========================================
+  # APIレート制限・コスト制御パラメータ
+  # ========================================
   ApiRateLimit:
     Type: Number
     Default: 60
     MinValue: 10
     MaxValue: 1000
     Description: |
-      API レート制限（リクエスト/分）
-      ユーザー当たりの制限
+      APIレート制限（リクエスト/分）
+      
+      【ユーザー体験とコストのバランス】
+      - 10-30リクエスト/分: 低コスト、個人用途
+      - 60リクエスト/分: 標準的なビジネス用途（推奨）
+      - 100-300リクエスト/分: 大量バッチ処理
+      - 500-1000リクエスト/分: エンタープライズ用途
+      
+      【適用スコープ】
+      - 個別ユーザー単位での制限
+      - スライディングウィンドウ方式
+      - DynamoDBでカウンター管理
+      
+      ※本番環境ではユーザーグループ別制限も検討
 
   DailyGenerationLimit:
     Type: Number
@@ -95,73 +238,117 @@ Parameters:
     MinValue: 10
     MaxValue: 10000
     Description: |
-      日次生成制限（画像/日）
-      コスト制御とリソース管理
+      日次画像生成上限（画像/日）
+      
+      【コスト管理戦略】
+      - 10-50画像/日: 個人・スタートアップ用
+      - 100画像/日: 中小企業・チーム用（推奨）
+      - 500画像/日: 大企業・マーケティングチーム
+      - 1000-10000画像/日: エンタープライズ・コンテンツ作成業務
+      
+      【コスト試算例】
+      - 100画像/日 x 30日 = 3000画像/月
+      - Stable Diffusion: 約$150-300/月
+      - Titan Image: 約$75-150/月
+      
+      【管理機能】
+      - TTL自動リセット（日本時間0:00）
+      - 超過時通知アラート
+      - 使用量ダッシュボード
 
 Conditions:
-  # 本番環境かどうか
+  # ========================================
+  # 環境別条件分岐
+  # パフォーマンス、セキュリティ、コスト設定の動的切り替え
+  # ========================================
+  
+  # 本番環境判定（高パフォーマンス設定用）
   IsProduction: !Equals [!Ref EnvironmentName, 'prod']
 
 Resources:
   # ========================================
   # S3バケット（画像保存・配信）
   # ========================================
-  # 生成画像保存バケット
+  # ========================================
+  # S3 ストレージシステム
+  # マルチティアコンテンツのライフサイクル管理
+  # ========================================
+  
+  # 生成画像メインストレージ（CDN配信用）
   GeneratedImagesBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub '${ProjectName}-${EnvironmentName}-images-${AWS::AccountId}'
+      
+      # CDN配信用パブリックアクセス設定
+      # CloudFront OAI経由でのみアクセス許可
       PublicAccessBlockConfiguration:
-        BlockPublicAcls: false
-        BlockPublicPolicy: false
-        IgnorePublicAcls: false
-        RestrictPublicBuckets: false
+        BlockPublicAcls: false        # OAIアクセスのためfalse
+        BlockPublicPolicy: false      # CloudFrontポリシー用
+        IgnorePublicAcls: false       # 細かい制御用
+        RestrictPublicBuckets: false  # CDN配信のため
+      
+      # エンタープライズグレード暗号化
+      # BedrockスタックからインポートしたKMSキー使用
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
+              SSEAlgorithm: aws:kms     # KMS暗号化（最高セキュリティ）
               KMSMasterKeyID: 
                 Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKey'
-            BucketKeyEnabled: true
+            BucketKeyEnabled: true      # コスト最適化用
+      
+      # バージョニング（本番のみ有効）
       VersioningConfiguration:
         Status: !If [IsProduction, Enabled, Suspended]
+      
+      # コスト最適化ライフサイクルルール
       LifecycleConfiguration:
         Rules:
+          # ステップ1: 標準ストレージ → 低頻度アクセス
           - Id: TransitionToIA
             Status: Enabled
             Transition:
-              StorageClass: STANDARD_IA
+              StorageClass: STANDARD_IA  # 30日後に68%コスト削減
               TransitionInDays: 30
+          # ステップ2: IA → アーカイブストレージ
           - Id: TransitionToGlacier
             Status: Enabled
             Transition:
-              StorageClass: GLACIER
+              StorageClass: GLACIER      # 90日後に85%コスト削減
               TransitionInDays: 90
+          # ステップ3: 最終自動削除
           - Id: DeleteOldImages
             Status: Enabled
-            ExpirationInDays: !Ref ImageRetentionDays
+            ExpirationInDays: !Ref ImageRetentionDays  # 設定可能な保持期間
+      # CORS設定（ブラウザからの直接アクセス用）
       CorsConfiguration:
         CorsRules:
-          - AllowedHeaders: ['*']
-            AllowedMethods: [GET, HEAD]
-            AllowedOrigins: ['*']
-            MaxAge: 3600
+          - AllowedHeaders: ['*']       # 全ヘッダー許可
+            AllowedMethods: [GET, HEAD] # 読み取りのみ許可
+            AllowedOrigins: ['*']       # 全ドメイン許可（本番では制限推奨）
+            MaxAge: 3600                # 1時間キャッシュ
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
 
-  # オリジナル/入力画像保存バケット
+  # 入力画像一時ストレージ（プライベート）
+  # Image-to-Image機能やアップロード用の一時保存
   InputImagesBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub '${ProjectName}-${EnvironmentName}-inputs-${AWS::AccountId}'
+      
+      # 完全プライベートアクセス（入力画像保護）
       PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
+        BlockPublicAcls: true         # パブリックACL完全禁止
+        BlockPublicPolicy: true       # パブリックポリシー禁止
+        IgnorePublicAcls: true        # パブリックACL無視
+        RestrictPublicBuckets: true   # パブリックアクセス完全制限
+      
+      # 入力画像も同様にKMS暗号化
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -169,11 +356,13 @@ Resources:
               KMSMasterKeyID: 
                 Fn::ImportValue: !Sub '${BedrockStackName}-BedrockKMSKey'
             BucketKeyEnabled: true
+      
+      # 入力画像は短期保持（一時アップロード用）
       LifecycleConfiguration:
         Rules:
           - Id: DeleteOldInputs
             Status: Enabled
-            ExpirationInDays: !Ref ImageRetentionDays
+            ExpirationInDays: !Ref ImageRetentionDays  # 生成画像と同期間保持
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -181,9 +370,11 @@ Resources:
           Value: !Ref ProjectName
 
   # ========================================
-  # CloudFront 配信
+  # CloudFront CDN 配信システム
+  # グローバルエッジキャッシュで高速画像配信
   # ========================================
-  # 画像配信用CloudFront
+  
+  # メインCDNディストリビューション
   ImageCDN:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -191,28 +382,46 @@ Resources:
         Enabled: true
         Comment: !Sub '${ProjectName} ${EnvironmentName} Image CDN'
         DefaultRootObject: index.html
+        
+        # オリジン設定（S3バケット接続）
         Origins:
           - Id: S3Origin
             DomainName: !GetAtt GeneratedImagesBucket.DomainName
+            # OAI経由でセキュアアクセス（S3直接アクセス禁止）
             S3OriginConfig:
               OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        
+        # デフォルトキャッシュ動作（全パス対象）
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
-          ViewerProtocolPolicy: redirect-to-https
-          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
-          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # Managed-CORS-S3Origin
-          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03  # Managed-SecurityHeadersPolicy
+          ViewerProtocolPolicy: redirect-to-https  # HTTP→HTTPS自動リダイレクト
+          # AWS管理ポリシー使用（パフォーマンス最適化済み）
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # キャッシュ最適化
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3対応
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03  # セキュリティヘッダー
+        
+        # APIパス専用キャッシュ設定（動的コンテンツ用）
         CacheBehaviors:
-          - PathPattern: '/api/*'
+          - PathPattern: '/api/*'                   # APIパスのみ対象
             TargetOriginId: S3Origin
-            ViewerProtocolPolicy: https-only
-            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingDisabled
+            ViewerProtocolPolicy: https-only        # HTTPS強制
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # キャッシュ無効
             OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+        
+        # 料金クラス（地理的配信範囲）
         PriceClass: !If [IsProduction, 'PriceClass_All', 'PriceClass_100']
+        # 本番: 全世界配信、開発: 主要地域のみ（コスト最適化）
+        
+        # SSL証明書設定
         ViewerCertificate:
-          CloudFrontDefaultCertificate: true
-        HttpVersion: http2
-        IPV6Enabled: true
+          CloudFrontDefaultCertificate: true        # デフォルト証明書使用
+          # 本番では独自ドメイン・ACM証明書推奨
+        
+        # プロトコルバージョン設定
+        HttpVersion: http2                          # HTTP/2有効（パフォーマンス向上）
+        IPV6Enabled: true                           # IPv6対応
+        
+        # アクセスログ（本番環境のみ）
         Logging: !If 
           - IsProduction
           - Bucket: !GetAtt AccessLogsBucket.DomainName
@@ -224,14 +433,18 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # CloudFront OAI
+  # CloudFront Origin Access Identity（S3セキュアアクセス用）
   CloudFrontOAI:
-    Type: AWS::CloudFront::OriginAccessIdentity
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
     Properties:
       OriginAccessIdentityConfig:
         Comment: !Sub '${ProjectName} ${EnvironmentName} OAI'
+        # OAIの役割:
+        # 1. S3バケットへの直接アクセスを禁止
+        # 2. CloudFront経由のみアクセス許可
+        # 3. ホットリンキング防止、帯域制御
 
-  # S3バケットポリシー（CloudFront専用アクセス）
+  # S3バケットアクセスポリシー（CloudFront OAI専用）
   GeneratedImagesBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -240,10 +453,11 @@ Resources:
         Statement:
           - Sid: AllowCloudFrontAccess
             Effect: Allow
+            # CloudFront OAIのみアクセス許可（他は全て拒否）
             Principal:
               AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOAI}'
-            Action: 's3:GetObject'
-            Resource: !Sub '${GeneratedImagesBucket}/*'
+            Action: 's3:GetObject'      # 読み取りのみ許可
+            Resource: !Sub '${GeneratedImagesBucket}/*'  # 全オブジェクト対象
 
   # アクセスログ用バケット（本番環境のみ）
   AccessLogsBucket:
@@ -268,73 +482,101 @@ Resources:
           Value: !Ref ProjectName
 
   # ========================================
-  # DynamoDB テーブル（生成履歴・管理）
+  # DynamoDB メタデータ管理システム
+  # 生成履歴、ステータス管理、レート制限カウンター
   # ========================================
-  # 画像生成履歴テーブル
+  
+  # 画像生成メイン履歴テーブル
   ImageGenerationHistoryTable:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub '${ProjectName}-${EnvironmentName}-generation-history'
+      
+      # コスト最適化課金モード（予測不可能なワークロードに最適）
       BillingMode: PAY_PER_REQUEST
+      
+      # テーブルスキーマ属性定義（インデックス用のみ）
       AttributeDefinitions:
-        - AttributeName: generationId
+        - AttributeName: generationId  # 一意生成ID（UUID）
           AttributeType: S
-        - AttributeName: userId
+        - AttributeName: userId        # ユーザーID（GSI用）
           AttributeType: S
-        - AttributeName: createdAt
+        - AttributeName: createdAt     # 作成日時（ソート用）
           AttributeType: S
-        - AttributeName: status
+        - AttributeName: status        # 処理状態（pending/processing/completed/failed）
           AttributeType: S
+      
+      # プライマリキー（個別レコードアクセス用）
       KeySchema:
         - AttributeName: generationId
-          KeyType: HASH
+          KeyType: HASH              # パーティションキー
+      
+      # グローバルセカンダリインデックス（高速検索用）
       GlobalSecondaryIndexes:
+        # ユーザー別履歴検索インデックス
         - IndexName: UserHistoryIndex
           KeySchema:
-            - AttributeName: userId
+            - AttributeName: userId      # ユーザー別分類
               KeyType: HASH
-            - AttributeName: createdAt
+            - AttributeName: createdAt   # 時系列ソート（新しい順）
               KeyType: RANGE
           Projection:
-            ProjectionType: ALL
+            ProjectionType: ALL          # 全属性投影（追加クエリ不要）
+        
+        # 状態別ジョブ管理インデックス
         - IndexName: StatusIndex
           KeySchema:
-            - AttributeName: status
+            - AttributeName: status      # 処理状態別分類
               KeyType: HASH
-            - AttributeName: createdAt
+            - AttributeName: createdAt   # 古い順で処理管理
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
+      
+      # TTL自動削除（ストレージコスト最適化）
       TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
+        AttributeName: ttl             # UNIXタイムスタンプ属性
+        Enabled: true                  # 自動期限削除有効
+      
+      # DynamoDB Streams（リアルタイム処理用）
       StreamSpecification:
-        StreamViewType: NEW_AND_OLD_IMAGES
+        StreamViewType: NEW_AND_OLD_IMAGES  # 変更前後両方記録
+        # 用途: 状態変更監視、統計情報更新、通知連携
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
 
-  # レート制限管理テーブル
+  # レート制限カウンター管理テーブル
   RateLimitTable:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub '${ProjectName}-${EnvironmentName}-rate-limits'
       BillingMode: PAY_PER_REQUEST
+      
+      # シンプルなカウンターテーブル構造
       AttributeDefinitions:
-        - AttributeName: userId
+        - AttributeName: userId        # ユーザーID（パーティションキー）
           AttributeType: S
-        - AttributeName: limitType
+        - AttributeName: limitType     # 制限タイプ（minute:YYYYMMDDHHMM, day:YYYYMMDD）
           AttributeType: S
+      
+      # 複合キー（ユーザー + 時間単位）
       KeySchema:
         - AttributeName: userId
-          KeyType: HASH
-        - AttributeName: limitType
+          KeyType: HASH              # ユーザー別分散
+        - AttributeName: limitType   # 時間窓別管理
           KeyType: RANGE
+      
+      # 自動期限削除（メモリリーク防止）
       TimeToLiveSpecification:
-        AttributeName: ttl
+        AttributeName: ttl           # 分カウンター: 2分後、日カウンター: 2日後
         Enabled: true
+      
+      # データ例:
+      # userId="user123", limitType="minute:202412311230" → count=5
+      # userId="user123", limitType="day:20241231" → count=45
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName

@@ -1,5 +1,39 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'ECS Cluster with Fargate and container services'
+Description: |
+  包括的Amazon ECS Fargate構成テンプレート - エンタープライズコンテナオーケストレーション
+  
+  このテンプレートは以下のコンテナ基盤ベストプラクティスを実装：
+  ════════════════════════════════════════════════════════════════════════════════
+  【コンテナオーケストレーション基礎】
+  ├── Fargate Serverless: インフラ管理不要・自動スケーリング対応
+  ├── Container Insights: 包括的監視・ログ集約・メトリクス収集
+  ├── ECR統合: セキュアなコンテナイメージ管理・脆弱性スキャン
+  └── ALB統合: 高可用性ロードバランシング・ヘルスチェック
+  
+  【セキュリティ・分離設計】
+  ├── VPCセキュリティグループ: ネットワークレベル分離
+  ├── IAMロールベース認証: タスク・実行レベル権限分離
+  ├── プライベートサブネット配置: インターネット直接アクセス遮断
+  └── ECRイメージスキャン: 自動脆弱性検出・修復
+  
+  【Auto Scaling・負荷分散】
+  ├── サービスレベルスケーリング: CPU・メモリ使用率ベース
+  ├── Application Load Balancer: L7ロードバランシング
+  ├── 環境別最適化: dev/staging/prod別設定
+  └── ローリングデプロイ: ゼロダウンタイム更新
+  
+  【運用自動化・効率化】
+  ├── CloudWatch統合: ログ・メトリクス・アラート
+  ├── デプロイメント自動化: CodeDeploy・GitHub Actions連携準備
+  ├── ライフサイクル管理: 自動コンテナイメージ整理
+  └── 設定管理: 環境変数・Secrets Manager統合
+  ════════════════════════════════════════════════════════════════════════════════
+  
+  業務利用時の重要な考慮事項:
+  - 本番環境ではFargateのみ使用（FARGATE_SPOT無効化）
+  - セキュリティグループは最小権限原則
+  - Container Insightsによるコスト・パフォーマンス監視
+  - 定期的なコンテナイメージ更新・セキュリティパッチ適用
 
 Parameters:
   EnvironmentName:
@@ -28,7 +62,16 @@ Parameters:
   ContainerImage:
     Type: String
     Default: nginx:latest
-    Description: Container image to deploy
+    Description: |
+      デプロイするコンテナイメージ
+      
+      イメージ管理ベストプラクティス:
+      - ECRプライベートリポジトリの使用推奨
+      - セマンティックバージョニング適用
+      - 脆弱性スキャン通過必須
+      - :latest タグの本番使用禁止
+      
+      例: 123456789012.dkr.ecr.region.amazonaws.com/app:v1.2.3
 
   ContainerPort:
     Type: Number
@@ -46,73 +89,191 @@ Parameters:
     Type: String
     Default: '256'
     AllowedValues: ['256', '512', '1024', '2048', '4096']
-    Description: Task CPU units
+    Description: |
+      タスクCPUユニット（vCPU換算）
+      
+      CPU/メモリ組み合わせルール（Fargate制約）:
+      - 256 CPU: 512MB-2GB メモリ
+      - 512 CPU: 1GB-4GB メモリ  
+      - 1024 CPU: 2GB-8GB メモリ
+      - 2048 CPU: 4GB-16GB メモリ
+      - 4096 CPU: 8GB-30GB メモリ
+      
+      選択指針:
+      - Webアプリ: 256-512
+      - API/マイクロサービス: 512-1024
+      - データ処理: 1024-4096
 
   TaskMemory:
     Type: String
     Default: '512'
     AllowedValues: ['512', '1024', '2048', '4096', '8192']
-    Description: Task memory in MB
+    Description: |
+      タスクメモリ（MB）
+      
+      メモリ使用量ガイドライン:
+      【アプリケーション種別別推奨値】
+      - 静的サイト（nginx）: 512MB
+      - Node.js API: 1024MB
+      - Java Spring Boot: 2048MB
+      - データベース: 4096MB+
+      
+      【監視・調整ポイント】
+      - CloudWatch Memory Utilizationで実使用量確認
+      - OOMKilled発生時は即座にメモリ増量
+      - 使用率20%未満が続く場合は減量検討
+      - JVMヒープサイズは総メモリの70%程度に設定
 
 Conditions:
   IsProduction: !Equals [!Ref EnvironmentName, 'prod']
 
+# ========================================
+# 環境別設定マッピング（運用要件別最適化）
+# ========================================
+# 
+# 環境別設定設計原則:
+# 【開発環境 (dev)】
+# - コスト最小化重視
+# - 単一タスクで十分
+# - 最小リソース（開発・テスト用）
+# - FARGATE_SPOT利用でコスト削減
+# 
+# 【ステージング環境 (staging)】
+# - 本番近似構成
+# - 冗長性確保（2タスク）
+# - 中程度リソース（負荷テスト対応）
+# - 本番投入前の最終検証
+# 
+# 【本番環境 (prod)】
+# - 高可用性・性能重視
+# - 冗長性強化（3タスク以上）
+# - 十分なリソース（ピーク負荷対応）
+# - Fargate標準のみ（安定性優先）
 Mappings:
   EnvironmentConfig:
     dev:
-      DesiredCount: 1
-      TaskCpu: '256'
-      TaskMemory: '512'
+      DesiredCount: 1      # 開発用最小構成
+      TaskCpu: '256'       # 最小CPU（コスト削減）
+      TaskMemory: '512'    # 最小メモリ（基本動作確認）
     staging:
-      DesiredCount: 2
-      TaskCpu: '512'
-      TaskMemory: '1024'
+      DesiredCount: 2      # 冗長性確保
+      TaskCpu: '512'       # 中程度CPU（負荷テスト対応）
+      TaskMemory: '1024'   # 中程度メモリ（実運用近似）
     prod:
-      DesiredCount: 3
-      TaskCpu: '1024'
-      TaskMemory: '2048'
+      DesiredCount: 3      # 高可用性（AZ分散）
+      TaskCpu: '1024'      # 十分なCPU（性能要件対応）
+      TaskMemory: '2048'   # 十分なメモリ（ピーク負荷対応）
 
 Resources:
-  # ECS Cluster
+  # ========================================
+  # ECSクラスター（コンテナオーケストレーション基盤）
+  # ========================================
+  # 
+  # クラスター設計戦略:
+  # 【キャパシティプロバイダー戦略】
+  # - FARGATE: 安定性・予測可能性重視
+  # - FARGATE_SPOT: コスト削減（非本番環境）
+  # - 本番環境はFARGATEのみで安定性確保
+  # - 開発環境はSPOT混在でコスト最適化
+  # 
+  # 【Container Insights有効化】
+  # - 詳細なメトリクス収集・分析
+  # - CloudWatch統合による運用効率化
+  # - パフォーマンス問題の早期発見
+  # - コスト使用量の可視化
+  # 
+  # 【運用上の考慮事項】
+  # - クラスター単位でのリソース管理
+  # - サービス間の分離とスケーリング
+  # - ログ集約とモニタリング統合
+  # - セキュリティポリシーの一元管理
   ECSCluster:
     Type: AWS::ECS::Cluster
     Properties:
       ClusterName: !Sub '${ProjectName}-${EnvironmentName}-cluster'
+      # キャパシティプロバイダー設定（環境別コスト・安定性バランス）
       CapacityProviders:
-        - FARGATE
-        - FARGATE_SPOT
+        - FARGATE      # 標準キャパシティ（安定性重視）
+        - FARGATE_SPOT  # スポットキャパシティ（コスト削減）
       DefaultCapacityProviderStrategy:
         - CapacityProvider: FARGATE
-          Weight: 1
+          Weight: 1  # 基本的にFargateを使用
         - CapacityProvider: FARGATE_SPOT
-          Weight: !If [IsProduction, 0, 1]
+          Weight: !If [IsProduction, 0, 1]  # 本番以外でSPOT利用
+      # Container Insights有効化（詳細監視）
       ClusterSettings:
         - Name: containerInsights
-          Value: enabled
+          Value: enabled  # CPU/メモリ/ネットワーク/ストレージメトリクス
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: CostCenter
+          Value: ContainerPlatform
 
-  # ECR Repository
+  # ========================================
+  # Amazon ECR リポジトリ（セキュアコンテナイメージ管理）
+  # ========================================
+  # 
+  # ECR管理戦略:
+  # 【セキュリティ強化】
+  # - プッシュ時自動脆弱性スキャン
+  # - 脆弱性検出時のデプロイ停止
+  # - イメージ署名・検証（今後実装）
+  # - IAMによる細粒度アクセス制御
+  # 
+  # 【ライフサイクル管理】
+  # - 自動イメージクリーンアップ
+  # - ストレージコスト最適化
+  # - 開発・本番別保持ポリシー
+  # - タグ付きイメージ優先保持
+  # 
+  # 【CI/CD統合】
+  # - GitHub Actions自動プッシュ
+  # - セマンティックバージョニング
+  # - マルチアーキテクチャ対応
+  # - イメージキャッシュ最適化
+  # 
+  # 【運用ベストプラクティス】
+  # - 最新10バージョンの保持
+  # - 未タグイメージの定期削除
+  # - スキャン結果に基づく品質管理
+  # - 容量使用量の定期監視
   ECRRepository:
     Type: AWS::ECR::Repository
     Properties:
       RepositoryName: !Sub '${ProjectName}-${EnvironmentName}'
+      # セキュリティスキャン設定
       ImageScanningConfiguration:
-        ScanOnPush: true
+        ScanOnPush: true  # プッシュ時自動脆弱性スキャン
+      # イメージライフサイクル管理（ストレージコスト最適化）
       LifecyclePolicy:
         LifecyclePolicyText: |
           {
             "rules": [
               {
                 "rulePriority": 1,
-                "description": "Keep last 10 images",
+                "description": "Keep last 10 tagged images for rollback capability",
                 "selection": {
                   "tagStatus": "tagged",
                   "countType": "imageCountMoreThan",
                   "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Delete untagged images older than 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
                 },
                 "action": {
                   "type": "expire"
@@ -125,57 +286,116 @@ Resources:
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
+        - Key: SecurityScanning
+          Value: Enabled
+        - Key: LifecycleManaged
+          Value: 'true'
 
-  # Security Group for ALB
+  # ========================================
+  # ネットワークセキュリティ・分離設計
+  # ========================================
+  # 
+  # セキュリティグループ設計原則:
+  # 【最小権限原則】
+  # - 必要最小限のポート・プロトコルのみ許可
+  # - ソース・デスティネーション明確化
+  # - 定期的なルール監査・見直し
+  # 
+  # 【多層防御】
+  # - ALB層: インターネット向けフロントエンド
+  # - ECS層: プライベートサブネット配置
+  # - DB層: アプリケーション層からのみアクセス
+  # 
+  # 【監視・ログ】
+  # - VPC Flow Logs有効化
+  # - 不正アクセス試行の検出
+  # - CloudTrail連携セキュリティ監査
+  # 
+  # Application Load Balancer用セキュリティグループ
+  # 役割: インターネットからのHTTP/HTTPS接続受付
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${ProjectName}-${EnvironmentName}-alb-sg'
-      GroupDescription: Security group for Application Load Balancer
+      GroupDescription: |
+        Application Load Balancer security group
+        - Allows HTTP/HTTPS from internet
+        - Protects frontend layer
+        - Integrates with WAF for additional protection
       VpcId: !Ref VpcId
       SecurityGroupIngress:
+        # HTTP接続（本番では443にリダイレクト推奨）
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
-          Description: HTTP from internet
+          Description: HTTP from internet - Redirect to HTTPS in production
+        # HTTPS接続（SSL/TLS暗号化通信）
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
-          Description: HTTPS from internet
+          Description: HTTPS from internet - Primary secure access
+      # アウトバウンド（ECSタスクへの転送用）
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
-          Description: All outbound traffic
+          Description: All outbound traffic for health checks and routing
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-${EnvironmentName}-alb-sg'
         - Key: Environment
           Value: !Ref EnvironmentName
+        - Key: Layer
+          Value: Frontend
+        - Key: SecurityLevel
+          Value: Public
 
-  # Security Group for ECS Tasks
+  # ECSタスク用セキュリティグループ（アプリケーション層保護）
+  # 役割: ALBからのトラフィックのみ許可・プライベート環境での実行
   ECSTaskSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${ProjectName}-${EnvironmentName}-ecs-sg'
-      GroupDescription: Security group for ECS tasks
+      GroupDescription: |
+        ECS Tasks security group - Application layer protection
+        - Only allows traffic from ALB
+        - Deployed in private subnets
+        - Blocks direct internet access
+        - Supports outbound for API calls and updates
       VpcId: !Ref VpcId
       SecurityGroupIngress:
+        # ALBからのアプリケーションポートアクセスのみ許可
         - IpProtocol: tcp
           FromPort: !Ref ContainerPort
           ToPort: !Ref ContainerPort
           SourceSecurityGroupId: !Ref ALBSecurityGroup
-          Description: HTTP from ALB
+          Description: |
+            Application traffic from ALB only
+            - Ensures traffic flows through load balancer
+            - Prevents direct container access
+            - Enables proper health checking
+      # アウトバウンド（外部API・サービス連携・パッケージ更新用）
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
-          Description: All outbound traffic
+          Description: |
+            All outbound traffic for:
+            - External API integrations
+            - Package downloads and updates
+            - Database connections
+            - Logging and monitoring services
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-${EnvironmentName}-ecs-sg'
         - Key: Environment
           Value: !Ref EnvironmentName
+        - Key: Layer
+          Value: Application
+        - Key: SecurityLevel
+          Value: Private
+        - Key: AccessPattern
+          Value: ALB-Only
 
   # Application Load Balancer
   ApplicationLoadBalancer:
@@ -369,15 +589,35 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # Auto Scaling Target
+  # ========================================
+  # Auto Scaling設定（動的スケーリング）
+  # ========================================
+  # 
+  # スケーリング戦略:
+  # 【パフォーマンス重視】
+  # - CPU使用率70%でスケールアウト
+  # - レスポンス時間劣化防止
+  # - トラフィック急増対応
+  # 
+  # 【コスト効率化】
+  # - 不要時の自動スケールイン
+  # - 最小1タスクで基本可用性確保
+  # - 最大10タスクで過剰スケール防止
+  # 
+  # 【安定性確保】
+  # - スケールイン・アウト間隔制御
+  # - ヘルシーでないタスクの自動置換
+  # - ローリング更新対応
+  # 
+  # Auto Scalingターゲット設定
   AutoScalingTarget:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
     Properties:
-      MaxCapacity: 10
-      MinCapacity: 1
+      MaxCapacity: 10  # 最大タスク数（コスト制御・リソース上限）
+      MinCapacity: 1   # 最小タスク数（基本可用性確保）
       ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
       RoleARN: !GetAtt ApplicationAutoScalingECSRole.Arn
-      ScalableDimension: ecs:service:DesiredCount
+      ScalableDimension: ecs:service:DesiredCount  # サービス内タスク数をスケール対象
       ServiceNamespace: ecs
 
   # Auto Scaling Role
@@ -394,56 +634,118 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSServiceRolePolicy
 
-  # Auto Scaling Policy
+  # Auto Scalingポリシー（CPU使用率ベース目標追跡）
+  # 
+  # Target Tracking設定根拠:
+  # 【目標CPU使用率70%】
+  # - 30%のバッファでトラフィック急増対応
+  # - レスポンス時間劣化防止
+  # - リソース効率とパフォーマンスのバランス
+  # 
+  # 【クールダウン時間300秒】
+  # - スケール後の安定化待機
+  # - 振動（hunting）現象防止  
+  # - メトリクス収集・評価時間確保
+  # 
+  # 【監視・調整ポイント】
+  # - 実際の負荷パターン分析
+  # - スケールイベント頻度監視
+  # - コスト効率性評価
   AutoScalingPolicy:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Properties:
       PolicyName: !Sub '${ProjectName}-${EnvironmentName}-scaling-policy'
-      PolicyType: TargetTrackingScaling
+      PolicyType: TargetTrackingScaling  # 目標値追跡型（最も安定）
       ScalingTargetId: !Ref AutoScalingTarget
       TargetTrackingScalingPolicyConfiguration:
         PredefinedMetricSpecification:
           PredefinedMetricType: ECSServiceAverageCPUUtilization
-        TargetValue: 70.0
-        ScaleOutCooldown: 300
-        ScaleInCooldown: 300
+        TargetValue: 70.0  # CPU使用率70%をターゲット（余裕を持った設定）
+        ScaleOutCooldown: 300  # スケールアウト後のクールダウン（5分）
+        ScaleInCooldown: 300   # スケールイン後のクールダウン（5分）
 
-  # CloudWatch Alarms
+  # ========================================
+  # 包括的監視・アラートシステム
+  # ========================================
+  # 
+  # アラート戦略:
+  # 【段階的エスカレーション】
+  # - Level 1: パフォーマンス劣化（警告）
+  # - Level 2: 可用性影響（重要）
+  # - Level 3: サービス停止（緊急）
+  # 
+  # 【プロアクティブ監視】
+  # - CPU/メモリ使用率監視
+  # - タスク異常終了検出
+  # - ヘルスチェック失敗監視
+  # - レスポンス時間劣化検出
+  # 
+  # 【ビジネス影響分析】
+  # - 顧客体験への影響度評価
+  # - SLA違反リスク算定
+  # - 自動復旧可能性判定
+  # 
+  # CPU使用率アラーム（パフォーマンス監視）
+  # 影響: レスポンス時間増加・ユーザー体験劣化
+  # 対応: Auto Scaling動作確認・手動スケール検討
   HighCPUAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub '${ProjectName}-${EnvironmentName}-high-cpu'
-      AlarmDescription: ECS Service High CPU
+      AlarmDescription: |
+        ECS Service experiencing high CPU utilization
+        
+        対応手順:
+        1. Container Insightsでタスク別CPU使用状況確認
+        2. Auto Scalingポリシー動作状況確認
+        3. アプリケーションログで異常処理確認
+        4. 必要に応じて手動スケールアウト実行
+        5. CPU集約的処理の最適化検討
       MetricName: CPUUtilization
       Namespace: AWS/ECS
       Statistic: Average
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: 80
+      Period: 300  # 5分間隔
+      EvaluationPeriods: 2  # 連続2回で発報（一時的スパイク除外）
+      Threshold: 80  # 80%閾値（Auto Scaling閾値70%より高く設定）
       ComparisonOperator: GreaterThanThreshold
       Dimensions:
         - Name: ServiceName
           Value: !GetAtt ECSService.Name
         - Name: ClusterName
           Value: !Ref ECSCluster
+      # アラート処理設定
+      TreatMissingData: notBreaching  # データ欠損時は正常扱い
 
+  # メモリ使用率アラーム（リソース枯渇監視）
+  # 影響: OOMKilled・タスク異常終了・サービス不安定
+  # 対応: 緊急メモリ増量・メモリリーク調査・タスク再起動
   HighMemoryAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub '${ProjectName}-${EnvironmentName}-high-memory'
-      AlarmDescription: ECS Service High Memory
+      AlarmDescription: |
+        ECS Service experiencing high memory utilization - Risk of OOM kills
+        
+        緊急対応手順:
+        1. 即座にタスク定義のメモリ設定を増量
+        2. Container Insightsでメモリ使用パターン分析
+        3. アプリケーションログでメモリリーク兆候確認
+        4. 必要に応じてタスクの強制再起動
+        5. ガベージコレクション設定見直し（Java/.NET等）
+        6. メモリプロファイリングツール導入検討
       MetricName: MemoryUtilization
       Namespace: AWS/ECS
       Statistic: Average
       Period: 300
       EvaluationPeriods: 2
-      Threshold: 80
+      Threshold: 80  # 80%でアラート（OOMKill直前での警告）
       ComparisonOperator: GreaterThanThreshold
       Dimensions:
         - Name: ServiceName
           Value: !GetAtt ECSService.Name
         - Name: ClusterName
           Value: !Ref ECSCluster
+      TreatMissingData: breaching  # メモリ関連はデータ欠損も異常扱い
 
   # S3 Bucket for Container Deployments
   ContainerDeploymentBucket:

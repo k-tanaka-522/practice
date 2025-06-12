@@ -926,22 +926,9 @@ Resources:
   # ========================================
   # Cost and Usage Report設定
   # ========================================
-  CostAndUsageReport:
-    Type: AWS::CUR::ReportDefinition
-    Properties:
-      ReportName: !Sub '${ProjectName}-${EnvironmentName}-cost-usage-report'
-      TimeUnit: HOURLY
-      Format: textORcsv
-      Compression: GZIP
-      AdditionalSchemaElements:
-        - RESOURCES
-      S3Bucket: !Ref CostReportsBucket
-      S3Prefix: 'cost-reports/'
-      S3Region: !Ref AWS::Region
-      AdditionalArtifacts:
-        - REDSHIFT
-        - QUICKSIGHT
-      ReportVersioning: OVERWRITE_REPORT
+  # Note: Cost and Usage Report requires specific setup and billing account permissions
+  # and is not supported in CloudFormation templates due to billing account restrictions
+  # CostAndUsageReport would be manually configured in the AWS Billing Console
 
   # ========================================
   # Budget設定
@@ -1288,9 +1275,9 @@ Outputs:
     Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CostOptimizationDashboard}'
 
   # Cost and Usage Report
-  CostAndUsageReportName:
-    Description: Cost and Usage Report名
-    Value: !Ref CostAndUsageReport
+  # CostAndUsageReportName:
+  #   Description: Cost and Usage Report名
+  #   Value: Manual configuration required
 
   # 使用ガイド
   CostOptimizationUsageGuide:

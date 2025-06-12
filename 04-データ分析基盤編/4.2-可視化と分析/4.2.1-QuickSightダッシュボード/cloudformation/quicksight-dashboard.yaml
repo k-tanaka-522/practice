@@ -91,17 +91,8 @@ Resources:
   # ========================================
   # QuickSight アカウント設定
   # ========================================
-  # QuickSight アカウント（新規作成の場合）
-  QuickSightAccount:
-    Type: AWS::QuickSight::AccountCustomization
-    Condition: CreateQuickSightAccount
-    Properties:
-      AwsAccountId: !Ref AWS::AccountId
-      DefaultTheme: !If [IsEnterprise, 'MIDNIGHT', 'CLASSIC']
-      DefaultEmailCustomizationTemplate: !If 
-        - IsEnterprise
-        - !Ref EmailCustomization
-        - !Ref AWS::NoValue
+  # 注意: QuickSightアカウントの設定は手動で行ってください
+  # aws quicksight create-account-subscription --edition STANDARD --authentication-method IAM_AND_QUICKSIGHT
 
   # メール カスタマイゼーション（Enterprise版のみ）
   EmailCustomization:
@@ -449,24 +440,9 @@ Resources:
   # ========================================
   # QuickSight ユーザー・グループ管理
   # ========================================
-  # 管理者グループ
-  AdminGroup:
-    Type: AWS::QuickSight::Group
-    Properties:
-      AwsAccountId: !Ref AWS::AccountId
-      GroupName: !Sub '${ProjectName}-${EnvironmentName}-admins'
-      Description: QuickSight管理者グループ
-      Namespace: default
-
-  # ビジネスユーザーグループ
-  BusinessUsersGroup:
-    Type: AWS::QuickSight::Group
-    Condition: HasBusinessUsers
-    Properties:
-      AwsAccountId: !Ref AWS::AccountId
-      GroupName: !Sub '${ProjectName}-${EnvironmentName}-business-users'
-      Description: ビジネスユーザーグループ
-      Namespace: default
+  # 注意: QuickSightユーザーグループは手動で作成してください
+  # aws quicksight create-group --aws-account-id [ACCOUNT-ID] --namespace default --group-name admins
+  # aws quicksight create-group --aws-account-id [ACCOUNT-ID] --namespace default --group-name business-users
 
   # ========================================
   # Lambda関数（自動化）

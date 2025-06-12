@@ -1,3 +1,30 @@
+# ===========================================
+# Bedrock チャットボットシステム
+# ===========================================
+# このテンプレートは、Amazon Bedrockを活用したリアルタイムチャットボットシステムを構築します。
+# WebSocket APIを使用してリアルタイム通信を実現し、スケーラブルで高性能なAI対話サービスを提供します。
+#
+# システムアーキテクチャ:
+# ┌─────────────┐   WebSocket   ┌─────────────┐   Lambda   ┌─────────────┐
+# │ Frontend    │ ←──────────→ │ API Gateway │ ────────→ │ Chat Logic  │
+# │ (Browser)   │              │ (WebSocket) │           │ (Lambda)    │
+# └─────────────┘              └─────────────┘           └─────────────┘
+#                                                                │
+#                                                                ▼
+# ┌─────────────┐              ┌─────────────┐           ┌─────────────┐
+# │ DynamoDB    │              │ SQS         │           │ Bedrock     │
+# │ (Sessions,  │              │ (Processing │           │ (AI Models) │
+# │  Messages)  │              │  Queue)     │           │             │
+# └─────────────┘              └─────────────┘           └─────────────┘
+#
+# 主な特徴:
+# - リアルタイムWebSocket通信
+# - セッション管理とメッセージ履歴
+# - 非同期AI応答処理
+# - 自動スケーリングとロードバランシング
+# - 包括的な監視とロギング
+# ===========================================
+
 AWSTemplateFormatVersion: '2010-09-09'
 Description: |
   Bedrock チャットボットシステム - 対話型AI基盤
@@ -10,7 +37,14 @@ Description: |
   - CloudWatch（監視・ログ・メトリクス）
   - SQS（非同期処理・キュー管理）
 
+# ===========================================
+# パラメータ定義
+# ===========================================
+# チャットボットシステムの動作を環境や要件に応じてカスタマイズするためのパラメータ群。
+# パフォーマンス、コスト、セキュリティのバランスを環境ごとに調整できます。
 Parameters:
+  # 環境別設定
+  # 環境によってLambdaのコンカレンシー、DynamoDBのスケーリング、ログ保持期間が変更されます
   EnvironmentName:
     Type: String
     Default: dev
@@ -26,14 +60,30 @@ Parameters:
     Default: chatbot
     Description: リソース命名に使用するプロジェクト名
 
-  # BedrockセットアップからのImport
+  # ===========================================
+  # 外部スタック連携設定
+  # ===========================================
+  # 他のCloudFormationスタックで作成されたリソースを参照するための設定。
+  # スタック間の結合を緩やかにし、各スタックを独立して管理できます。
+  # ===========================================
+  
+  # Bedrockスタック名
+  # bedrock-setup.yamlで作成したKMSキー、S3バケット、IAMロール等を参照するために使用
   BedrockStackName:
     Type: String
     Description: |
       Bedrockセットアップスタック名
       bedrock-setup.yamlで作成されたスタック名
 
-  # チャットボット設定
+  # ===========================================
+  # チャットボット機能設定
+  # ===========================================
+  # チャットボットの性格、機能、パフォーマンスに関する設定。
+  # ユーザーエクスペリエンスとシステムの安定性に直接影響します。
+  # ===========================================
+  
+  # チャットボット名設定
+  # ユーザーインターフェースに表示されるボットの名前。ブランディングやユーザーエクスペリエンスに影響。
   ChatbotName:
     Type: String
     Default: AIAssistant
@@ -41,20 +91,32 @@ Parameters:
       チャットボット名
       ユーザーとの対話で表示される名前
 
+  # AIモデル選択
+  # チャットボットの知能と性能を決定する重要な設定。
+  # モデルごとに異なるコスト、レスポンス速度、品質のトレードオフがあります。
   DefaultModel:
     Type: String
     Default: anthropic.claude-3-sonnet-20240229-v1:0
     AllowedValues: 
-      - anthropic.claude-3-sonnet-20240229-v1:0
-      - anthropic.claude-3-haiku-20240307-v1:0
-      - amazon.titan-text-express-v1
+      - anthropic.claude-3-sonnet-20240229-v1:0  # 高品質・バランス型（推奨）
+      - anthropic.claude-3-haiku-20240307-v1:0   # 高速・軽量型（コスト重視）
+      - amazon.titan-text-express-v1             # Amazon製・汎用型（安定性重視）
     Description: |
       デフォルトAIモデル
       - Claude 3 Sonnet: 高品質・バランス型
       - Claude 3 Haiku: 高速・軽量型
       - Titan Express: Amazon製・汎用型
 
-  # セッション設定
+  # ===========================================
+  # セッション管理設定
+  # ===========================================
+  # ユーザーのチャットセッションを管理するための設定。
+  # メモリ使用量、コスト、ユーザーエクスペリエンスのバランスを調整。
+  # ===========================================
+  
+  # セッションタイムアウト設定
+  # ユーザーが非アクティブになった後、セッションを自動終了するまでの時間。
+  # 短い: メモリ効率、コスト削減 / 長い: ユーザー体験向上
   SessionTimeoutMinutes:
     Type: Number
     Default: 30
@@ -64,6 +126,9 @@ Parameters:
       セッション有効期限（分）
       非アクティブ時間後の自動終了
 
+  # メッセージ数制限
+  # 1セッションで保持するメッセージ数の上限。コンテキストウィンドウとメモリ使用量に影響。
+  # 多い: 長い文脈保持、高コスト / 少ない: コスト削減、文脈切れ
   MaxMessagesPerSession:
     Type: Number
     Default: 100
@@ -73,7 +138,16 @@ Parameters:
       セッション当たりの最大メッセージ数
       制限を超えると新セッションを開始
 
-  # パフォーマンス設定
+  # ===========================================
+  # パフォーマンスとレート制限設定
+  # ===========================================
+  # システムの安定性とパフォーマンスを保つための制限設定。
+  # DDoS攻撃や意図しない負荷集中からシステムを保護します。
+  # ===========================================
+  
+  # WebSocket同時接続数制限
+  # 同時に接続できるWebSocketコネクションの最大数。
+  # 高い: 多くのユーザーをサポート、高コスト / 低い: コスト削減、ユーザー制限
   ConnectionLimit:
     Type: Number
     Default: 1000
@@ -83,6 +157,9 @@ Parameters:
       同時接続数制限
       WebSocket接続の上限
 
+  # メッセージレート制限
+  # ユーザーが1分間に送信できるメッセージ数の上限。
+  # スパムや濫用を防ぎ、AIモデルのコストを制御するための重要な設定。
   MessageRateLimit:
     Type: Number
     Default: 10
@@ -92,52 +169,73 @@ Parameters:
       メッセージレート制限（件/分）
       ユーザー当たりの送信制限
 
+# ===========================================
+# 条件定義
+# ===========================================
+# 環境ごとの設定変更を自動化するための条件判定。
 Conditions:
-  # 本番環境かどうか
+  # 本番環境判定条件
+  # ログ保持期間、Lambdaコンカレンシー、モニタリング設定等に影響
   IsProduction: !Equals [!Ref EnvironmentName, 'prod']
 
 Resources:
   # ========================================
   # DynamoDB テーブル（チャット管理）
   # ========================================
+  # DynamoDBはチャットボットシステムのコアデータストアです。
+  # セッション管理、メッセージ履歴、WebSocket接続管理を担います。
+  # 
+  # 重要な設計決定:
+  # - PAY_PER_REQUEST: 予測不可能なワークロードに最適
+  # - GSI: 柔軟なクエリパターンをサポート
+  # - TTL: 自動データ削除でコスト最適化
+  # - DynamoDB Streams: リアルタイムデータ処理を可能に
+  # ========================================
   # チャットセッションテーブル
+  # ユーザーのチャットセッション情報を管理。セッションの状態、最終アクティビティ、メッセージ数等を記録。
   ChatSessionsTable:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: !Sub '${ProjectName}-${EnvironmentName}-chat-sessions'
-      BillingMode: PAY_PER_REQUEST
+      BillingMode: PAY_PER_REQUEST  # 自動スケーリング（予測不可能なワークロードに最適）
+      # テーブルのキー構造とインデックス定義
       AttributeDefinitions:
-        - AttributeName: sessionId
+        - AttributeName: sessionId    # プライマリキー（ユニークなセッションID）
           AttributeType: S
-        - AttributeName: userId
+        - AttributeName: userId       # ユーザーID（GSI用）
           AttributeType: S
-        - AttributeName: timestamp
+        - AttributeName: timestamp    # タイムスタンプ（ソート用）
           AttributeType: S
-        - AttributeName: connectionId
+        - AttributeName: connectionId # WebSocket接続ID（GSI用）
           AttributeType: S
       KeySchema:
         - AttributeName: sessionId
-          KeyType: HASH
+          KeyType: HASH  # パーティションキー（分散配置用）
+      # グローバルセカンダリインデックス（柔軟なクエリパターンをサポート）
       GlobalSecondaryIndexes:
+        # ユーザー別セッション検索用インデックス
         - IndexName: UserSessionsIndex
           KeySchema:
             - AttributeName: userId
               KeyType: HASH
             - AttributeName: timestamp
-              KeyType: RANGE
+              KeyType: RANGE  # 時間順ソートを可能に
           Projection:
-            ProjectionType: ALL
+            ProjectionType: ALL  # 全属性を投影（柔軟性重視）
+        # WebSocket接続別検索用インデックス
         - IndexName: ConnectionIndex
           KeySchema:
             - AttributeName: connectionId
               KeyType: HASH
           Projection:
             ProjectionType: ALL
+      # TTL設定（自動データ削除でコスト最適化）
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+      # DynamoDB Streams（リアルタイムデータ処理用）
       StreamSpecification:
-        StreamViewType: NEW_AND_OLD_IMAGES
+        StreamViewType: NEW_AND_OLD_IMAGES  # 変更前後のデータを取得
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName

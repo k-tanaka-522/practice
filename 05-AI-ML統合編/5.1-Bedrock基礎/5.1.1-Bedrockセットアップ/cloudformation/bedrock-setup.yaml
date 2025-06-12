@@ -1,3 +1,22 @@
+# ===========================================
+# Amazon Bedrock AI/ML基盤セットアップ
+# ===========================================
+# このテンプレートは、Amazon Bedrockを使用したAI/ML基盤を構築します。
+# Bedrockは、基盤モデル（Foundation Models）へのAPIアクセスを提供する
+# フルマネージドサービスです。
+#
+# 主な特徴:
+# - サーバーレスでスケーラブル
+# - 複数のAIモデルに統一的なAPIでアクセス
+# - 従量課金制（使用した分だけ課金）
+# - エンタープライズグレードのセキュリティ
+#
+# サポートされるモデル:
+# - Claude (Anthropic): 高度な対話・テキスト生成
+# - Titan (Amazon): テキスト生成・埋め込み
+# - Stable Diffusion (Stability AI): 画像生成
+# ===========================================
+
 AWSTemplateFormatVersion: '2010-09-09'
 Description: |
   Amazon Bedrock セットアップ - AI/ML基盤構築
@@ -10,7 +29,14 @@ Description: |
   - CloudWatch監視・ログ設定
   - セキュリティ設定（暗号化・アクセス制御）
 
+# ===========================================
+# パラメータ定義
+# ===========================================
+# Bedrockの設定を環境ごとにカスタマイズするためのパラメータ群です。
+# 開発環境ではコストを重視し、本番環境ではセキュリティとパフォーマンスを重視します。
 Parameters:
+  # 環境別設定
+  # 環境によって使用するモデル、ログ保持期間、セキュリティ設定が変更されます
   EnvironmentName:
     Type: String
     Default: dev
@@ -26,7 +52,17 @@ Parameters:
     Default: bedrock-setup
     Description: リソース命名に使用するプロジェクト名
 
+  # ===========================================
   # Bedrockモデル設定
+  # ===========================================
+  # 使用する基盤モデルを選択します。
+  # 各モデルには異なる料金体系と性能特性があります。
+  # 必要なモデルのみを有効化してコストを最適化してください。
+  # ===========================================
+  
+  # Claude 3モデル設定
+  # Anthropic社の高性能言語モデル。最も高品質なテキスト生成で人気が高い。
+  # コスト: 高めだが高品質な出力を期待できる
   EnableClaude3:
     Type: String
     Default: 'true'
@@ -35,6 +71,9 @@ Parameters:
       Claude 3モデルへのアクセスを有効化
       高性能なテキスト生成・会話AI
 
+  # Amazon Titan Textモデル設定
+  # Amazon社が開発した汎用テキストモデル。コストパフォーマンスのバランスが良い。
+  # 用途: 基本的なテキスト生成、要約、カテゴリ分類など
   EnableTitanText:
     Type: String
     Default: 'true'
@@ -43,6 +82,9 @@ Parameters:
       Amazon Titan Textモデルへのアクセスを有効化
       テキスト生成・要約・分類
 
+  # Amazon Titan Embeddingsモデル設定
+  # テキストをベクトルデータに変換するモデル。RAG（Retrieval-Augmented Generation）システムに不可欠。
+  # 用途: セマンティック検索、類似文書検索、ドキュメントクラスタリングなど
   EnableTitanEmbeddings:
     Type: String
     Default: 'true'
@@ -51,6 +93,10 @@ Parameters:
       Amazon Titan Embeddingsモデルへのアクセスを有効化
       ベクトル検索・セマンティック検索
 
+  # Stable Diffusion XLモデル設定
+  # Stability AI社の高品質画像生成モデル。非常に高コストなので注意が必要。
+  # 用途: マーケティング素材、コンテンツ作成、プロトタイプ用アセットなど
+  # 警告: 1回の生成で数ドルかかる可能性があります
   EnableStableDiffusion:
     Type: String
     Default: 'false'
@@ -59,7 +105,15 @@ Parameters:
       Stable Diffusion XLモデルへのアクセスを有効化
       画像生成（高コスト注意）
 
-  # セキュリティ設定
+  # ===========================================
+  # セキュリティとコンプライアンス設定
+  # ===========================================
+  # エンタープライズ環境ではログ記録、暗号化、アクセス制御が重要です。
+  # GDPR、HIPAA、SOC 2等のコンプライアンス要件を満たすための設定。
+  # ===========================================
+  
+  # APIログ記録設定
+  # セキュリティ監査、使用量分析、デバッグに必要。本番環境では必ず有効化推奨。
   EnableLogging:
     Type: String
     Default: 'true'
@@ -68,6 +122,9 @@ Parameters:
       Bedrock API呼び出しログの有効化
       セキュリティ監査・使用量分析用
 
+  # データ住居性設定
+  # 法的要件やコンプライアンス要件に基づいてデータ保管リージョンを選択。
+  # 日本の企業はap-northeast-1（東京）、ヨーロッパはeu-west-1（アイルランド）が一般的。
   DataResidencyRegion:
     Type: String
     Default: us-east-1
@@ -76,56 +133,77 @@ Parameters:
       データ保管リージョン
       コンプライアンス要件に応じて選択
 
+# ===========================================
+# 条件定義
+# ===========================================
+# CloudFormationの条件機能を使用して、パラメータの値に応じて
+# リソースの作成や設定を動的に制御します。
 Conditions:
-  # 本番環境かどうか
+  # 本番環境判定
+  # セキュリティ設定、ログ保持期間、バックアップ設定等に影響
   IsProduction: !Equals [!Ref EnvironmentName, 'prod']
   
-  # 各モデルの有効化
+  # 各モデルの有効化条件
+  # 無効なモデルはIAMポリシーから除外され、セキュリティが向上します
   UseClaude3: !Equals [!Ref EnableClaude3, 'true']
   UseTitanText: !Equals [!Ref EnableTitanText, 'true']
   UseTitanEmbeddings: !Equals [!Ref EnableTitanEmbeddings, 'true']
   UseStableDiffusion: !Equals [!Ref EnableStableDiffusion, 'true']
   
-  # ログ機能の有効化
+  # ログ機能の有効化条件
+  # コンプライアンスやデバッグのため、本番環境では特に重要
   LoggingEnabled: !Equals [!Ref EnableLogging, 'true']
 
 Resources:
   # ========================================
   # S3バケット（モデル出力・ログ保存）
   # ========================================
+  # AIモデルの出力やログを安全に保存するためのS3バケット。
+  # エンタープライズグレードのセキュリティ設定（暗号化、アクセス制御等）を適用。
+  # 
+  # 重要なセキュリティ設定:
+  # - パブリックアクセスを完全にブロック
+  # - KMS暗号化で保存時暗号化
+  # - ライフサイクルポリシーでコスト最適化
+  # ========================================
   # Bedrock出力保存バケット
+  # AIモデルの生成結果（テキスト、画像等）を保存
   BedrockOutputBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub '${ProjectName}-${EnvironmentName}-bedrock-outputs-${AWS::AccountId}'
+      # パブリックアクセスを完全にブロック（セキュリティベストプラクティス）
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      # KMS暗号化設定（エンタープライズ環境では必須）
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: aws:kms
               KMSMasterKeyID: !Ref BedrockKMSKey
-            BucketKeyEnabled: true
+            BucketKeyEnabled: true  # コスト最適化のため有効化
+      # バージョニング設定（本番環境ではデータ保護のため有効）
       VersioningConfiguration:
         Status: !If [IsProduction, Enabled, Suspended]
+      # ライフサイクルポリシー（コスト最適化）
       LifecycleConfiguration:
         Rules:
           - Id: TransitionToIA
             Status: Enabled
             Transition:
-              StorageClass: STANDARD_IA
+              StorageClass: STANDARD_IA  # 30日後に低頻度アクセスストレージへ
               TransitionInDays: 30
           - Id: TransitionToGlacier
             Status: Enabled
             Transition:
-              StorageClass: GLACIER
+              StorageClass: GLACIER  # 90日後にアーカイブストレージへ
               TransitionInDays: 90
           - Id: DeleteOldOutputs
             Status: Enabled
-            ExpirationInDays: !If [IsProduction, 365, 90]
+            ExpirationInDays: !If [IsProduction, 365, 90]  # 本番: 1年、その他: 90日で自動削除
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -167,37 +245,49 @@ Resources:
   # ========================================
   # KMS暗号化キー
   # ========================================
+  # エンタープライズグレードのデータ暗号化のためのKMSキー。
+  # S3、CloudWatch Logs、SNS等で使用されます。
+  # 
+  # セキュリティ上の重要なポイント:
+  # - キーのローテーションを定期的に実施
+  # - アクセス権限を最小限に制限
+  # - CloudTrailでキー使用状況を監視
+  # ========================================
   BedrockKMSKey:
     Type: AWS::KMS::Key
     Properties:
       Description: !Sub '${ProjectName} ${EnvironmentName} Bedrock暗号化キー'
+      # キーポリシー（アクセス制御）
       KeyPolicy:
         Version: '2012-10-17'
         Statement:
+          # アカウント管理者に全権限を付与
           - Sid: Enable IAM User Permissions
             Effect: Allow
             Principal:
               AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
             Action: 'kms:*'
             Resource: '*'
+          # Bedrockサービスに必要な最小限の権限を付与
           - Sid: Allow Bedrock Service
             Effect: Allow
             Principal:
               Service: bedrock.amazonaws.com
             Action:
-              - kms:Decrypt
-              - kms:GenerateDataKey
-              - kms:CreateGrant
+              - kms:Decrypt          # データの復号化
+              - kms:GenerateDataKey  # データキーの生成
+              - kms:CreateGrant      # 他サービスへの一時的な権限付与
             Resource: '*'
             Condition:
               StringEquals:
-                'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'
+                'kms:ViaService': !Sub 's3.${AWS::Region}.amazonaws.com'  # S3経由のみ許可
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
 
+  # KMSキーエイリアス（管理を簡単にするための名前）
   BedrockKMSKeyAlias:
     Type: AWS::KMS::Alias
     Properties:

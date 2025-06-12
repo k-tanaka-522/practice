@@ -1,5 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'RDS Database with best practices, read replicas, and monitoring'
+Description: |
+  包括的RDSデータベース構成テンプレート
+  
+  このテンプレートは以下のリソースを作成します：
+  - RDS Database（Multi-AZ、Read Replica、暗号化）
+  - Secrets Manager（パスワード管理）
+  - Parameter Groups（パフォーマンス最適化）
+  - CloudWatch（監視・アラーム）
+  - Lambda（自動化・ヘルスチェック）
 
 Parameters:
   EnvironmentName:
@@ -50,7 +58,14 @@ Parameters:
     Default: dbadmin
     AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
     MaxLength: 16
-    Description: Master username
+    Description: |
+      データベースマスターユーザー名
+      
+      セキュリティベストプラクティス:
+      - デフォルト名（root/admin等）は避ける
+      - 英数字のみ使用（特殊文字不可）
+      - 最大16文字制限
+      - IAM認証との併用を推奨
 
   AllocatedStorage:
     Type: Number
@@ -77,13 +92,45 @@ Parameters:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
-    Description: Enable Multi-AZ deployment
+    Description: |
+      Multi-AZ配置の有効化
+      
+      Multi-AZの効果と考慮事項:
+      【可用性向上】
+      - 自動フェイルオーバー（通常1-2分）
+      - メンテナンス時のダウンタイム最小化
+      - AZ障害時の継続稼働
+      
+      【パフォーマンス影響】
+      - 同期レプリケーションによる若干の書き込み遅延
+      - Read Replicaとは異なり読み取り負荷分散不可
+      
+      【コスト】
+      - インスタンス費用約2倍
+      - 本番環境では必須、開発環境では任意
 
   CreateReadReplica:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
-    Description: Create read replica
+    Description: |
+      Read Replicaの作成
+      
+      Read Replicaの活用シナリオ:
+      【読み取り負荷分散】
+      - SELECT処理の水平スケーリング
+      - レポート・分析処理の分離
+      - 地理的に分散したユーザーへの低遅延提供
+      
+      【災害復旧・バックアップ】
+      - クロスリージョンレプリケーション
+      - 手動昇格による災害復旧
+      - データの論理削除からの保護
+      
+      【運用上の注意点】
+      - 非同期レプリケーション（若干の遅延あり）
+      - レプリケーション遅延の監視必須
+      - 書き込み処理はマスターのみ
 
   EnablePerformanceInsights:
     Type: String
@@ -107,7 +154,28 @@ Conditions:
     - !Condition IsProduction
 
 Resources:
-  # Random password for database
+  # ========================================
+  # データベース認証・セキュリティ設定
+  # ========================================
+  # データベースマスターパスワード（AWS Secrets Manager管理）
+  # 
+  # Secrets Managerを使用する理由と効果:
+  # 【セキュリティ強化】
+  # - 自動パスワード生成（32文字・複雑なパスワード）
+  # - 暗号化保存（KMS統合）
+  # - アクセスログ・監査証跡
+  # - Fine-grainedアクセス制御（IAMポリシー）
+  # 
+  # 【運用効率化】
+  # - 自動ローテーション対応
+  # - アプリケーションからの安全な取得
+  # - CloudFormationテンプレートにパスワード記載不要
+  # - 複数環境での一元管理
+  # 
+  # 【コンプライアンス対応】
+  # - GDPR・SOX法等の要件満たす
+  # - パスワード履歴管理
+  # - 定期ローテーション強制
   DatabaseMasterUserSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
@@ -116,26 +184,54 @@ Resources:
       GenerateSecretString:
         SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
         GenerateStringKey: 'password'
-        PasswordLength: 32
-        ExcludeCharacters: '"@/\'
+        PasswordLength: 32  # セキュリティポリシーに応じて調整（推奨: 16-32文字）
+        ExcludeCharacters: '"@/\'  # SQLインジェクション対策・特殊文字回避
+        RequireEachIncludedType: true  # 大文字・小文字・数字・記号を必須
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
+        - Key: SecurityLevel
+          Value: High
+        - Key: RotationSchedule
+          Value: 90days  # ローテーション間隔（業務要件に応じて調整）
 
-  # Database Subnet Group
+  # ========================================
+  # ネットワーク構成・分離設計
+  # ========================================
+  # データベースサブネットグループ
+  # 
+  # サブネットグループ設計原則:
+  # 【セキュリティ分離】
+  # - プライベートサブネット配置（インターネット直接アクセス不可）
+  # - アプリケーション層からのみアクセス許可
+  # - 管理者アクセスはVPN・踏み台サーバー経由
+  # 
+  # 【高可用性設計】
+  # - 最低2つのAZに跨るサブネット配置
+  # - Multi-AZ展開時の自動フェイルオーバー対応
+  # - AZ障害時の継続稼働保証
+  # 
+  # 【ネットワーク最適化】
+  # - アプリケーションサーバーとの近接配置
+  # - 適切なCIDRブロック設計（将来拡張考慮）
+  # - ルートテーブル・NACLによる通信制御
   DatabaseSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
       DBSubnetGroupName: !Sub '${ProjectName}-${EnvironmentName}-db-subnet-group'
-      DBSubnetGroupDescription: !Sub 'Subnet group for ${ProjectName} ${EnvironmentName} database'
-      SubnetIds: !Ref DatabaseSubnetIds
+      DBSubnetGroupDescription: !Sub 'Subnet group for ${ProjectName} ${EnvironmentName} database - Private subnet isolation for enhanced security'
+      SubnetIds: !Ref DatabaseSubnetIds  # 必ず2つ以上のAZのプライベートサブネットを指定
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
+        - Key: NetworkTier
+          Value: Database
+        - Key: SecurityZone
+          Value: Private
 
   # Database Security Group
   DatabaseSecurityGroup:
@@ -173,43 +269,81 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # Database Parameter Group
+  # ========================================
+  # データベースパフォーマンス最適化設定
+  # ========================================
+  # カスタムパラメータグループ
+  # 
+  # パラメータチューニング戦略:
+  # 【PostgreSQL最適化】
+  # - ログ設定: パフォーマンス分析・トラブルシューティング用
+  # - pg_stat_statements: SQL統計収集（Performance Insights連携）
+  # - 接続・チェックポイント監視: システム安定性確保
+  # 
+  # 【MySQL最適化】
+  # - スロークエリログ: 2秒以上のクエリを記録
+  # - インデックス未使用クエリ検出: パフォーマンス問題早期発見
+  # - InnoDB Buffer Pool: メモリの3/4を割り当て（読み取り性能向上）
+  # 
+  # 【運用監視設定】
+  # - 包括的ログ出力: 障害分析・セキュリティ監査対応
+  # - 接続ログ: 不正アクセス検出・利用状況分析
+  # - ロック待機ログ: デッドロック・競合状態の特定
+  # 
+  # 本番環境での追加考慮事項:
+  # - ワークロードに応じたメモリ・CPU設定調整
+  # - バックアップ・レプリケーション設定最適化
+  # - 接続プール設定（max_connections等）
   DatabaseParameterGroup:
     Type: AWS::RDS::DBParameterGroup
     Properties:
       DBParameterGroupName: !Sub '${ProjectName}-${EnvironmentName}-db-params'
-      Description: !Sub 'Parameter group for ${ProjectName} ${EnvironmentName} database'
+      Description: !Sub 'Optimized parameter group for ${ProjectName} ${EnvironmentName} database - Performance and monitoring focused'
       Family: !If 
         - IsPostgreSQL
-        - postgres15
+        - postgres15  # PostgreSQL 15の最新機能活用
         - !If 
           - IsMySQL
-          - mysql8.0
-          - mariadb10.6
+          - mysql8.0  # MySQL 8.0の高性能機能活用
+          - mariadb10.6  # MariaDB 10.6の安定版機能
       Parameters: !If
         - IsPostgreSQL
-        - log_statement: 'all'
-          log_min_duration_statement: '1000'
-          shared_preload_libraries: 'pg_stat_statements'
-          log_line_prefix: '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
-          log_checkpoints: '1'
-          log_connections: '1'
-          log_disconnections: '1'
-          log_lock_waits: '1'
+        # PostgreSQL専用パフォーマンス・監視設定
+        - log_statement: 'all'  # 全SQL文ログ出力（開発環境）本番では'mod'推奨
+          log_min_duration_statement: '1000'  # 1秒以上のクエリをログ出力
+          shared_preload_libraries: 'pg_stat_statements'  # SQL統計拡張モジュール
+          log_line_prefix: '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '  # 詳細ログ形式
+          log_checkpoints: '1'  # チェックポイント情報ログ
+          log_connections: '1'  # 接続ログ（セキュリティ監査用）
+          log_disconnections: '1'  # 切断ログ（セッション管理用）
+          log_lock_waits: '1'  # ロック待機ログ（デッドロック分析用）
+          track_activities: 'on'  # アクティビティ追跡
+          track_counts: 'on'  # 統計情報収集
+          track_io_timing: 'on'  # I/O統計収集
         - !If
           - IsMySQL
+          # MySQL専用パフォーマンス・監視設定
+          - slow_query_log: '1'  # スロークエリログ有効化
+            long_query_time: '2'  # 2秒以上をスロークエリとして記録
+            log_queries_not_using_indexes: '1'  # インデックス未使用クエリログ
+            innodb_buffer_pool_size: '{DBInstanceClassMemory*3/4}'  # メモリの75%をバッファプールに
+            innodb_buffer_pool_instances: '8'  # バッファプール並列化
+            general_log: '0'  # 本番では無効（パフォーマンス重視）
+            binlog_format: 'ROW'  # レプリケーション最適化
+            sync_binlog: '1'  # データ整合性保証
+          # MariaDB専用設定
           - slow_query_log: '1'
             long_query_time: '2'
             log_queries_not_using_indexes: '1'
             innodb_buffer_pool_size: '{DBInstanceClassMemory*3/4}'
-          - slow_query_log: '1'
-            long_query_time: '2'
-            log_queries_not_using_indexes: '1'
+            query_cache_size: '0'  # MariaDB 10.6では無効化推奨
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
         - Key: Project
           Value: !Ref ProjectName
+        - Key: TuningLevel
+          Value: Production  # 本番レベルチューニング適用
 
   # Option Group (for MySQL/MariaDB)
   DatabaseOptionGroup:
@@ -275,67 +409,93 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
 
-  # Main Database Instance
+  # ========================================
+  # メインデータベースインスタンス
+  # ========================================
+  # 
+  # エンタープライズ要件に対応した包括的RDS設定
+  # 
+  # 【ストレージ設計】
+  # - GP3使用: コスト効率・パフォーマンス最適化
+  # - 自動スケーリング: 容量不足による停止回避
+  # - 暗号化必須: データ保護・コンプライアンス要件
+  # 
+  # 【バックアップ戦略】
+  # - 本番: 30日保持（法的要件・業務継続性）
+  # - 開発: パラメータ設定値（コスト最適化）
+  # - ポイントインタイム復旧: 秒単位の精密復旧
+  # 
+  # 【監視・パフォーマンス】
+  # - Performance Insights: SQL実行プラン・リソース使用状況
+  # - Enhanced Monitoring: OS・ハードウェアレベル詳細監視
+  # - CloudWatch Logs: 集約ログ分析・異常検知
+  # 
+  # 【メンテナンス戦略】
+  # - マイナーバージョン自動更新: 開発環境のみ
+  # - 本番環境: 手動更新（検証・計画的メンテナンス）
+  # - メンテナンス窓: 日曜深夜4-5時（業務影響最小化）
   DatabaseInstance:
     Type: AWS::RDS::DBInstance
-    DeletionPolicy: !If [IsProduction, Snapshot, Delete]
+    DeletionPolicy: !If [IsProduction, Snapshot, Delete]  # 本番は削除時スナップショット保護
     Properties:
       DBInstanceIdentifier: !Sub '${ProjectName}-${EnvironmentName}-database'
       DBName: !Ref DatabaseName
       Engine: !Ref DatabaseEngine
-      EngineVersion: !Ref DatabaseVersion
-      DBInstanceClass: !Ref DatabaseInstanceClass
-      AllocatedStorage: !Ref AllocatedStorage
-      MaxAllocatedStorage: !Ref MaxAllocatedStorage
-      StorageType: gp3
-      StorageEncrypted: true
-      KmsKeyId: !Ref DatabaseKMSKey
+      EngineVersion: !Ref DatabaseVersion  # 定期的に最新安定版へ更新推奨
+      DBInstanceClass: !Ref DatabaseInstanceClass  # ワークロードに応じて調整
       
-      # Network Configuration
+      # ストレージ設定（性能・コスト・拡張性のバランス）
+      AllocatedStorage: !Ref AllocatedStorage  # 初期容量
+      MaxAllocatedStorage: !Ref MaxAllocatedStorage  # 自動スケーリング上限
+      StorageType: gp3  # 最新世代ストレージ（コスト効率・性能向上）
+      StorageEncrypted: true  # 暗号化必須（GDPR・PCI DSS対応）
+      KmsKeyId: !Ref DatabaseKMSKey  # カスタムKMSキー使用
+      
+      # ネットワーク設定（セキュリティ・分離）
       DBSubnetGroupName: !Ref DatabaseSubnetGroup
       VPCSecurityGroups:
         - !Ref DatabaseSecurityGroup
-      PubliclyAccessible: false
+      PubliclyAccessible: false  # プライベートアクセスのみ（セキュリティ強化）
       
-      # Authentication
+      # 認証設定（Secrets Manager統合）
       MasterUsername: !Ref MasterUsername
-      ManageMasterUserPassword: true
+      ManageMasterUserPassword: true  # AWS管理パスワード使用
       MasterUserSecret:
         SecretArn: !Ref DatabaseMasterUserSecret
       
-      # Parameter and Option Groups
+      # エンジン最適化設定
       DBParameterGroupName: !Ref DatabaseParameterGroup
       OptionGroupName: !If [IsMySQL, !Ref DatabaseOptionGroup, !Ref AWS::NoValue]
       
-      # Backup Configuration
-      BackupRetentionPeriod: !If [IsProduction, 30, !Ref BackupRetentionPeriod]
-      PreferredBackupWindow: '03:00-04:00'
-      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
-      DeleteAutomatedBackups: !If [IsProduction, false, true]
+      # バックアップ設定（業務継続・災害復旧）
+      BackupRetentionPeriod: !If [IsProduction, 30, !Ref BackupRetentionPeriod]  # 本番30日・開発は設定値
+      PreferredBackupWindow: '03:00-04:00'  # 深夜時間帯（業務影響最小）
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'  # 日曜深夜（計画メンテナンス）
+      DeleteAutomatedBackups: !If [IsProduction, false, true]  # 本番はバックアップ保持
       
-      # High Availability
-      MultiAZ: !If [EnableMultiAZ, true, false]
+      # 高可用性設定
+      MultiAZ: !If [EnableMultiAZ, true, false]  # 本番環境推奨
       
-      # Monitoring
-      MonitoringInterval: !If [IsProduction, 60, 0]
+      # 監視設定（パフォーマンス・障害検知）
+      MonitoringInterval: !If [IsProduction, 60, 0]  # 本番1分間隔監視
       MonitoringRoleArn: !If [IsProduction, !GetAtt EnhancedMonitoringRole.Arn, !Ref AWS::NoValue]
-      EnablePerformanceInsights: !If [EnablePI, true, false]
-      PerformanceInsightsRetentionPeriod: !If [EnablePI, !If [IsProduction, 731, 7], !Ref AWS::NoValue]
+      EnablePerformanceInsights: !If [EnablePI, true, false]  # SQL解析・最適化支援
+      PerformanceInsightsRetentionPeriod: !If [EnablePI, !If [IsProduction, 731, 7], !Ref AWS::NoValue]  # 本番2年保持
       PerformanceInsightsKMSKeyId: !If [EnablePI, !Ref DatabaseKMSKey, !Ref AWS::NoValue]
       
-      # Logging
+      # ログ設定（トラブルシューティング・監査）
       EnableCloudwatchLogsExports: !If
         - IsPostgreSQL
-        - [postgresql]
+        - [postgresql]  # PostgreSQLログ
         - !If
           - IsMySQL
-          - [error, general, slowquery]
-          - [error, slowquery]
+          - [error, general, slowquery]  # MySQL全ログ種別
+          - [error, slowquery]  # MariaDB基本ログ
       
-      # Maintenance
-      AutoMinorVersionUpgrade: !If [IsProduction, false, true]
-      AllowMajorVersionUpgrade: false
-      DeletionProtection: !If [IsProduction, true, false]
+      # メンテナンス設定（可用性・セキュリティバランス）
+      AutoMinorVersionUpgrade: !If [IsProduction, false, true]  # 本番は手動・開発は自動
+      AllowMajorVersionUpgrade: false  # メジャーバージョンアップは常に手動
+      DeletionProtection: !If [IsProduction, true, false]  # 本番誤削除防止
       
       Tags:
         - Key: Environment
@@ -344,6 +504,10 @@ Resources:
           Value: !Ref ProjectName
         - Key: Backup
           Value: Required
+        - Key: DataClassification
+          Value: Confidential  # データ分類（セキュリティポリシー）
+        - Key: ComplianceRequired
+          Value: !If [IsProduction, 'GDPR,SOX', 'Internal']
 
   # Read Replica (for production)
   DatabaseReadReplica:
@@ -377,24 +541,55 @@ Resources:
       LogGroupName: !Sub '/aws/rds/instance/${ProjectName}-${EnvironmentName}-database/${DatabaseEngine}'
       RetentionInDays: !If [IsProduction, 90, 30]
 
-  # CloudWatch Alarms
+  # ========================================
+  # 包括的監視・アラートシステム
+  # ========================================
+  # 
+  # CloudWatch アラーム設計原則:
+  # 【段階的アラート】
+  # - Warning: 早期警告（予防保守）
+  # - Critical: 即座対応必要（業務影響）
+  # - Emergency: 緊急対応（サービス停止リスク）
+  # 
+  # 【アラート閾値設定根拠】
+  # - CPU 80%: 一般的なRDSパフォーマンス限界点
+  # - 接続数: max_connections設定の80%（接続枯渇回避）
+  # - ストレージ: 2GB未満（自動拡張しない場合の停止回避）
+  # - レイテンシ: 200ms超（アプリケーション応答性能影響）
+  # 
+  # CPU使用率監視アラーム
+  # 高CPU使用率は以下を示唆:
+  # - 非効率なSQL実行（インデックス不足・複雑結合）
+  # - インスタンスサイズ不足
+  # - 同時実行数過多
+  # - バックグラウンド処理負荷
   DatabaseCPUAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub '${ProjectName}-${EnvironmentName}-database-high-cpu'
-      AlarmDescription: Database high CPU utilization
+      AlarmDescription: |
+        Database high CPU utilization detected
+        
+        対応手順:
+        1. Performance Insightsで実行中SQLの確認
+        2. スロークエリログの分析
+        3. インデックス使用状況の確認
+        4. 必要に応じてインスタンスサイズアップ検討
       MetricName: CPUUtilization
       Namespace: AWS/RDS
       Statistic: Average
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: 80
+      Period: 300  # 5分間隔
+      EvaluationPeriods: 2  # 連続2回で発報（一時的スパイク回避）
+      Threshold: 80  # 80%閾値（パフォーマンス劣化開始点）
       ComparisonOperator: GreaterThanThreshold
       Dimensions:
         - Name: DBInstanceIdentifier
           Value: !Ref DatabaseInstance
       AlarmActions:
         - !Ref DatabaseAlarmTopic
+      OKActions:
+        - !Ref DatabaseAlarmTopic  # 復旧通知も送信
+      TreatMissingData: notBreaching  # データ欠損時は正常扱い
 
   DatabaseConnectionsAlarm:
     Type: AWS::CloudWatch::Alarm

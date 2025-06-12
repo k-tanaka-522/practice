@@ -1,63 +1,183 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: |
-  マルチステージビルドパイプライン - 高度なCI/CD基盤
+  マルチステージCI/CDパイプライン - エンタープライズグレード自動化基盤
   
-  このテンプレートは以下のリソースを作成します：
-  - CodePipeline（マルチステージパイプライン）
-  - CodeBuild（ビルド・テスト・デプロイ）
-  - CodeCommit（ソースコード管理）
-  - S3（アーティファクト保存・配布）
-  - IAMロール（パイプライン実行権限）
-  - CloudWatch（監視・ログ・メトリクス）
-  - SNS（通知・アラート）
+  【システム概要】
+  コードコミットから本番デプロイまでの全自動化パイプライン
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │                          CI/CD パイプライン アーキテクチャ                             │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ コード → Source → Build & Test → Security → Staging → Approval → Production │
+  │ コミット   取得    ビルド・テスト   スキャン   デプロイ    手動承認    本番      │
+  │   ↑         ↑          ↑           ↑         ↑         ↑          ↑        │
+  │ GitHub    キャッシュ     ユニットテスト   脆弱性    E2Eテスト    スモーク     ライブ     │
+  │ CodeCommit S3保存     Lintチェック    チェック   統合テスト  テスト      デプロイ   │
+  │           アーティファクト セキュリティチェック         パフォーマンス            │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  
+  【主要コンポーネント】
+  ◆ CodePipeline（メインオーケストレーター）
+    - マルチステージワークフロー管理
+    - 並列・順次アクション制御
+    - 手動承認ゲート統合
+    - ロールバック機能
+  
+  ◆ CodeBuildプロジェクト群
+    - Build: ビルド・ユニットテスト・Lintチェック
+    - Security: 脆弱性スキャン・コード解析
+    - Integration: E2Eテスト・統合テスト
+    - Deploy: CloudFormationデプロイメント
+  
+  ◆ ソースコード管理
+    - GitHub統合（プルリクエスト連携）
+    - CodeCommitフォールバック
+    - ブランチ戦略対応
+  
+  ◆ アーティファクト管理
+    - S3バケット（暗号化・バージョニング）
+    - ビルドキャッシュ最適化
+    - ライフサイクル管理
+  
+  ◆ 品質ゲート
+    - 自動テストスイート
+    - セキュリティスキャン
+    - パフォーマンステスト
+    - コード品質メトリクス
+  
+  ◆ 監視・通知
+    - CloudWatchメトリクス・アラーム
+    - SNS通知（メール・Slack）
+    - パイプライン可視化
+  
+  【セキュリティ機能】
+  ✓ IAM最小権限原則
+  ✓ シークレット管理（Secrets Manager）
+  ✓ コード署名検証
+  ✓ 脆弱性スキャン自動化
+  ✓ CloudFormationテンプレート検証
+  ✓ インフラコードセキュリティ
+  
+  【パフォーマンス最適化】
+  ✓ ビルドキャッシュ活用
+  ✓ 並列ジョブ実行
+  ✓ コンテナレイヤーキャッシュ
+  ✓ 漸進的デプロイメント
+  ✓ 自動スケーリング
+  ✓ ライフサイクル管理
+  
+  【DevOpsベストプラクティス】
+  ✓ Infrastructure as Code
+  ✓ イミューターブルインフラ
+  ✓ ブルーグリーンデプロイメント
+  ✓ モニタリングドリブン開発
+  ✓ フィーチャーフラグ管理
+  ✓ データベースマイグレーション
 
 Parameters:
+  # ========================================
+  # 環境・プロジェクト設定パラメータ
+  # ========================================
   EnvironmentName:
     Type: String
     Default: dev
     AllowedValues: [dev, staging, prod]
     Description: |
-      環境名
-      - dev: 開発環境（基本機能）
-      - staging: ステージング環境（詳細テスト）
-      - prod: 本番環境（本格運用）
+      デプロイメント環境名
+      
+      【環境別設定】
+      - dev: 開発環境
+        * 基本機能のみ
+        * 高速ビルド優先
+        * ログ保持短期
+        * セキュリティチェック簡略
+      
+      - staging: ステージング環境  
+        * 本番同等設定
+        * 詳細テストスイート
+        * パフォーマンステスト
+        * 統合テスト実行
+      
+      - prod: 本番環境
+        * 最高セキュリティ
+        * 手動承認ゲート
+        * 詳細ログ・モニタリング
+        * ロールバック機能
 
   ProjectName:
     Type: String
     Default: multi-stage-build
-    Description: リソース命名に使用するプロジェクト名
+    Description: |
+      プロジェクト名（リソース命名用）
+      例: multi-stage-build → multi-stage-build-dev-pipeline
+      命名規則: {ProjectName}-{Environment}-{ResourceType}
 
-  # ソースコード設定
+  # ========================================
+  # ソースコード管理設定パラメータ
+  # ========================================
   GitHubOwner:
     Type: String
     Default: ""
     Description: |
-      GitHubオーナー名（任意）
-      空の場合はCodeCommitを使用
+      GitHubアカウント名（オプション）
+      
+      【GitHub vs CodeCommit】
+      - GitHub使用時:
+        * オープンソースコミュニティ連携
+        * プルリクエストワークフロー
+        * GitHub Actionsとの連携可能
+        * サードパーティコラボレーション
+      
+      - CodeCommit使用時:
+        * 完全AWSマネージド
+        * VPC内プライベートアクセス
+        * IAM統合認証
+        * 低コスト（ユーザー数制限なし）
+      
+      ※空の場合はCodeCommitを自動作成
 
   GitHubRepository:
     Type: String
     Default: ""
     Description: |
-      GitHubリポジトリ名（任意）
-      GitHubOwnerが設定されている場合必須
+      GitHubリポジトリ名
+      GitHubOwner指定時は必須パラメーター
+      例: my-application
 
   GitHubBranch:
     Type: String
     Default: main
     Description: |
-      GitHubブランチ名
-      デフォルトはmain
+      監視ブランチ名（パイプライントリガー用）
+      
+      【ブランチ戦略】
+      - main/master: メインブランチ（本番直結）
+      - develop: 開発ブランチ（統合テスト）
+      - release/*: リリースブランチ（QAテスト）
+      - feature/*: 機能ブランチ（開発中）
 
-  # パイプライン設定
+  # ========================================
+  # CI/CDパフォーマンス設定パラメータ
+  # ========================================
   BuildTimeout:
     Type: Number
     Default: 30
     MinValue: 5
-    MaxValue: 480
+    MaxValue: 480  # 8時間
     Description: |
       ビルドタイムアウト（分）
-      長時間ビルドに対応
+      
+      【タイムアウト目安】
+      - 5-15分: シンプルNode.js/Pythonアプリ
+      - 30-60分: Java/C#エンタープライズアプリ
+      - 120-240分: 大規模モノリシックアプリ
+      - 480分: ネイティブアプリ、大量テスト
+      
+      【パフォーマンス最適化】
+      - ビルドキャッシュ活用
+      - 並列テスト実行
+      - 漸進テスト（高速テスト優先）
+      - コンテナレイヤーキャッシュ
 
   BuildComputeType:
     Type: String
@@ -68,67 +188,140 @@ Parameters:
       - BUILD_GENERAL1_LARGE
       - BUILD_GENERAL1_2XLARGE
     Description: |
-      ビルド環境のコンピューティングタイプ
-      - SMALL: 3 GB RAM, 2 vCPU
-      - MEDIUM: 7 GB RAM, 4 vCPU
-      - LARGE: 15 GB RAM, 8 vCPU
-      - 2XLARGE: 145 GB RAM, 72 vCPU
+      CodeBuildコンピュートインスタンスタイプ
+      
+      【スペックとコスト】
+      - BUILD_GENERAL1_SMALL
+        * 3 GB RAM, 2 vCPU
+        * $0.005/分
+        * 用途: 軽量Webアプリ、簡単スクリプト
+      
+      - BUILD_GENERAL1_MEDIUM（推奨）
+        * 7 GB RAM, 4 vCPU
+        * $0.01/分
+        * 用途: 一般的なWeb/モバイルアプリ
+      
+      - BUILD_GENERAL1_LARGE
+        * 15 GB RAM, 8 vCPU
+        * $0.02/分
+        * 用途: 大規模Java/.NETアプリ、Dockerビルド
+      
+      - BUILD_GENERAL1_2XLARGE
+        * 145 GB RAM, 72 vCPU
+        * $0.04/分
+        * 用途: 大規模ビルド、機械学習モデルトレーニング
+      
+      ※コストは時期により変更される可能性があります
 
-  # 通知設定
+  # ========================================
+  # 通知・アラート設定パラメータ
+  # ========================================
   NotificationEmail:
     Type: String
     Default: admin@example.com
     Description: |
-      パイプライン通知用メールアドレス
-      成功・失敗時の通知先
+      パイプライン状態通知用メールアドレス
+      
+      【通知タイミング】
+      - パイプライン実行開始
+      - ビルド成功/失敗
+      - セキュリティスキャン結果
+      - デプロイメント完了
+      - 手動承認待ち
+      - エラー・異常発生
+      
+      ※チームメーリングリストや個人アドレスを指定
 
   SlackWebhookUrl:
     Type: String
     Default: ""
     Description: |
-      Slack Webhook URL（任意）
-      Slack通知を使用する場合に設定
+      Slack Incoming Webhook URL（オプション）
+      
+      【Slack統合のメリット】
+      - リアルタイムチーム通知
+      - リッチフォーマットメッセージ
+      - スレッド別通知分類
+      - メンション機能
+      - CI/CDダッシュボード連携
+      
+      【設定手順】
+      1. SlackアプリでIncoming Webhooks有効化
+      2. チャンネル選択とWebhook URL取得
+      3. このパラメーターにURLを設定
+      
+      ※空の場合はSlack通知無効
 
-  # デプロイ対象環境
+  # ========================================
+  # デプロイメントステージ制御パラメータ
+  # ========================================
   DeployToStaging:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: |
-      ステージング環境へのデプロイ有効化
-      本番前の検証環境
+      ステージング環境デプロイ有効化
+      
+      【ステージング環境の役割】
+      - 本番同等環境での最終検証
+      - 統合テスト・E2Eテスト実行
+      - パフォーマンステスト・負荷テスト
+      - ユーザー受入テスト(UAT)
+      - セキュリティ・ペネトレーションテスト
+      - データベースマイグレーション検証
+      
+      【推奨設定】
+      - true: 本格開発プロジェクト
+      - false: シンプルCIパイプライン
 
   DeployToProduction:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
     Description: |
-      本番環境への自動デプロイ有効化
-      手動承認が推奨
+      本番環境自動デプロイ有効化
+      
+      【本番デプロイ戦略】
+      - false(推奨): 手動承認ゲートあり
+        * ステークホルダーレビュー
+        * ビジネス影響度検証
+        * メンテナンスウィンドウ調整
+        * ロールバック準備確認
+      
+      - true: 完全自動化パイプライン
+        * 高頻度リリース環境
+        * カナリアデプロイメント
+        * フィーチャーフラグ管理
+        * 十分なテストカバレッジ
+      
+      ※本番環境では最高レベルの安全性を重視
 
+# ========================================
+# 条件分岐設定
+# パラメータ値に基づく動的リソース作成制御
+# ========================================
 Conditions:
-  # GitHub使用かどうか
+  # ソースコード管理方法判定
   UseGitHub: !And
     - !Not [!Equals [!Ref GitHubOwner, ""]]
     - !Not [!Equals [!Ref GitHubRepository, ""]]
   
-  # CodeCommit使用かどうか
   UseCodeCommit: !Not [!Condition UseGitHub]
   
-  # ステージングデプロイを使用するか
+  # デプロイメントステージ制御
   EnableStagingDeploy: !Equals [!Ref DeployToStaging, 'true']
-  
-  # 本番デプロイを使用するか
   EnableProductionDeploy: !Equals [!Ref DeployToProduction, 'true']
   
-  # Slack通知を使用するか
+  # 通知統合判定
   UseSlackNotification: !Not [!Equals [!Ref SlackWebhookUrl, ""]]
 
 Resources:
   # ========================================
-  # S3バケット（アーティファクト保存）
+  # S3 アーティファクトストレージシステム
+  # CI/CDパイプラインの中間成果物管理
   # ========================================
-  # パイプラインアーティファクトバケット
+  
+  # メインアーティファクトストレージ
   PipelineArtifactsBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -1057,7 +1250,7 @@ Outputs:
       マルチステージビルドパイプライン:
       
       1. ソースコード管理:
-      ${UseCodeCommit}
+      CodeCommit: ${DeployToStaging}
       
       2. パイプライン監視:
       https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${BuildPipeline}/view
@@ -1075,7 +1268,7 @@ Outputs:
     Value: !Sub |
       Multi-Stage Build Pipeline:
       - Pipeline: ${BuildPipeline}
-      - Source: ${UseGitHub}
+      - GitHub Integration: ${GitHubOwner}
       - Build Timeout: ${BuildTimeout} minutes
       - Compute Type: ${BuildComputeType}
       - Staging Deploy: ${DeployToStaging}
