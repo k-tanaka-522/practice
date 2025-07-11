@@ -1,0 +1,367 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Step 6: EC2 instances with database connection'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-practice
+    Description: Name of the project
+  
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID from previous step
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 1 ID for EC2 instances
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 2 ID for EC2 instances
+
+  WebServerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group ID for web servers
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+    Default: aws-practice-keypair
+
+  DatabaseEndpoint:
+    Type: String
+    Description: Database endpoint
+
+  DatabaseName:
+    Type: String
+    Default: webapp
+    Description: Database name
+
+  DatabaseUser:
+    Type: String
+    Default: admin
+    Description: Database user
+
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: Database password
+
+Resources:
+  # IAM Role for EC2 instances
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DatabaseSecret
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-ec2-role
+
+  # Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # Database connection secret
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ProjectName}-${EnvironmentName}-database-secret
+      Description: Database connection credentials
+      SecretString: !Sub |
+        {
+          "username": "${DatabaseUser}",
+          "password": "${DatabasePassword}",
+          "engine": "mysql",
+          "host": "${DatabaseEndpoint}",
+          "port": 3306,
+          "dbname": "${DatabaseName}"
+        }
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-database-secret
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Launch Template
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ProjectName}-${EnvironmentName}-web-template
+      LaunchTemplateData:
+        ImageId: ami-0d52744d6551d851e  # Amazon Linux 2023 (ap-northeast-1)
+        InstanceType: t3.micro
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroupId
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd php php-mysqlnd mysql
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Get instance information
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            
+            # Install AWS CLI v2
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            yum install -y unzip
+            unzip awscliv2.zip
+            ./aws/install
+            
+            # Get database credentials from Secrets Manager
+            SECRET_VALUE=$(aws secretsmanager get-secret-value --secret-id ${DatabaseSecret} --region ap-northeast-1 --query SecretString --output text)
+            DB_HOST=$(echo $SECRET_VALUE | python3 -c "import sys, json; print(json.load(sys.stdin)['host'])")
+            DB_USER=$(echo $SECRET_VALUE | python3 -c "import sys, json; print(json.load(sys.stdin)['username'])")
+            DB_PASS=$(echo $SECRET_VALUE | python3 -c "import sys, json; print(json.load(sys.stdin)['password'])")
+            DB_NAME=$(echo $SECRET_VALUE | python3 -c "import sys, json; print(json.load(sys.stdin)['dbname'])")
+            
+            # Create database connection test
+            cat > /var/www/html/dbtest.php << 'EOF'
+            <?php
+            $servername = getenv('DB_HOST');
+            $username = getenv('DB_USER');
+            $password = getenv('DB_PASS');
+            $dbname = getenv('DB_NAME');
+            
+            // Create connection
+            $conn = new mysqli($servername, $username, $password, $dbname);
+            
+            // Check connection
+            if ($conn->connect_error) {
+                die("Connection failed: " . $conn->connect_error);
+            }
+            
+            // Create table if not exists
+            $sql = "CREATE TABLE IF NOT EXISTS visits (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                instance_id VARCHAR(50) NOT NULL,
+                visit_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_agent TEXT
+            )";
+            
+            if ($conn->query($sql) === TRUE) {
+                // Insert visit record
+                $instance_id = $_SERVER['HTTP_X_INSTANCE_ID'] ?? 'unknown';
+                $user_agent = $_SERVER['HTTP_USER_AGENT'] ?? 'unknown';
+                
+                $stmt = $conn->prepare("INSERT INTO visits (instance_id, user_agent) VALUES (?, ?)");
+                $stmt->bind_param("ss", $instance_id, $user_agent);
+                $stmt->execute();
+                $stmt->close();
+                
+                // Get visit count
+                $result = $conn->query("SELECT COUNT(*) as count FROM visits");
+                $row = $result->fetch_assoc();
+                $visit_count = $row['count'];
+                
+                echo "Database connection successful! Total visits: " . $visit_count;
+            } else {
+                echo "Error creating table: " . $conn->error;
+            }
+            
+            $conn->close();
+            ?>
+            EOF
+            
+            # Set environment variables for PHP
+            cat > /etc/environment << EOF
+            DB_HOST=$DB_HOST
+            DB_USER=$DB_USER
+            DB_PASS=$DB_PASS
+            DB_NAME=$DB_NAME
+            EOF
+            
+            # Add environment variables to Apache
+            cat >> /etc/httpd/conf/httpd.conf << EOF
+            SetEnv DB_HOST $DB_HOST
+            SetEnv DB_USER $DB_USER
+            SetEnv DB_PASS $DB_PASS
+            SetEnv DB_NAME $DB_NAME
+            EOF
+            
+            # Create main web page
+            cat > /var/www/html/index.html << EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>AWS Practice - Complete Web Application</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    .container { max-width: 1000px; margin: 0 auto; }
+                    .header { background: #232f3e; color: white; padding: 20px; border-radius: 8px; }
+                    .content { background: #f9f9f9; padding: 20px; border-radius: 8px; margin-top: 20px; }
+                    .info { background: #e8f4f8; padding: 15px; border-radius: 5px; margin: 10px 0; }
+                    .success { background: #d4edda; padding: 15px; border-radius: 5px; margin: 10px 0; }
+                    .architecture { background: #fff3cd; padding: 15px; border-radius: 5px; margin: 10px 0; }
+                    .button { display: inline-block; padding: 10px 20px; margin: 10px 5px; background: #007bff; color: white; text-decoration: none; border-radius: 5px; }
+                    .button:hover { background: #0056b3; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>🚀 AWS Practice - Complete 3-Tier Web Application</h1>
+                        <p>Environment: ${EnvironmentName}</p>
+                    </div>
+                    <div class="content">
+                        <h2>Server Information</h2>
+                        <div class="info">
+                            <strong>Instance ID:</strong> $INSTANCE_ID<br>
+                            <strong>Availability Zone:</strong> $AZ<br>
+                            <strong>Database Host:</strong> $DB_HOST<br>
+                            <strong>Database Name:</strong> $DB_NAME<br>
+                            <strong>Private IP:</strong> <span id="private-ip">Loading...</span>
+                        </div>
+                        <div class="success">
+                            <h3>✅ 3-Tier Architecture Completed!</h3>
+                            <p>This application demonstrates a complete AWS 3-tier architecture</p>
+                        </div>
+                        <div class="architecture">
+                            <h3>🏗️ Architecture Components</h3>
+                            <ul>
+                                <li><strong>Presentation Tier:</strong> Application Load Balancer</li>
+                                <li><strong>Application Tier:</strong> Auto Scaling EC2 instances</li>
+                                <li><strong>Data Tier:</strong> RDS MySQL database</li>
+                            </ul>
+                        </div>
+                        <h2>Application Features</h2>
+                        <ul>
+                            <li>✅ Multi-AZ deployment for high availability</li>
+                            <li>✅ Auto Scaling for dynamic load handling</li>
+                            <li>✅ Load balancing across multiple instances</li>
+                            <li>✅ Secure database connectivity</li>
+                            <li>✅ CloudWatch monitoring</li>
+                            <li>✅ Secrets Manager integration</li>
+                        </ul>
+                        <div style="margin-top: 20px;">
+                            <a href="dbtest.php" class="button">Test Database Connection</a>
+                            <a href="info.php" class="button">PHP Info</a>
+                        </div>
+                    </div>
+                </div>
+                
+                <script>
+                    // Get private IP
+                    fetch('http://169.254.169.254/latest/meta-data/local-ipv4')
+                        .then(response => response.text())
+                        .then(data => document.getElementById('private-ip').textContent = data);
+                </script>
+            </body>
+            </html>
+            EOF
+            
+            # Create PHP info page
+            cat > /var/www/html/info.php << 'EOF'
+            <?php
+            echo "<h1>PHP Configuration</h1>";
+            echo "<p>Database Host: " . getenv('DB_HOST') . "</p>";
+            echo "<p>Database Name: " . getenv('DB_NAME') . "</p>";
+            echo "<p>Database User: " . getenv('DB_USER') . "</p>";
+            phpinfo();
+            ?>
+            EOF
+            
+            # Restart Apache to pick up environment variables
+            systemctl restart httpd
+            
+            # Install CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+            
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -s \
+                -c default
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectName}-${EnvironmentName}-web-server
+              - Key: Environment
+                Value: !Ref EnvironmentName
+              - Key: Project
+                Value: !Ref ProjectName
+
+  # Auto Scaling Group
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${ProjectName}-${EnvironmentName}-web-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 4
+      DesiredCapacity: 2
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-web-asg
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+
+Outputs:
+  LaunchTemplateId:
+    Description: Launch Template ID
+    Value: !Ref WebServerLaunchTemplate
+    Export:
+      Name: !Sub ${AWS::StackName}-LaunchTemplate-ID
+
+  AutoScalingGroupName:
+    Description: Auto Scaling Group Name
+    Value: !Ref WebServerAutoScalingGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-ASG-Name
+
+  EC2RoleArn:
+    Description: EC2 IAM Role ARN
+    Value: !GetAtt EC2Role.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2Role-ARN
+
+  DatabaseSecretArn:
+    Description: Database secret ARN
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub ${AWS::StackName}-DatabaseSecret-ARN

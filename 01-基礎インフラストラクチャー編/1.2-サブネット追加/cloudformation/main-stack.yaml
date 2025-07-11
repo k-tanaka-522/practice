@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Main Stack - Step 2: VPC + Subnets'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-practice
+    Description: Name of the project
+  
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name
+
+Resources:
+  # VPC Stack (from Step 1)
+  VPCStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../templates/vpc.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnvironmentName: !Ref EnvironmentName
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-vpc-stack
+
+  # Subnet Stack (New in Step 2)
+  SubnetStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../templates/subnet.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnvironmentName: !Ref EnvironmentName
+        VPCId: !GetAtt VPCStack.Outputs.VPCId
+        InternetGatewayId: !GetAtt VPCStack.Outputs.InternetGatewayId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-subnet-stack
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !GetAtt VPCStack.Outputs.VPCId
+  
+  PublicSubnetId:
+    Description: Public subnet ID
+    Value: !GetAtt SubnetStack.Outputs.PublicSubnetId
+
+  PrivateSubnetId:
+    Description: Private subnet ID
+    Value: !GetAtt SubnetStack.Outputs.PrivateSubnetId
+
+  PublicRouteTableId:
+    Description: Public route table ID
+    Value: !GetAtt SubnetStack.Outputs.PublicRouteTableId
+
+  PrivateRouteTableId:
+    Description: Private route table ID
+    Value: !GetAtt SubnetStack.Outputs.PrivateRouteTableId

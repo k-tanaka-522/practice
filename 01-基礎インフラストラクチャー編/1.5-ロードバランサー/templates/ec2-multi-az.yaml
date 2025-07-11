@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Step 5: Multi-AZ EC2 instances for ALB'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-practice
+    Description: Name of the project
+  
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name
+
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID from previous step
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 1 ID for EC2 instances
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet 2 ID for EC2 instances
+
+  WebServerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group ID for web servers
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+    Default: aws-practice-keypair
+
+Resources:
+  # IAM Role for EC2 instances
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-ec2-role
+
+  # Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # Launch Template
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ProjectName}-${EnvironmentName}-web-template
+      LaunchTemplateData:
+        ImageId: ami-0d52744d6551d851e  # Amazon Linux 2023 (ap-northeast-1)
+        InstanceType: t3.micro
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroupId
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Get instance information
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            
+            # Create a simple web page
+            cat > /var/www/html/index.html << EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>AWS Practice - ${ProjectName}</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    .container { max-width: 800px; margin: 0 auto; }
+                    .header { background: #232f3e; color: white; padding: 20px; border-radius: 8px; }
+                    .content { background: #f9f9f9; padding: 20px; border-radius: 8px; margin-top: 20px; }
+                    .info { background: #e8f4f8; padding: 15px; border-radius: 5px; margin: 10px 0; }
+                    .success { background: #d4edda; padding: 15px; border-radius: 5px; margin: 10px 0; }
+                    .az-info { background: #fff3cd; padding: 15px; border-radius: 5px; margin: 10px 0; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>🚀 AWS Practice - Load Balanced Web Server</h1>
+                        <p>Environment: ${EnvironmentName}</p>
+                    </div>
+                    <div class="content">
+                        <h2>Server Information</h2>
+                        <div class="info">
+                            <strong>Instance ID:</strong> $INSTANCE_ID<br>
+                            <strong>Availability Zone:</strong> $AZ<br>
+                            <strong>Private IP:</strong> <span id="private-ip">Loading...</span>
+                        </div>
+                        <div class="success">
+                            <h3>✅ Load Balancer Test Successful!</h3>
+                            <p>This page is served through an Application Load Balancer (ALB)</p>
+                        </div>
+                        <div class="az-info">
+                            <h3>🌐 Multi-AZ Architecture</h3>
+                            <p>This server is deployed across multiple Availability Zones for high availability</p>
+                        </div>
+                        <h2>System Status</h2>
+                        <ul>
+                            <li>✅ Web server is running successfully</li>
+                            <li>✅ CloudWatch agent is monitoring system metrics</li>
+                            <li>✅ Auto Scaling is configured for high availability</li>
+                            <li>✅ Application Load Balancer is distributing traffic</li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <script>
+                    // Get private IP
+                    fetch('http://169.254.169.254/latest/meta-data/local-ipv4')
+                        .then(response => response.text())
+                        .then(data => document.getElementById('private-ip').textContent = data);
+                </script>
+            </body>
+            </html>
+            EOF
+            
+            # Install CloudWatch agent
+            yum install -y amazon-cloudwatch-agent
+            
+            # Start CloudWatch agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -s \
+                -c default
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectName}-${EnvironmentName}-web-server
+              - Key: Environment
+                Value: !Ref EnvironmentName
+              - Key: Project
+                Value: !Ref ProjectName
+
+  # Auto Scaling Group
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${ProjectName}-${EnvironmentName}-web-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 4
+      DesiredCapacity: 2
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-web-asg
+          PropagateAtLaunch: false
+        - Key: Environment
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+
+Outputs:
+  LaunchTemplateId:
+    Description: Launch Template ID
+    Value: !Ref WebServerLaunchTemplate
+    Export:
+      Name: !Sub ${AWS::StackName}-LaunchTemplate-ID
+
+  AutoScalingGroupName:
+    Description: Auto Scaling Group Name
+    Value: !Ref WebServerAutoScalingGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-ASG-Name
+
+  EC2RoleArn:
+    Description: EC2 IAM Role ARN
+    Value: !GetAtt EC2Role.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-EC2Role-ARN

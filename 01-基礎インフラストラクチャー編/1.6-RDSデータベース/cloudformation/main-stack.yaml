@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Main Stack - Step 6: Complete 3-Tier Web Application with RDS'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-practice
+    Description: Name of the project
+  
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+    Default: aws-practice-keypair
+
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: '[a-zA-Z0-9]+'
+    ConstraintDescription: Must contain only alphanumeric characters
+    Default: MyPassword123
+    Description: Database password (8-41 characters)
+
+Resources:
+  # VPC Stack (from Step 1)
+  VPCStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../templates/vpc.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnvironmentName: !Ref EnvironmentName
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-vpc-stack
+
+  # Multi-AZ Subnet Stack (from Step 5)
+  SubnetStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../templates/subnet-multi-az.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnvironmentName: !Ref EnvironmentName
+        VPCId: !GetAtt VPCStack.Outputs.VPCId
+        InternetGatewayId: !GetAtt VPCStack.Outputs.InternetGatewayId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-subnet-stack
+
+  # Security Groups Stack (from Step 3)
+  SecurityGroupsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../templates/security-groups.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnvironmentName: !Ref EnvironmentName
+        VPCId: !GetAtt VPCStack.Outputs.VPCId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-sg-stack
+
+  # RDS Database Stack (New in Step 6)
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../templates/rds.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnvironmentName: !Ref EnvironmentName
+        VPCId: !GetAtt VPCStack.Outputs.VPCId
+        PrivateSubnet1Id: !GetAtt SubnetStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt SubnetStack.Outputs.PrivateSubnet2Id
+        DatabaseSecurityGroupId: !GetAtt SecurityGroupsStack.Outputs.DatabaseSecurityGroupId
+        DatabasePassword: !Ref DatabasePassword
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-database-stack
+
+  # EC2 with Database Connection Stack (Updated for Step 6)
+  EC2Stack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../templates/ec2-with-db.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnvironmentName: !Ref EnvironmentName
+        VPCId: !GetAtt VPCStack.Outputs.VPCId
+        PrivateSubnet1Id: !GetAtt SubnetStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt SubnetStack.Outputs.PrivateSubnet2Id
+        WebServerSecurityGroupId: !GetAtt SecurityGroupsStack.Outputs.WebServerSecurityGroupId
+        KeyPairName: !Ref KeyPairName
+        DatabaseEndpoint: !GetAtt DatabaseStack.Outputs.DatabaseEndpoint
+        DatabaseName: !GetAtt DatabaseStack.Outputs.DatabaseName
+        DatabaseUser: !GetAtt DatabaseStack.Outputs.DatabaseUser
+        DatabasePassword: !Ref DatabasePassword
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-ec2-stack
+
+  # Application Load Balancer Stack (from Step 5)
+  ALBStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../templates/alb.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnvironmentName: !Ref EnvironmentName
+        VPCId: !GetAtt VPCStack.Outputs.VPCId
+        PublicSubnet1Id: !GetAtt SubnetStack.Outputs.PublicSubnet1Id
+        PublicSubnet2Id: !GetAtt SubnetStack.Outputs.PublicSubnet2Id
+        ALBSecurityGroupId: !GetAtt SecurityGroupsStack.Outputs.ALBSecurityGroupId
+        AutoScalingGroupName: !GetAtt EC2Stack.Outputs.AutoScalingGroupName
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-alb-stack
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !GetAtt VPCStack.Outputs.VPCId
+  
+  ApplicationLoadBalancerDNS:
+    Description: Application Load Balancer DNS Name
+    Value: !GetAtt ALBStack.Outputs.ApplicationLoadBalancerDNS
+
+  WebsiteURL:
+    Description: Website URL
+    Value: !GetAtt ALBStack.Outputs.WebsiteURL
+
+  DatabaseTestURL:
+    Description: Database Test URL
+    Value: !Sub "${ALBStack.Outputs.WebsiteURL}/dbtest.php"
+
+  DatabaseEndpoint:
+    Description: Database endpoint
+    Value: !GetAtt DatabaseStack.Outputs.DatabaseEndpoint
+
+  DatabaseName:
+    Description: Database name
+    Value: !GetAtt DatabaseStack.Outputs.DatabaseName
+
+  AutoScalingGroupName:
+    Description: Auto Scaling Group Name
+    Value: !GetAtt EC2Stack.Outputs.AutoScalingGroupName
+
+  ArchitectureCompleted:
+    Description: Architecture Status
+    Value: "✅ Complete 3-Tier AWS Architecture Successfully Deployed!"
