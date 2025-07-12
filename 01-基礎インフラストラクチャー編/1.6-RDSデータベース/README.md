@@ -93,21 +93,39 @@ echo "MySecurePassword123" # 実際の本番環境では、より複雑なパス
 aws cloudformation delete-stack --stack-name aws-practice-alb
 ```
 
-### 2. 完全な3層アーキテクチャのデプロイ
+### 2. S3バケットの作成とテンプレートのアップロード
+
+```bash
+# ユニークなバケット名を作成
+BUCKET_NAME="aws-practice-templates-$(date +%s)"
+echo "Using bucket: $BUCKET_NAME"
+
+# S3バケットの作成
+aws s3 mb s3://$BUCKET_NAME
+
+# CloudFormationテンプレートをS3にアップロード
+aws s3 cp cloudformation/ s3://$BUCKET_NAME/cloudformation/ --recursive
+
+# アップロードの確認
+aws s3 ls s3://$BUCKET_NAME/cloudformation/
+```
+
+### 3. 完全な3層アーキテクチャのデプロイ
 
 ```bash
 # 完全なスタックの作成
 aws cloudformation create-stack \
   --stack-name aws-practice-complete \
-  --template-body file://cloudformation/main-stack.yaml \
+  --template-url https://$BUCKET_NAME.s3.amazonaws.com/cloudformation/main-stack.yaml \
   --parameters ParameterKey=ProjectName,ParameterValue=aws-practice \
                ParameterKey=EnvironmentName,ParameterValue=dev \
+               ParameterKey=S3BucketName,ParameterValue=$BUCKET_NAME \
                ParameterKey=KeyPairName,ParameterValue=aws-practice-keypair \
                ParameterKey=DatabasePassword,ParameterValue=MySecurePassword123 \
   --capabilities CAPABILITY_IAM
 ```
 
-### 3. デプロイ完了の確認
+### 4. デプロイ完了の確認
 
 ```bash
 # スタックの状態確認
@@ -267,18 +285,26 @@ aws cloudwatch get-metric-statistics \
 ## 🗑️ リソースの削除
 
 ```bash
-# Key Pairの削除
-aws ec2 delete-key-pair --key-name aws-practice-keypair
-rm aws-practice-keypair.pem
-
 # スタックの削除
 aws cloudformation delete-stack \
   --stack-name aws-practice-complete
 
+# スタック削除の完了を待機
+aws cloudformation wait stack-delete-complete \
+  --stack-name aws-practice-complete
+
+# S3バケットの中身を削除
+aws s3 rm s3://$BUCKET_NAME --recursive
+
+# S3バケットの削除
+aws s3 rb s3://$BUCKET_NAME
+
+# Key Pairの削除
+aws ec2 delete-key-pair --key-name aws-practice-keypair
+rm aws-practice-keypair.pem
+
 # 削除の確認
-aws cloudformation describe-stacks \
-  --stack-name aws-practice-complete \
-  --query 'Stacks[0].StackStatus'
+echo "All resources have been deleted successfully!"
 ```
 
 ## 🎉 学習完了

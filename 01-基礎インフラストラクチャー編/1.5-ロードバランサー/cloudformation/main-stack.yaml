@@ -12,6 +12,10 @@ Parameters:
     Default: dev
     Description: Environment name
 
+  S3BucketName:
+    Type: String
+    Description: S3 bucket name for CloudFormation templates
+
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
     Description: EC2 Key Pair for SSH access
@@ -22,7 +26,7 @@ Resources:
   VPCStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: ../templates/vpc.yaml
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/vpc.yaml'
       Parameters:
         ProjectName: !Ref ProjectName
         EnvironmentName: !Ref EnvironmentName
@@ -34,7 +38,7 @@ Resources:
   SubnetStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: ../templates/subnet-multi-az.yaml
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/subnet-multi-az.yaml'
       Parameters:
         ProjectName: !Ref ProjectName
         EnvironmentName: !Ref EnvironmentName
@@ -48,7 +52,7 @@ Resources:
   SecurityGroupsStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: ../templates/security-groups.yaml
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/security-groups.yaml'
       Parameters:
         ProjectName: !Ref ProjectName
         EnvironmentName: !Ref EnvironmentName
@@ -61,7 +65,7 @@ Resources:
   EC2Stack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: ../templates/ec2-multi-az.yaml
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/ec2-multi-az.yaml'
       Parameters:
         ProjectName: !Ref ProjectName
         EnvironmentName: !Ref EnvironmentName
@@ -78,7 +82,7 @@ Resources:
   ALBStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: ../templates/alb.yaml
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/alb.yaml'
       Parameters:
         ProjectName: !Ref ProjectName
         EnvironmentName: !Ref EnvironmentName
