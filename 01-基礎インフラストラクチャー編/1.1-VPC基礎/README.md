@@ -26,12 +26,17 @@ AWSの基礎となるVPC（Virtual Private Cloud）を作成します。まず�
 
 ## 🚀 デプロイ手順
 
+### 前提条件
+- **実行ディレクトリ**: このREADMEがあるディレクトリ（`1.1-VPC基礎/`）から実行してください
+- **AWS CLI**: 設定済みであること
+- **権限**: CloudFormationとVPC作成権限があること
+
 ### 1. テンプレートの検証
 
 ```bash
 # CloudFormationテンプレートの検証
 aws cloudformation validate-template \
-  --template-body file://cloudformation/main-stack.yaml
+  --template-body file://cloudformation/templates/main-stack.yaml
 ```
 
 ### 2. スタックの作成
@@ -40,7 +45,7 @@ aws cloudformation validate-template \
 # メインスタックの作成
 aws cloudformation create-stack \
   --stack-name aws-practice-vpc \
-  --template-body file://cloudformation/main-stack.yaml \
+  --template-body file://cloudformation/templates/main-stack.yaml \
   --parameters ParameterKey=ProjectName,ParameterValue=aws-practice \
                ParameterKey=EnvironmentName,ParameterValue=dev
 ```

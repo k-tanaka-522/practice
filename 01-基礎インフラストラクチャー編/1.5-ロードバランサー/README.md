@@ -64,6 +64,11 @@ chmod 600 aws-practice-keypair.pem
 
 ## 🚀 デプロイ手順
 
+### 前提条件
+- **実行ディレクトリ**: このREADMEがあるディレクトリ（`1.5-ロードバランサー/`）から実行してください
+- **AWS CLI**: 設定済みであること
+- **権限**: CloudFormationとVPC作成権限があること
+
 ### 1. 前のステップのクリーンアップ (必要に応じて)
 
 ```bash
@@ -77,7 +82,7 @@ aws cloudformation delete-stack --stack-name aws-practice-ec2
 # メインスタックの作成 (完全なWebアプリケーション)
 aws cloudformation create-stack \
   --stack-name aws-practice-alb \
-  --template-body file://cloudformation/main-stack.yaml \
+  --template-body file://cloudformation/templates/main-stack.yaml \
   --parameters ParameterKey=ProjectName,ParameterValue=aws-practice \
                ParameterKey=EnvironmentName,ParameterValue=dev \
                ParameterKey=KeyPairName,ParameterValue=aws-practice-keypair \
