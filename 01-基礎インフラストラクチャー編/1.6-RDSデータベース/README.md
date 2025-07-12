@@ -99,7 +99,7 @@ aws cloudformation delete-stack --stack-name aws-practice-alb
 # 完全なスタックの作成
 aws cloudformation create-stack \
   --stack-name aws-practice-complete \
-  --template-body file://cloudformation/templates/main-stack.yaml \
+  --template-body file://cloudformation/main-stack.yaml \
   --parameters ParameterKey=ProjectName,ParameterValue=aws-practice \
                ParameterKey=EnvironmentName,ParameterValue=dev \
                ParameterKey=KeyPairName,ParameterValue=aws-practice-keypair \

@@ -55,7 +55,7 @@ aws cloudformation delete-stack --stack-name aws-practice-dev-step1
 # メインスタックの作成 (VPC + サブネット)
 aws cloudformation create-stack \
   --stack-name aws-practice-dev-step2 \
-  --template-body file://cloudformation/templates/main-stack.yaml \
+  --template-body file://cloudformation/main-stack.yaml \
   --parameters ParameterKey=ProjectName,ParameterValue=aws-practice \
                ParameterKey=EnvironmentName,ParameterValue=dev
 ```

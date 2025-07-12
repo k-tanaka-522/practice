@@ -36,7 +36,7 @@ AWSの基礎となるVPC（Virtual Private Cloud）を作成します。まず�
 ```bash
 # CloudFormationテンプレートの検証
 aws cloudformation validate-template \
-  --template-body file://cloudformation/templates/main-stack.yaml
+  --template-body file://cloudformation/main-stack.yaml
 ```
 
 ### 2. スタックの作成
@@ -45,7 +45,7 @@ aws cloudformation validate-template \
 # メインスタックの作成
 aws cloudformation create-stack \
   --stack-name aws-practice-vpc \
-  --template-body file://cloudformation/templates/main-stack.yaml \
+  --template-body file://cloudformation/main-stack.yaml \
   --parameters ParameterKey=ProjectName,ParameterValue=aws-practice \
                ParameterKey=EnvironmentName,ParameterValue=dev
 ```

@@ -53,7 +53,7 @@ aws cloudformation delete-stack --stack-name aws-practice-subnets
 # メインスタックの作成 (VPC + サブネット + セキュリティグループ)
 aws cloudformation create-stack \
   --stack-name aws-practice-security \
-  --template-body file://cloudformation/templates/main-stack.yaml \
+  --template-body file://cloudformation/main-stack.yaml \
   --parameters ParameterKey=ProjectName,ParameterValue=aws-practice \
                ParameterKey=EnvironmentName,ParameterValue=dev
 ```
