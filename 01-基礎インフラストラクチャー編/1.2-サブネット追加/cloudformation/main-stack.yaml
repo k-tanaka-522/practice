@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Main Stack - Step 2: VPC + Subnets'
+Description: 'Step 2: VPC + Subnets'
 
 Parameters:
   ProjectName:
@@ -13,49 +13,134 @@ Parameters:
     Description: Environment name
 
 Resources:
-  # VPC Stack (from Step 1)
-  VPCStack:
-    Type: AWS::CloudFormation::Stack
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
     Properties:
-      TemplateURL: ../templates/vpc.yaml
-      Parameters:
-        ProjectName: !Ref ProjectName
-        EnvironmentName: !Ref EnvironmentName
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
       Tags:
         - Key: Name
-          Value: !Sub ${ProjectName}-${EnvironmentName}-vpc-stack
+          Value: !Sub ${ProjectName}-${EnvironmentName}-vpc
 
-  # Subnet Stack (New in Step 2)
-  SubnetStack:
-    Type: AWS::CloudFormation::Stack
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
     Properties:
-      TemplateURL: ../templates/subnet.yaml
-      Parameters:
-        ProjectName: !Ref ProjectName
-        EnvironmentName: !Ref EnvironmentName
-        VPCId: !GetAtt VPCStack.Outputs.VPCId
-        InternetGatewayId: !GetAtt VPCStack.Outputs.InternetGatewayId
       Tags:
         - Key: Name
-          Value: !Sub ${ProjectName}-${EnvironmentName}-subnet-stack
+          Value: !Sub ${ProjectName}-${EnvironmentName}-igw
+
+  # Attach Internet Gateway to VPC
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-public-subnet
+
+  # Private Subnet
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-private-subnet
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-public-rt
+
+  # Public Route
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Public Subnet Route Table Association
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private Route Table
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${EnvironmentName}-private-rt
+
+  # Private Subnet Route Table Association
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
 
 Outputs:
   VPCId:
     Description: VPC ID
-    Value: !GetAtt VPCStack.Outputs.VPCId
-  
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${AWS::StackName}-VPC-ID
+
+  VPCCidr:
+    Description: VPC CIDR block
+    Value: 10.0.0.0/16
+    Export:
+      Name: !Sub ${AWS::StackName}-VPC-CIDR
+
+  InternetGatewayId:
+    Description: Internet Gateway ID
+    Value: !Ref InternetGateway
+    Export:
+      Name: !Sub ${AWS::StackName}-VPC-IGW-ID
+
   PublicSubnetId:
     Description: Public subnet ID
-    Value: !GetAtt SubnetStack.Outputs.PublicSubnetId
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnet-ID
 
   PrivateSubnetId:
     Description: Private subnet ID
-    Value: !GetAtt SubnetStack.Outputs.PrivateSubnetId
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateSubnet-ID
 
   PublicRouteTableId:
     Description: Public route table ID
-    Value: !GetAtt SubnetStack.Outputs.PublicRouteTableId
+    Value: !Ref PublicRouteTable
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicRT-ID
 
   PrivateRouteTableId:
     Description: Private route table ID
-    Value: !GetAtt SubnetStack.Outputs.PrivateRouteTableId
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateRT-ID

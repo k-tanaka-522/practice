@@ -12,12 +12,16 @@ Parameters:
     Default: dev
     Description: Environment name
 
+  S3BucketName:
+    Type: String
+    Description: S3 bucket name for CloudFormation templates
+
 Resources:
   # VPC Stack
   VPCStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: ../templates/vpc.yaml
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/vpc.yaml'
       Parameters:
         ProjectName: !Ref ProjectName
         EnvironmentName: !Ref EnvironmentName
