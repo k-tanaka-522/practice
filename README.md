@@ -408,8 +408,5 @@ cd ai-driven-development-practice
 [![AWS](https://img.shields.io/badge/AWS-Certified-orange.svg)](https://aws.amazon.com/)
 [![Bedrock](https://img.shields.io/badge/Bedrock-AI-blue.svg)](https://aws.amazon.com/bedrock/)
 
-</div>#   p r a c t i c e 
- 
- #   p r a c t i c e 
- 
- 
+
+</div>
