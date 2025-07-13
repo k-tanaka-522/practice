@@ -1,0 +1,657 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Comprehensive APM and Monitoring Stack for CI/CD Applications'
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: my-web-app
+    Description: Name of the application to monitor
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Environment name
+
+  AlertEmail:
+    Type: String
+    Description: Email address for alerts and notifications
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: Slack webhook URL for notifications (optional)
+    NoEcho: true
+
+  PagerDutyRoutingKey:
+    Type: String
+    Default: ''
+    Description: PagerDuty routing key for critical alerts (optional)
+    NoEcho: true
+
+Resources:
+  # X-Ray Service Map
+  XRayServiceMap:
+    Type: AWS::XRay::SamplingRule
+    Properties:
+      SamplingRule:
+        RuleName: !Sub '${ApplicationName}-${Environment}-sampling'
+        Priority: 9000
+        FixedRate: 0.1
+        ReservoirSize: 1
+        ServiceName: !Sub '${ApplicationName}-*'
+        ServiceType: '*'
+        Host: '*'
+        HTTPMethod: '*'
+        URLPath: '*'
+        Version: 1
+
+  # CloudWatch Dashboard
+  ApplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ApplicationName}-${Environment}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationName}-alb"],
+                  [".", "TargetResponseTime", ".", "."],
+                  [".", "HTTPCode_Target_4XX_Count", ".", "."],
+                  [".", "HTTPCode_Target_5XX_Count", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "ALB Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ECS", "CPUUtilization", "ServiceName", "${ApplicationName}-service", "ClusterName", "${ApplicationName}-cluster"],
+                  [".", "MemoryUtilization", ".", ".", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "ECS Resource Utilization"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/X-Ray", "TracesReceived", "ServiceName", "${ApplicationName}"],
+                  [".", "ResponseTime", ".", "."],
+                  [".", "ErrorRate", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "X-Ray Traces"
+              }
+            },
+            {
+              "type": "log",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/ecs/${ApplicationName}'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # Custom Lambda for Business Metrics
+  BusinessMetricsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-business-metrics'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt BusinessMetricsRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import time
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              cloudwatch = boto3.client('cloudwatch')
+              
+              # ビジネスメトリクスの例
+              metrics_data = [
+                  {
+                      'MetricName': 'ActiveUsers',
+                      'Value': get_active_users(),
+                      'Unit': 'Count',
+                      'Dimensions': [
+                          {'Name': 'Application', 'Value': os.environ['APPLICATION_NAME']},
+                          {'Name': 'Environment', 'Value': os.environ['ENVIRONMENT']}
+                      ]
+                  },
+                  {
+                      'MetricName': 'TransactionVolume',
+                      'Value': get_transaction_volume(),
+                      'Unit': 'Count',
+                      'Dimensions': [
+                          {'Name': 'Application', 'Value': os.environ['APPLICATION_NAME']},
+                          {'Name': 'Environment', 'Value': os.environ['ENVIRONMENT']}
+                      ]
+                  },
+                  {
+                      'MetricName': 'Revenue',
+                      'Value': get_revenue(),
+                      'Unit': 'None',
+                      'Dimensions': [
+                          {'Name': 'Application', 'Value': os.environ['APPLICATION_NAME']},
+                          {'Name': 'Environment', 'Value': os.environ['ENVIRONMENT']}
+                      ]
+                  }
+              ]
+              
+              # メトリクス送信
+              cloudwatch.put_metric_data(
+                  Namespace='BusinessMetrics',
+                  MetricData=metrics_data
+              )
+              
+              return {'statusCode': 200, 'body': 'Metrics sent successfully'}
+          
+          def get_active_users():
+              # DynamoDBやRDSから取得する実装
+              return 1000
+          
+          def get_transaction_volume():
+              # トランザクション数を取得する実装
+              return 500
+          
+          def get_revenue():
+              # 収益を取得する実装
+              return 10000.0
+      Environment:
+        Variables:
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT: !Ref Environment
+
+  BusinessMetricsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: '*'
+
+  # EventBridge Rule for Metrics Collection
+  MetricsScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Schedule for collecting business metrics
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BusinessMetricsLambda.Arn
+          Id: BusinessMetricsTarget
+
+  MetricsSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BusinessMetricsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MetricsScheduleRule.Arn
+
+  # SLO/SLI Monitoring
+  # SLI: Request Success Rate
+  RequestSuccessRateSLI:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-sli-success-rate'
+      AlarmDescription: 'SLI: Request success rate below 99.9%'
+      MetricName: HTTPCode_Target_2XX_Count
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 0.999
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Sub '${ApplicationName}-alb'
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+
+  # SLI: Response Time
+  ResponseTimeSLI:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-sli-response-time'
+      AlarmDescription: 'SLI: Response time above 500ms'
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 0.5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Sub '${ApplicationName}-alb'
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+
+  # Business Metrics Alarms
+  ActiveUsersDropAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-active-users-drop'
+      AlarmDescription: 'Active users dropped significantly'
+      MetricName: ActiveUsers
+      Namespace: BusinessMetrics
+      Statistic: Average
+      Period: 900
+      EvaluationPeriods: 2
+      Threshold: 500
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: Application
+          Value: !Ref ApplicationName
+        - Name: Environment
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+
+  RevenueDropAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-revenue-drop'
+      AlarmDescription: 'Revenue dropped significantly'
+      MetricName: Revenue
+      Namespace: BusinessMetrics
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 5000
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      Dimensions:
+        - Name: Application
+          Value: !Ref ApplicationName
+        - Name: Environment
+          Value: !Ref Environment
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+
+  # Anomaly Detection
+  RequestCountAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      MetricName: RequestCount
+      Namespace: AWS/ApplicationELB
+      Stat: Sum
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Sub '${ApplicationName}-alb'
+
+  RequestCountAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-request-count-anomaly'
+      AlarmDescription: 'Anomalous request count detected'
+      ComparisonOperator: LessThanLowerOrGreaterThanUpperThreshold
+      EvaluationPeriods: 2
+      Metrics:
+        - Id: m1
+          MetricStat:
+            Metric:
+              MetricName: RequestCount
+              Namespace: AWS/ApplicationELB
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !Sub '${ApplicationName}-alb'
+            Period: 300
+            Stat: Sum
+        - Id: ad1
+          AnomalyDetector:
+            MetricMathAnomalyDetector:
+              MetricDataQueries:
+                - Id: m1
+                  MetricStat:
+                    Metric:
+                      MetricName: RequestCount
+                      Namespace: AWS/ApplicationELB
+                      Dimensions:
+                        - Name: LoadBalancer
+                          Value: !Sub '${ApplicationName}-alb'
+                    Period: 300
+                    Stat: Sum
+      ThresholdMetricId: ad1
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+
+  # SNS Topics for Alerts
+  CriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-critical-alerts'
+      DisplayName: 'Critical Alerts'
+
+  WarningAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-warning-alerts'
+      DisplayName: 'Warning Alerts'
+
+  # Email Subscriptions
+  CriticalEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CriticalAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  WarningEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WarningAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # Lambda for Enhanced Notifications
+  NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-notification-handler'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt NotificationRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import urllib3
+          
+          def lambda_handler(event, context):
+              try:
+                  # SNSメッセージを解析
+                  sns_message = json.loads(event['Records'][0]['Sns']['Message'])
+                  
+                  # アラーム情報を抽出
+                  alarm_name = sns_message.get('AlarmName', 'Unknown')
+                  new_state = sns_message.get('NewStateValue', 'UNKNOWN')
+                  reason = sns_message.get('NewStateReason', 'No reason provided')
+                  
+                  # Slack通知
+                  slack_webhook = os.environ.get('SLACK_WEBHOOK_URL')
+                  if slack_webhook:
+                      send_slack_notification(slack_webhook, alarm_name, new_state, reason)
+                  
+                  # PagerDuty通知 (クリティカルアラームのみ)
+                  pagerduty_key = os.environ.get('PAGERDUTY_ROUTING_KEY')
+                  if pagerduty_key and 'critical' in alarm_name.lower():
+                      send_pagerduty_alert(pagerduty_key, alarm_name, new_state, reason)
+                  
+                  return {'statusCode': 200, 'body': 'Notifications sent'}
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+          
+          def send_slack_notification(webhook_url, alarm_name, state, reason):
+              http = urllib3.PoolManager()
+              
+              color = 'danger' if state == 'ALARM' else 'good'
+              
+              payload = {
+                  'attachments': [{
+                      'color': color,
+                      'title': f'CloudWatch Alarm: {alarm_name}',
+                      'text': f'State: {state}\nReason: {reason}',
+                      'ts': int(time.time())
+                  }]
+              }
+              
+              response = http.request(
+                  'POST',
+                  webhook_url,
+                  body=json.dumps(payload),
+                  headers={'Content-Type': 'application/json'}
+              )
+              
+              return response.status == 200
+          
+          def send_pagerduty_alert(routing_key, alarm_name, state, reason):
+              http = urllib3.PoolManager()
+              
+              event_action = 'trigger' if state == 'ALARM' else 'resolve'
+              
+              payload = {
+                  'routing_key': routing_key,
+                  'event_action': event_action,
+                  'dedup_key': alarm_name,
+                  'payload': {
+                      'summary': f'CloudWatch Alarm: {alarm_name}',
+                      'source': 'AWS CloudWatch',
+                      'severity': 'critical',
+                      'custom_details': {
+                          'state': state,
+                          'reason': reason
+                      }
+                  }
+              }
+              
+              response = http.request(
+                  'POST',
+                  'https://events.pagerduty.com/v2/enqueue',
+                  body=json.dumps(payload),
+                  headers={'Content-Type': 'application/json'}
+              )
+              
+              return response.status == 202
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          PAGERDUTY_ROUTING_KEY: !Ref PagerDutyRoutingKey
+
+  NotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Lambda Subscription to SNS Topics
+  CriticalNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CriticalAlertsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt NotificationLambda.Arn
+
+  WarningNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WarningAlertsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt NotificationLambda.Arn
+
+  # Permissions for SNS to invoke Lambda
+  CriticalNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CriticalAlertsTopic
+
+  WarningNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref WarningAlertsTopic
+
+  # CloudWatch Synthetics for E2E Monitoring
+  SyntheticsCanary:
+    Type: AWS::Synthetics::Canary
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-e2e-check'
+      ExecutionRoleArn: !GetAtt SyntheticsRole.Arn
+      Code:
+        Handler: pageLoadBlueprint.handler
+        Script: !Sub |
+          const synthetics = require('Synthetics');
+          const log = require('SyntheticsLogger');
+          
+          const loadBlueprint = async function () {
+              const URL = "${ApplicationName}.example.com";
+              
+              let page = await synthetics.getPage();
+              
+              const response = await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              
+              if (!response) {
+                  throw "Failed to load page!";
+              }
+              
+              await page.waitFor(15000);
+              
+              await synthetics.takeScreenshot('loaded', 'loaded');
+              
+              // カスタムチェック
+              const title = await page.title();
+              if (!title.includes('${ApplicationName}')) {
+                  throw "Page title doesn't contain application name";
+              }
+              
+              // API ヘルスチェック
+              const healthResponse = await page.goto(`${URL}/health`, { waitUntil: 'domcontentloaded' });
+              if (healthResponse.status() !== 200) {
+                  throw "Health check failed";
+              }
+          };
+          
+          exports.handler = async () => {
+              return await synthetics.executeStep('loadBlueprint', loadBlueprint);
+          };
+      ArtifactS3Location: !Sub 's3://${SyntheticsArtifactsBucket}'
+      RuntimeVersion: syn-nodejs-puppeteer-3.5
+      Schedule:
+        Expression: 'rate(5 minutes)'
+        DurationInSeconds: 0
+      RunConfig:
+        TimeoutInSeconds: 60
+        MemoryInMB: 960
+      FailureRetentionPeriod: 30
+      SuccessRetentionPeriod: 30
+
+  SyntheticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/CloudWatchSyntheticsExecutionRolePolicy
+
+  SyntheticsArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-${Environment}-synthetics-artifacts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+Outputs:
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationName}-${Environment}-monitoring'
+
+  CriticalAlertsTopicArn:
+    Description: SNS Topic ARN for Critical Alerts
+    Value: !Ref CriticalAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CriticalAlertsTopic'
+
+  WarningAlertsTopicArn:
+    Description: SNS Topic ARN for Warning Alerts
+    Value: !Ref WarningAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-WarningAlertsTopic'
+
+  SyntheticsCanaryName:
+    Description: CloudWatch Synthetics Canary Name
+    Value: !Ref SyntheticsCanary
+
+  XRaySamplingRuleName:
+    Description: X-Ray Sampling Rule Name
+    Value: !Ref XRayServiceMap

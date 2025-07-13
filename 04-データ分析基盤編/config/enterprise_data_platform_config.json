@@ -1,0 +1,366 @@
+{
+  "data_platform": {
+    "name": "enterprise-data-platform",
+    "environment": "production",
+    "region": "us-east-1",
+    "aws_account_id": "123456789012"
+  },
+  "kinesis_streaming": {
+    "stream_name": "enterprise-data-stream",
+    "shard_count": 5,
+    "retention_hours": 168,
+    "data_generation": {
+      "events_per_second": 100,
+      "duration_seconds": 3600,
+      "data_types": [
+        "user_activity",
+        "transaction",
+        "system_metric",
+        "sensor_data",
+        "clickstream",
+        "app_log"
+      ],
+      "realistic_patterns": true,
+      "burst_mode": false,
+      "burst_events": 10000
+    },
+    "consumers": [
+      {
+        "name": "real-time-processor",
+        "type": "lambda",
+        "batch_size": 100,
+        "parallelization_factor": 2
+      },
+      {
+        "name": "analytics-processor",
+        "type": "lambda",
+        "batch_size": 500,
+        "parallelization_factor": 1
+      }
+    ]
+  },
+  "etl_pipeline": {
+    "raw_bucket": "enterprise-raw-data-bucket",
+    "processed_bucket": "enterprise-processed-data-bucket",
+    "curated_bucket": "enterprise-curated-data-bucket",
+    "scripts_bucket": "enterprise-etl-scripts-bucket",
+    "database_name": "enterprise_analytics_db",
+    "glue_jobs": [
+      {
+        "name": "customer-data-processing",
+        "type": "pyspark",
+        "worker_type": "G.2X",
+        "max_workers": 20,
+        "script_location": "s3://enterprise-etl-scripts-bucket/customer_etl.py",
+        "schedule": "cron(0 2 * * ? *)"
+      },
+      {
+        "name": "sales-data-processing",
+        "type": "pyspark",
+        "worker_type": "G.2X",
+        "max_workers": 15,
+        "script_location": "s3://enterprise-etl-scripts-bucket/sales_etl.py",
+        "schedule": "cron(0 3 * * ? *)"
+      }
+    ],
+    "data_quality": {
+      "completeness_threshold": 0.95,
+      "uniqueness_threshold": 0.99,
+      "validity_threshold": 0.98,
+      "consistency_threshold": 0.95
+    },
+    "notifications": {
+      "sns_topic_arn": "arn:aws:sns:us-east-1:123456789012:etl-notifications",
+      "success_notifications": true,
+      "failure_notifications": true
+    }
+  },
+  "quicksight_dashboards": {
+    "account_id": "123456789012",
+    "region": "us-east-1",
+    "edition": "ENTERPRISE",
+    "data_sources": [
+      {
+        "type": "s3",
+        "name": "enterprise-data-lake",
+        "location": "s3://enterprise-curated-data-bucket/"
+      },
+      {
+        "type": "athena",
+        "name": "analytics-database",
+        "database": "enterprise_analytics_db"
+      }
+    ],
+    "executive_permissions": [
+      {
+        "principal": "arn:aws:quicksight:us-east-1:123456789012:user/default/executive-user",
+        "actions": [
+          "quicksight:DescribeDashboard",
+          "quicksight:ListDashboardVersions",
+          "quicksight:QueryDashboard"
+        ]
+      }
+    ],
+    "operational_permissions": [
+      {
+        "principal": "arn:aws:quicksight:us-east-1:123456789012:group/default/operations-team",
+        "actions": [
+          "quicksight:DescribeDashboard",
+          "quicksight:QueryDashboard",
+          "quicksight:UpdateDashboard"
+        ]
+      }
+    ],
+    "analytical_permissions": [
+      {
+        "principal": "arn:aws:quicksight:us-east-1:123456789012:group/default/data-analysts",
+        "actions": [
+          "quicksight:DescribeDashboard",
+          "quicksight:QueryDashboard",
+          "quicksight:CreateAnalysis",
+          "quicksight:UpdateAnalysis"
+        ]
+      }
+    ],
+    "refresh_schedules": {
+      "executive": "0 6 * * *",
+      "operational": "*/15 * * * *",
+      "analytical": "0 */6 * * *",
+      "customer": "0 8 * * *"
+    }
+  },
+  "cloudwatch_monitoring": {
+    "region": "us-east-1",
+    "custom_metrics": [
+      {
+        "name": "DataQualityScore",
+        "namespace": "DataPlatform/Quality",
+        "type": "gauge",
+        "unit": "Percent",
+        "description": "Overall data quality score"
+      },
+      {
+        "name": "ProcessingLatency",
+        "namespace": "DataPlatform/Performance",
+        "type": "timer",
+        "unit": "Milliseconds",
+        "description": "End-to-end processing latency"
+      },
+      {
+        "name": "DataVolume",
+        "namespace": "DataPlatform/Volume",
+        "type": "gauge",
+        "unit": "Bytes",
+        "description": "Data volume processed"
+      }
+    ],
+    "alert_rules": [
+      {
+        "name": "HighDataQualityDegradation",
+        "metric_name": "DataQualityScore",
+        "namespace": "DataPlatform/Quality",
+        "statistic": "Average",
+        "threshold": 85.0,
+        "comparison_operator": "LessThanThreshold",
+        "evaluation_periods": 2,
+        "period": 300,
+        "severity": "high",
+        "dynamic_threshold": false,
+        "actions": [
+          "arn:aws:sns:us-east-1:123456789012:data-quality-alerts"
+        ]
+      },
+      {
+        "name": "HighProcessingLatency",
+        "metric_name": "ProcessingLatency",
+        "namespace": "DataPlatform/Performance",
+        "statistic": "Average",
+        "threshold": 5000,
+        "comparison_operator": "GreaterThanThreshold",
+        "evaluation_periods": 3,
+        "period": 300,
+        "severity": "medium",
+        "dynamic_threshold": true,
+        "actions": [
+          "arn:aws:sns:us-east-1:123456789012:performance-alerts"
+        ]
+      }
+    ],
+    "anomaly_detection": {
+      "detectors": [
+        {
+          "namespace": "DataPlatform/Volume",
+          "metric_name": "DataVolume",
+          "stat": "Average",
+          "dimensions": []
+        },
+        {
+          "namespace": "AWS/Kinesis",
+          "metric_name": "IncomingRecords",
+          "stat": "Sum",
+          "dimensions": [
+            {
+              "Name": "StreamName",
+              "Value": "enterprise-data-stream"
+            }
+          ]
+        }
+      ]
+    },
+    "dashboard_name": "enterprise-monitoring-dashboard",
+    "sla_monitoring": {
+      "data_availability": {
+        "sla_threshold": 99.9,
+        "evaluation_periods": 2,
+        "metrics": [
+          {
+            "namespace": "DataPlatform/Availability",
+            "metric_name": "DataAvailability"
+          }
+        ],
+        "alarm_actions": [
+          "arn:aws:sns:us-east-1:123456789012:sla-violations"
+        ]
+      },
+      "processing_time": {
+        "sla_threshold": 95.0,
+        "evaluation_periods": 3,
+        "metrics": [
+          {
+            "namespace": "DataPlatform/Performance",
+            "metric_name": "ProcessingLatency"
+          }
+        ],
+        "alarm_actions": [
+          "arn:aws:sns:us-east-1:123456789012:sla-violations"
+        ]
+      }
+    },
+    "cost_monitoring": {
+      "services": [
+        "Amazon Kinesis",
+        "AWS Glue",
+        "Amazon S3",
+        "Amazon QuickSight",
+        "Amazon CloudWatch"
+      ],
+      "budget_threshold": 1000,
+      "cost_anomaly_threshold": 20
+    }
+  },
+  "security": {
+    "encryption": {
+      "at_rest": true,
+      "in_transit": true,
+      "kms_key_id": "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"
+    },
+    "iam_roles": {
+      "glue_service_role": "arn:aws:iam::123456789012:role/GlueServiceRole",
+      "lambda_execution_role": "arn:aws:iam::123456789012:role/LambdaExecutionRole",
+      "quicksight_service_role": "arn:aws:iam::123456789012:role/QuickSightServiceRole"
+    },
+    "vpc_config": {
+      "vpc_id": "vpc-12345678",
+      "subnet_ids": [
+        "subnet-12345678",
+        "subnet-87654321"
+      ],
+      "security_group_ids": [
+        "sg-12345678"
+      ]
+    }
+  },
+  "networking": {
+    "vpc_endpoints": [
+      {
+        "service": "s3",
+        "type": "gateway"
+      },
+      {
+        "service": "kinesis",
+        "type": "interface"
+      },
+      {
+        "service": "glue",
+        "type": "interface"
+      }
+    ]
+  },
+  "automation": {
+    "deployment": {
+      "infrastructure_as_code": "cloudformation",
+      "ci_cd_pipeline": true,
+      "automated_testing": true
+    },
+    "backup_and_recovery": {
+      "backup_schedule": "0 2 * * *",
+      "retention_days": 30,
+      "cross_region_backup": true
+    },
+    "auto_scaling": {
+      "kinesis_shards": {
+        "target_utilization": 70,
+        "scale_out_cooldown": 300,
+        "scale_in_cooldown": 900
+      },
+      "glue_workers": {
+        "min_workers": 2,
+        "max_workers": 100,
+        "target_utilization": 80
+      }
+    }
+  },
+  "data_governance": {
+    "data_lineage": {
+      "tracking_enabled": true,
+      "lineage_database": "enterprise_lineage_db"
+    },
+    "data_classification": {
+      "pii_detection": true,
+      "sensitive_data_masking": true,
+      "retention_policies": {
+        "raw_data": 90,
+        "processed_data": 365,
+        "curated_data": 2555
+      }
+    },
+    "compliance": {
+      "gdpr_compliance": true,
+      "data_audit_logging": true,
+      "access_logging": true
+    }
+  },
+  "performance_optimization": {
+    "caching": {
+      "quicksight_spice": true,
+      "redis_cluster": {
+        "enabled": true,
+        "node_type": "cache.r6g.large",
+        "num_nodes": 3
+      }
+    },
+    "data_partitioning": {
+      "strategy": "date_hour",
+      "partition_columns": ["year", "month", "day", "hour"]
+    },
+    "compression": {
+      "algorithm": "snappy",
+      "file_format": "parquet"
+    }
+  },
+  "disaster_recovery": {
+    "multi_region": {
+      "enabled": true,
+      "primary_region": "us-east-1",
+      "secondary_region": "us-west-2"
+    },
+    "backup_strategy": {
+      "rpo": "1 hour",
+      "rto": "4 hours"
+    },
+    "failover": {
+      "automated": true,
+      "testing_schedule": "monthly"
+    }
+  }
+}

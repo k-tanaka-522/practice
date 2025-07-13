@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'React Web Application Hosting - Main Stack'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  CFBucket:
+    Type: String
+    Description: S3 bucket containing CloudFormation templates
+    
+  ProjectName:
+    Type: String
+    Default: simple-webapp
+    Description: Project name for resource naming
+    
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Custom domain name (optional)
+    
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN for custom domain (optional)
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, '']]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+
+Resources:
+  # S3 Static Website Hosting Stack
+  HostingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/simple-webapp/s3-hosting.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        DomainName: !Ref DomainName
+        CertificateArn: !Ref CertificateArn
+
+Outputs:
+  WebsiteBucket:
+    Description: S3 bucket for website hosting
+    Value: !GetAtt HostingStack.Outputs.WebsiteBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-website-bucket'
+      
+  CloudFrontDistribution:
+    Description: CloudFront distribution ID
+    Value: !GetAtt HostingStack.Outputs.CloudFrontDistribution
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-cloudfront-distribution'
+      
+  WebsiteURL:
+    Description: Website URL
+    Value: !GetAtt HostingStack.Outputs.WebsiteURL
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-website-url'
+      
+  CloudFrontDomainName:
+    Description: CloudFront domain name
+    Value: !GetAtt HostingStack.Outputs.CloudFrontDomainName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-cloudfront-domain'
+
+  CustomDomainURL:
+    Condition: HasCustomDomain
+    Description: Custom domain URL
+    Value: !GetAtt HostingStack.Outputs.CustomDomainURL
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-custom-domain-url'
+
+  StackName:
+    Description: Current stack name
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-stack-name'

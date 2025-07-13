@@ -1,0 +1,1050 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Enterprise Incident Management and Response System
+  
+  Comprehensive incident management platform featuring:
+  - Automated incident detection and classification
+  - PagerDuty, Slack, and Jira integrations
+  - War room provisioning and communication
+  - Escalation matrix and on-call management
+  - Post-incident review automation
+  - SLA tracking and reporting
+  - AI-powered incident correlation and analysis
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: enterprise-app
+    Description: Name of the application
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Environment name
+
+  # Integration Credentials
+  PagerDutyRoutingKey:
+    Type: String
+    Description: PagerDuty service routing key
+    NoEcho: true
+
+  SlackBotToken:
+    Type: String
+    Description: Slack bot token for incident channel management
+    NoEcho: true
+
+  SlackChannelPrefix:
+    Type: String
+    Default: incident
+    Description: Prefix for incident Slack channels
+
+  JiraApiToken:
+    Type: String
+    Description: Jira API token for ticket creation
+    NoEcho: true
+
+  JiraProjectKey:
+    Type: String
+    Default: OPS
+    Description: Jira project key for incident tickets
+
+  JiraBaseUrl:
+    Type: String
+    Default: https://your-company.atlassian.net
+    Description: Jira base URL
+
+  # SLA Configuration
+  P1IncidentSLA:
+    Type: Number
+    Default: 30
+    Description: P1 incident response SLA in minutes
+
+  P2IncidentSLA:
+    Type: Number
+    Default: 120
+    Description: P2 incident response SLA in minutes
+
+  P3IncidentSLA:
+    Type: Number
+    Default: 480
+    Description: P3 incident response SLA in minutes
+
+  # Escalation Configuration
+  EscalationTimerP1:
+    Type: Number
+    Default: 15
+    Description: P1 escalation timer in minutes
+
+  EscalationTimerP2:
+    Type: Number
+    Default: 60
+    Description: P2 escalation timer in minutes
+
+  # Notification Configuration
+  OnCallEmail:
+    Type: String
+    Description: Primary on-call engineer email
+
+  ManagerEmail:
+    Type: String
+    Description: Engineering manager email for escalations
+
+  ExecutiveEmail:
+    Type: String
+    Description: Executive email for critical incidents
+
+Resources:
+  # DynamoDB Tables for Incident Management
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ApplicationName}-${Environment}-incidents'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incident_id
+          AttributeType: S
+        - AttributeName: created_timestamp
+          AttributeType: N
+        - AttributeName: severity
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incident_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: SeverityStatusIndex
+          KeySchema:
+            - AttributeName: severity
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: TimelineIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: created_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  EscalationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ApplicationName}-${Environment}-escalations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incident_id
+          AttributeType: S
+        - AttributeName: escalation_level
+          AttributeType: N
+      KeySchema:
+        - AttributeName: incident_id
+          KeyType: HASH
+        - AttributeName: escalation_level
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  OnCallScheduleTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ApplicationName}-${Environment}-oncall-schedule'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: schedule_id
+          AttributeType: S
+        - AttributeName: effective_date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: schedule_id
+          KeyType: HASH
+        - AttributeName: effective_date
+          KeyType: RANGE
+
+  # S3 Bucket for Incident Artifacts
+  IncidentArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-${Environment}-incident-artifacts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldIncidents
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_INFREQUENT_ACCESS
+              - TransitionInDays: 365
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt IncidentArtifactProcessor.Arn
+
+  # SNS Topics for Incident Routing
+  IncidentAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-incident-alerts'
+      DisplayName: 'Incident Management Alerts'
+
+  EscalationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-escalations'
+      DisplayName: 'Incident Escalations'
+
+  # Lambda Function for Incident Management
+  IncidentManagerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-incident-manager'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IncidentManagerRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT: !Ref Environment
+          INCIDENT_TABLE: !Ref IncidentTable
+          ESCALATION_TABLE: !Ref EscalationTable
+          ONCALL_SCHEDULE_TABLE: !Ref OnCallScheduleTable
+          ARTIFACTS_BUCKET: !Ref IncidentArtifactsBucket
+          PAGERDUTY_ROUTING_KEY: !Ref PagerDutyRoutingKey
+          SLACK_BOT_TOKEN: !Ref SlackBotToken
+          SLACK_CHANNEL_PREFIX: !Ref SlackChannelPrefix
+          JIRA_API_TOKEN: !Ref JiraApiToken
+          JIRA_PROJECT_KEY: !Ref JiraProjectKey
+          JIRA_BASE_URL: !Ref JiraBaseUrl
+          P1_SLA_MINUTES: !Ref P1IncidentSLA
+          P2_SLA_MINUTES: !Ref P2IncidentSLA
+          P3_SLA_MINUTES: !Ref P3IncidentSLA
+          P1_ESCALATION_MINUTES: !Ref EscalationTimerP1
+          P2_ESCALATION_MINUTES: !Ref EscalationTimerP2
+          ONCALL_EMAIL: !Ref OnCallEmail
+          MANAGER_EMAIL: !Ref ManagerEmail
+          EXECUTIVE_EMAIL: !Ref ExecutiveEmail
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import time
+          import uuid
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          import urllib.request
+          import urllib.parse
+          import base64
+
+          # AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          s3 = boto3.client('s3')
+          events = boto3.client('events')
+
+          def lambda_handler(event, context):
+              """
+              Central incident management orchestrator
+              """
+              try:
+                  # Route based on event source
+                  if 'Records' in event:
+                      for record in event['Records']:
+                          if record.get('eventSource') == 'aws:sns':
+                              handle_incident_alert(record)
+                          elif record.get('eventSource') == 'aws:dynamodb':
+                              handle_incident_state_change(record)
+                          elif record.get('eventSource') == 'aws:s3':
+                              handle_artifact_upload(record)
+                  elif event.get('source') == 'aws.events':
+                      # Scheduled event for SLA monitoring or escalations
+                      handle_scheduled_event(event)
+                  else:
+                      # Direct invocation (API call)
+                      return handle_api_request(event)
+                  
+                  return {'statusCode': 200, 'body': 'Incident processed successfully'}
+                  
+              except Exception as e:
+                  print(f"Error in incident management: {str(e)}")
+                  send_error_notification(str(e))
+                  return {'statusCode': 500, 'body': str(e)}
+
+          def handle_incident_alert(sns_record):
+              """Process incoming incident alerts"""
+              
+              message = json.loads(sns_record['Sns']['Message'])
+              
+              # Create or update incident
+              incident = create_or_update_incident(message)
+              
+              # Determine response actions based on severity
+              if incident['severity'] in ['P1', 'P2']:
+                  # High severity incident workflow
+                  execute_high_severity_workflow(incident)
+              else:
+                  # Normal severity incident workflow
+                  execute_normal_severity_workflow(incident)
+
+          def create_or_update_incident(alert_data):
+              """Create new incident or update existing one"""
+              
+              incident_table = dynamodb.Table(os.environ['INCIDENT_TABLE'])
+              
+              # Generate incident ID
+              incident_id = f"INC-{datetime.utcnow().strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
+              
+              # Classify severity based on alert data
+              severity = classify_incident_severity(alert_data)
+              
+              # Calculate SLA deadline
+              sla_deadline = calculate_sla_deadline(severity)
+              
+              incident = {
+                  'incident_id': incident_id,
+                  'title': alert_data.get('title', 'System Alert'),
+                  'description': alert_data.get('description', ''),
+                  'severity': severity,
+                  'status': 'OPEN',
+                  'created_timestamp': int(time.time()),
+                  'updated_timestamp': int(time.time()),
+                  'sla_deadline': sla_deadline,
+                  'affected_services': alert_data.get('affected_services', []),
+                  'detection_source': alert_data.get('source', 'CloudWatch'),
+                  'assigned_engineer': '',
+                  'war_room_channel': '',
+                  'jira_ticket': '',
+                  'pagerduty_incident': '',
+                  'customer_impact': alert_data.get('customer_impact', 'Unknown'),
+                  'escalation_level': 0,
+                  'timeline': []
+              }
+              
+              # Store incident
+              incident_table.put_item(Item=incident)
+              
+              # Add timeline entry
+              add_timeline_entry(incident_id, 'CREATED', 'Incident created from alert', 'system')
+              
+              return incident
+
+          def classify_incident_severity(alert_data):
+              """AI-enhanced incident severity classification"""
+              
+              # Default classification rules
+              if 'critical' in alert_data.get('title', '').lower():
+                  return 'P1'
+              elif any(service in alert_data.get('affected_services', []) for service in ['authentication', 'payment', 'core-api']):
+                  return 'P1'
+              elif 'high' in alert_data.get('severity', '').lower():
+                  return 'P2'
+              elif 'error' in alert_data.get('title', '').lower():
+                  return 'P2'
+              else:
+                  return 'P3'
+
+          def calculate_sla_deadline(severity):
+              """Calculate SLA deadline based on severity"""
+              
+              sla_minutes = {
+                  'P1': int(os.environ.get('P1_SLA_MINUTES', 30)),
+                  'P2': int(os.environ.get('P2_SLA_MINUTES', 120)),
+                  'P3': int(os.environ.get('P3_SLA_MINUTES', 480))
+              }
+              
+              deadline = datetime.utcnow() + timedelta(minutes=sla_minutes.get(severity, 480))
+              return int(deadline.timestamp())
+
+          def execute_high_severity_workflow(incident):
+              """Execute workflow for high severity incidents"""
+              
+              # 1. Page on-call engineer
+              page_oncall_engineer(incident)
+              
+              # 2. Create war room
+              war_room_channel = create_war_room(incident)
+              
+              # 3. Create Jira ticket
+              jira_ticket = create_jira_ticket(incident)
+              
+              # 4. Set up escalation timer
+              schedule_escalation(incident)
+              
+              # 5. Notify stakeholders
+              notify_stakeholders(incident)
+              
+              # Update incident with created resources
+              update_incident(incident['incident_id'], {
+                  'war_room_channel': war_room_channel,
+                  'jira_ticket': jira_ticket,
+                  'assigned_engineer': get_current_oncall()
+              })
+
+          def execute_normal_severity_workflow(incident):
+              """Execute workflow for normal severity incidents"""
+              
+              # 1. Create Jira ticket
+              jira_ticket = create_jira_ticket(incident)
+              
+              # 2. Notify on-call via Slack
+              notify_oncall_slack(incident)
+              
+              # Update incident
+              update_incident(incident['incident_id'], {
+                  'jira_ticket': jira_ticket
+              })
+
+          def page_oncall_engineer(incident):
+              """Send PagerDuty alert to on-call engineer"""
+              
+              routing_key = os.environ['PAGERDUTY_ROUTING_KEY']
+              
+              payload = {
+                  'routing_key': routing_key,
+                  'event_action': 'trigger',
+                  'dedup_key': incident['incident_id'],
+                  'payload': {
+                      'summary': f"{incident['severity']} Incident: {incident['title']}",
+                      'severity': incident['severity'].lower(),
+                      'source': incident['detection_source'],
+                      'component': ', '.join(incident['affected_services']),
+                      'group': os.environ['APPLICATION_NAME'],
+                      'class': 'production incident',
+                      'custom_details': {
+                          'incident_id': incident['incident_id'],
+                          'description': incident['description'],
+                          'customer_impact': incident['customer_impact'],
+                          'sla_deadline': datetime.fromtimestamp(incident['sla_deadline']).isoformat()
+                      }
+                  },
+                  'links': [
+                      {
+                          'href': f"https://console.aws.amazon.com/cloudwatch/home",
+                          'text': 'CloudWatch Dashboard'
+                      }
+                  ]
+              }
+              
+              # Send to PagerDuty
+              try:
+                  req = urllib.request.Request(
+                      'https://events.pagerduty.com/v2/enqueue',
+                      data=json.dumps(payload).encode(),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  response = urllib.request.urlopen(req)
+                  result = json.loads(response.read().decode())
+                  
+                  # Update incident with PagerDuty details
+                  update_incident(incident['incident_id'], {
+                      'pagerduty_incident': result.get('dedup_key', '')
+                  })
+                  
+                  add_timeline_entry(incident['incident_id'], 'PAGED', 'On-call engineer paged', 'system')
+                  
+              except Exception as e:
+                  print(f"Error sending PagerDuty alert: {e}")
+
+          def create_war_room(incident):
+              """Create Slack war room for incident coordination"""
+              
+              channel_name = f"{os.environ['SLACK_CHANNEL_PREFIX']}-{incident['incident_id'].lower()}"
+              
+              # Create Slack channel
+              slack_payload = {
+                  'name': channel_name,
+                  'is_private': False,
+                  'purpose': f"War room for {incident['severity']} incident: {incident['title']}"
+              }
+              
+              try:
+                  # Create channel using Slack API
+                  channel_id = create_slack_channel(slack_payload)
+                  
+                  # Post initial incident summary
+                  post_incident_summary_to_slack(channel_id, incident)
+                  
+                  # Invite key personnel
+                  invite_war_room_participants(channel_id, incident)
+                  
+                  add_timeline_entry(incident['incident_id'], 'WAR_ROOM_CREATED', f'War room created: #{channel_name}', 'system')
+                  
+                  return channel_name
+                  
+              except Exception as e:
+                  print(f"Error creating war room: {e}")
+                  return ''
+
+          def create_jira_ticket(incident):
+              """Create Jira incident ticket"""
+              
+              jira_url = f"{os.environ['JIRA_BASE_URL']}/rest/api/2/issue"
+              
+              ticket_data = {
+                  'fields': {
+                      'project': {'key': os.environ['JIRA_PROJECT_KEY']},
+                      'summary': f"[{incident['severity']}] {incident['title']}",
+                      'description': f"""
+                      Incident ID: {incident['incident_id']}
+                      Severity: {incident['severity']}
+                      Detection Source: {incident['detection_source']}
+                      Affected Services: {', '.join(incident['affected_services'])}
+                      Customer Impact: {incident['customer_impact']}
+                      
+                      Description:
+                      {incident['description']}
+                      
+                      SLA Deadline: {datetime.fromtimestamp(incident['sla_deadline']).isoformat()}
+                      """,
+                      'issuetype': {'name': 'Incident'},
+                      'priority': {'name': 'Critical' if incident['severity'] == 'P1' else 'High' if incident['severity'] == 'P2' else 'Medium'},
+                      'labels': ['incident', incident['severity'].lower(), os.environ['ENVIRONMENT']]
+                  }
+              }
+              
+              try:
+                  # Create Jira ticket
+                  auth_string = base64.b64encode(f"api:{os.environ['JIRA_API_TOKEN']}".encode()).decode()
+                  
+                  req = urllib.request.Request(
+                      jira_url,
+                      data=json.dumps(ticket_data).encode(),
+                      headers={
+                          'Content-Type': 'application/json',
+                          'Authorization': f'Basic {auth_string}'
+                      }
+                  )
+                  
+                  response = urllib.request.urlopen(req)
+                  result = json.loads(response.read().decode())
+                  
+                  ticket_key = result['key']
+                  
+                  add_timeline_entry(incident['incident_id'], 'JIRA_CREATED', f'Jira ticket created: {ticket_key}', 'system')
+                  
+                  return ticket_key
+                  
+              except Exception as e:
+                  print(f"Error creating Jira ticket: {e}")
+                  return ''
+
+          def schedule_escalation(incident):
+              """Schedule automatic escalation if incident isn't resolved"""
+              
+              escalation_minutes = {
+                  'P1': int(os.environ.get('P1_ESCALATION_MINUTES', 15)),
+                  'P2': int(os.environ.get('P2_ESCALATION_MINUTES', 60))
+              }
+              
+              if incident['severity'] not in escalation_minutes:
+                  return
+              
+              # Schedule escalation using EventBridge
+              rule_name = f"escalation-{incident['incident_id']}"
+              schedule_expression = f"rate({escalation_minutes[incident['severity']]} minutes)"
+              
+              try:
+                  events.put_rule(
+                      Name=rule_name,
+                      ScheduleExpression=schedule_expression,
+                      Description=f"Escalation timer for incident {incident['incident_id']}",
+                      State='ENABLED'
+                  )
+                  
+                  # Add Lambda target
+                  events.put_targets(
+                      Rule=rule_name,
+                      Targets=[{
+                          'Id': '1',
+                          'Arn': context.invoked_function_arn,
+                          'Input': json.dumps({
+                              'action': 'escalate',
+                              'incident_id': incident['incident_id']
+                          })
+                      }]
+                  )
+                  
+              except Exception as e:
+                  print(f"Error scheduling escalation: {e}")
+
+          def handle_escalation(incident_id):
+              """Handle incident escalation"""
+              
+              # Get current incident state
+              incident = get_incident(incident_id)
+              
+              if not incident or incident['status'] in ['RESOLVED', 'CLOSED']:
+                  # Incident already resolved, cancel escalation
+                  cancel_escalation_timer(incident_id)
+                  return
+              
+              # Increment escalation level
+              escalation_level = incident.get('escalation_level', 0) + 1
+              
+              # Determine escalation action
+              if escalation_level == 1:
+                  # Escalate to manager
+                  escalate_to_manager(incident)
+              elif escalation_level == 2:
+                  # Escalate to executive
+                  escalate_to_executive(incident)
+              
+              # Update incident
+              update_incident(incident_id, {'escalation_level': escalation_level})
+              
+              # Record escalation
+              record_escalation(incident_id, escalation_level)
+
+          def notify_stakeholders(incident):
+              """Notify relevant stakeholders based on incident severity"""
+              
+              if incident['severity'] == 'P1':
+                  # Notify executives for P1 incidents
+                  send_executive_notification(incident)
+              
+              # Always notify engineering manager for P1 and P2
+              if incident['severity'] in ['P1', 'P2']:
+                  send_manager_notification(incident)
+
+          # Helper functions
+          def get_current_oncall():
+              """Get current on-call engineer from schedule"""
+              # Simplified implementation - would integrate with actual on-call schedule
+              return os.environ['ONCALL_EMAIL']
+
+          def add_timeline_entry(incident_id, action, description, actor):
+              """Add entry to incident timeline"""
+              
+              incident_table = dynamodb.Table(os.environ['INCIDENT_TABLE'])
+              
+              timeline_entry = {
+                  'timestamp': int(time.time()),
+                  'action': action,
+                  'description': description,
+                  'actor': actor
+              }
+              
+              # Update incident with new timeline entry
+              try:
+                  incident_table.update_item(
+                      Key={'incident_id': incident_id},
+                      UpdateExpression='SET timeline = list_append(if_not_exists(timeline, :empty_list), :new_entry)',
+                      ExpressionAttributeValues={
+                          ':empty_list': [],
+                          ':new_entry': [timeline_entry]
+                      }
+                  )
+              except Exception as e:
+                  print(f"Error adding timeline entry: {e}")
+
+          def update_incident(incident_id, updates):
+              """Update incident with new data"""
+              
+              incident_table = dynamodb.Table(os.environ['INCIDENT_TABLE'])
+              
+              updates['updated_timestamp'] = int(time.time())
+              
+              # Build update expression
+              update_expr = 'SET '
+              expr_values = {}
+              
+              for key, value in updates.items():
+                  update_expr += f'{key} = :{key}, '
+                  expr_values[f':{key}'] = value
+              
+              update_expr = update_expr.rstrip(', ')
+              
+              try:
+                  incident_table.update_item(
+                      Key={'incident_id': incident_id},
+                      UpdateExpression=update_expr,
+                      ExpressionAttributeValues=expr_values
+                  )
+              except Exception as e:
+                  print(f"Error updating incident: {e}")
+
+          def get_incident(incident_id):
+              """Retrieve incident from database"""
+              
+              incident_table = dynamodb.Table(os.environ['INCIDENT_TABLE'])
+              
+              try:
+                  response = incident_table.get_item(Key={'incident_id': incident_id})
+                  return response.get('Item')
+              except Exception as e:
+                  print(f"Error getting incident: {e}")
+                  return None
+
+          # Placeholder functions for Slack API integration
+          def create_slack_channel(payload):
+              print(f"Creating Slack channel: {payload['name']}")
+              return f"C{str(uuid.uuid4())[:8].upper()}"
+
+          def post_incident_summary_to_slack(channel_id, incident):
+              print(f"Posting incident summary to channel {channel_id}")
+
+          def invite_war_room_participants(channel_id, incident):
+              print(f"Inviting participants to war room {channel_id}")
+
+          def notify_oncall_slack(incident):
+              print(f"Notifying on-call via Slack for incident {incident['incident_id']}")
+
+          def send_manager_notification(incident):
+              print(f"Sending manager notification for incident {incident['incident_id']}")
+
+          def send_executive_notification(incident):
+              print(f"Sending executive notification for incident {incident['incident_id']}")
+
+          def escalate_to_manager(incident):
+              print(f"Escalating incident {incident['incident_id']} to manager")
+
+          def escalate_to_executive(incident):
+              print(f"Escalating incident {incident['incident_id']} to executive")
+
+          def record_escalation(incident_id, level):
+              """Record escalation in escalation table"""
+              
+              escalation_table = dynamodb.Table(os.environ['ESCALATION_TABLE'])
+              
+              escalation_table.put_item(Item={
+                  'incident_id': incident_id,
+                  'escalation_level': level,
+                  'timestamp': int(time.time()),
+                  'ttl': int(time.time()) + (30 * 24 * 3600)  # 30 days TTL
+              })
+
+          def cancel_escalation_timer(incident_id):
+              """Cancel escalation timer for resolved incident"""
+              
+              rule_name = f"escalation-{incident_id}"
+              
+              try:
+                  events.delete_rule(Name=rule_name, Force=True)
+              except Exception as e:
+                  print(f"Error canceling escalation timer: {e}")
+
+          def handle_incident_state_change(dynamodb_record):
+              """Handle incident state changes from DynamoDB stream"""
+              
+              if dynamodb_record['eventName'] == 'MODIFY':
+                  # Check if incident was resolved
+                  new_image = dynamodb_record['dynamodb'].get('NewImage', {})
+                  old_image = dynamodb_record['dynamodb'].get('OldImage', {})
+                  
+                  if (new_image.get('status', {}).get('S') in ['RESOLVED', 'CLOSED'] and
+                      old_image.get('status', {}).get('S') not in ['RESOLVED', 'CLOSED']):
+                      
+                      incident_id = new_image['incident_id']['S']
+                      cancel_escalation_timer(incident_id)
+
+          def handle_artifact_upload(s3_record):
+              """Handle artifact uploads to incident bucket"""
+              
+              bucket = s3_record['s3']['bucket']['name']
+              key = s3_record['s3']['object']['key']
+              
+              print(f"Processing incident artifact: s3://{bucket}/{key}")
+
+          def handle_scheduled_event(event):
+              """Handle scheduled events (SLA monitoring, escalations)"""
+              
+              detail = event.get('detail', {})
+              
+              if detail.get('action') == 'escalate':
+                  handle_escalation(detail['incident_id'])
+              elif event.get('detail-type') == 'SLA Monitor':
+                  monitor_sla_breaches()
+
+          def handle_api_request(event):
+              """Handle direct API requests"""
+              
+              action = event.get('action')
+              
+              if action == 'resolve_incident':
+                  return resolve_incident(event['incident_id'], event.get('resolution', ''))
+              elif action == 'update_incident':
+                  return update_incident_api(event['incident_id'], event['updates'])
+              elif action == 'get_incident':
+                  return get_incident(event['incident_id'])
+              else:
+                  return {'error': 'Unknown action'}
+
+          def resolve_incident(incident_id, resolution):
+              """Resolve an incident"""
+              
+              updates = {
+                  'status': 'RESOLVED',
+                  'resolution': resolution,
+                  'resolved_timestamp': int(time.time())
+              }
+              
+              update_incident(incident_id, updates)
+              add_timeline_entry(incident_id, 'RESOLVED', f'Incident resolved: {resolution}', 'engineer')
+              
+              # Cancel escalation timer
+              cancel_escalation_timer(incident_id)
+              
+              return {'success': True}
+
+          def monitor_sla_breaches():
+              """Monitor for SLA breaches"""
+              
+              current_time = int(time.time())
+              
+              # Query for open incidents approaching SLA deadline
+              incident_table = dynamodb.Table(os.environ['INCIDENT_TABLE'])
+              
+              try:
+                  response = incident_table.query(
+                      IndexName='TimelineIndex',
+                      KeyConditionExpression='#status = :status',
+                      FilterExpression='sla_deadline < :current_time',
+                      ExpressionAttributeNames={'#status': 'status'},
+                      ExpressionAttributeValues={
+                          ':status': 'OPEN',
+                          ':current_time': current_time
+                      }
+                  )
+                  
+                  # Send SLA breach notifications
+                  for incident in response['Items']:
+                      send_sla_breach_notification(incident)
+                      
+              except Exception as e:
+                  print(f"Error monitoring SLA breaches: {e}")
+
+          def send_sla_breach_notification(incident):
+              """Send notification for SLA breach"""
+              
+              print(f"SLA breach detected for incident {incident['incident_id']}")
+              
+              # Escalate immediately
+              handle_escalation(incident['incident_id'])
+
+          def send_error_notification(error_message):
+              """Send error notification when the system fails"""
+              
+              try:
+                  sns.publish(
+                      TopicArn=os.environ.get('INCIDENT_ALERTS_TOPIC', ''),
+                      Subject='Incident Management System Error',
+                      Message=f"Error in incident management system: {error_message}"
+                  )
+              except Exception:
+                  print(f"Failed to send error notification: {error_message}")
+
+  # IAM Role for Incident Manager Lambda
+  IncidentManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IncidentManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt IncidentTable.Arn
+                  - !Sub '${IncidentTable.Arn}/index/*'
+                  - !GetAtt EscalationTable.Arn
+                  - !GetAtt OnCallScheduleTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: 
+                  - !GetAtt IncidentArtifactsBucket.Arn
+                  - !Sub '${IncidentArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: 
+                  - !Ref IncidentAlertsTopic
+                  - !Ref EscalationTopic
+              - Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ApplicationName}-incident-manager'
+
+  # Lambda Function for Incident Artifact Processing
+  IncidentArtifactProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-incident-artifact-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt IncidentArtifactProcessorRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          
+          def lambda_handler(event, context):
+              """Process incident artifacts uploaded to S3"""
+              
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  
+                  print(f"Processing artifact: s3://{bucket}/{key}")
+                  
+                  # Extract incident ID from object key
+                  if '/' in key:
+                      incident_id = key.split('/')[0]
+                      print(f"Artifact uploaded for incident: {incident_id}")
+                      
+                      # Here you could trigger additional processing:
+                      # - Image analysis for screenshots
+                      # - Log file parsing
+                      # - Automated report generation
+              
+              return {'statusCode': 200}
+
+  # IAM Role for Artifact Processor
+  IncidentArtifactProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ArtifactProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${IncidentArtifactsBucket}/*'
+
+  # Permission for S3 to invoke Lambda
+  IncidentArtifactProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IncidentArtifactProcessor
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt IncidentArtifactsBucket.Arn
+
+  # EventBridge Rule for SLA Monitoring
+  SLAMonitoringRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Monitor incident SLAs every 5 minutes'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IncidentManagerLambda.Arn
+          Id: SLAMonitorTarget
+          Input: !Sub |
+            {
+              "source": "aws.events",
+              "detail-type": "SLA Monitor",
+              "detail": {
+                "action": "monitor_sla"
+              }
+            }
+
+  # Permission for EventBridge to invoke Lambda
+  SLAMonitoringPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IncidentManagerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SLAMonitoringRule.Arn
+
+  # SNS Subscription to trigger incident manager
+  IncidentManagerSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref IncidentAlertsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt IncidentManagerLambda.Arn
+
+  # Permission for SNS to invoke Lambda
+  IncidentManagerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IncidentManagerLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref IncidentAlertsTopic
+
+Outputs:
+  IncidentManagerLambdaArn:
+    Description: ARN of the incident manager Lambda function
+    Value: !GetAtt IncidentManagerLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IncidentManagerLambda'
+
+  IncidentAlertsTopicArn:
+    Description: ARN of the incident alerts SNS topic
+    Value: !Ref IncidentAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-IncidentAlertsTopic'
+
+  IncidentTableName:
+    Description: Name of the incident DynamoDB table
+    Value: !Ref IncidentTable
+    Export:
+      Name: !Sub '${AWS::StackName}-IncidentTable'
+
+  IncidentArtifactsBucketName:
+    Description: Name of the incident artifacts S3 bucket
+    Value: !Ref IncidentArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-IncidentArtifactsBucket'
+
+  EscalationTopicArn:
+    Description: ARN of the escalation SNS topic
+    Value: !Ref EscalationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-EscalationTopic'

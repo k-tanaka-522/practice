@@ -1,0 +1,202 @@
+{
+  "environments": {
+    "dev": {
+      "timeout": 300,
+      "memory": 1024,
+      "concurrency": 10,
+      "log_level": "INFO",
+      "cache_retention_hours": 24,
+      "enable_caching": true,
+      "max_retries": 3,
+      "models": {
+        "default": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "available": [
+          "anthropic.claude-3-sonnet-20240229-v1:0",
+          "anthropic.claude-3-haiku-20240307-v1:0",
+          "amazon.titan-text-express-v1"
+        ]
+      },
+      "rate_limits": {
+        "requests_per_minute": 60,
+        "requests_per_day": 1000
+      }
+    },
+    "staging": {
+      "timeout": 300,
+      "memory": 2048,
+      "concurrency": 25,
+      "log_level": "INFO",
+      "cache_retention_hours": 48,
+      "enable_caching": true,
+      "max_retries": 3,
+      "models": {
+        "default": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "available": [
+          "anthropic.claude-3-sonnet-20240229-v1:0",
+          "anthropic.claude-3-haiku-20240307-v1:0",
+          "amazon.titan-text-express-v1",
+          "amazon.titan-text-lite-v1"
+        ]
+      },
+      "rate_limits": {
+        "requests_per_minute": 100,
+        "requests_per_day": 5000
+      }
+    },
+    "prod": {
+      "timeout": 900,
+      "memory": 3008,
+      "concurrency": 100,
+      "log_level": "WARN",
+      "cache_retention_hours": 168,
+      "enable_caching": true,
+      "max_retries": 5,
+      "models": {
+        "default": "anthropic.claude-3-sonnet-20240229-v1:0",
+        "available": [
+          "anthropic.claude-3-sonnet-20240229-v1:0",
+          "anthropic.claude-3-haiku-20240307-v1:0",
+          "amazon.titan-text-express-v1",
+          "amazon.titan-text-lite-v1"
+        ]
+      },
+      "rate_limits": {
+        "requests_per_minute": 500,
+        "requests_per_day": 50000
+      }
+    }
+  },
+  "model_configurations": {
+    "anthropic.claude-3-sonnet-20240229-v1:0": {
+      "type": "claude",
+      "max_tokens": 4000,
+      "context_window": 200000,
+      "cost_per_1k_tokens": 0.015,
+      "use_cases": ["general", "creative", "analysis", "translation"],
+      "languages": ["english", "japanese", "spanish", "french", "german"]
+    },
+    "anthropic.claude-3-haiku-20240307-v1:0": {
+      "type": "claude",
+      "max_tokens": 4000,
+      "context_window": 200000,
+      "cost_per_1k_tokens": 0.0025,
+      "use_cases": ["quick_responses", "simple_tasks", "high_volume"],
+      "languages": ["english", "japanese", "spanish", "french", "german"]
+    },
+    "amazon.titan-text-express-v1": {
+      "type": "titan",
+      "max_tokens": 4000,
+      "context_window": 8000,
+      "cost_per_1k_tokens": 0.002,
+      "use_cases": ["general", "summarization", "qa"],
+      "languages": ["english"]
+    },
+    "amazon.titan-text-lite-v1": {
+      "type": "titan",
+      "max_tokens": 4000,
+      "context_window": 4000,
+      "cost_per_1k_tokens": 0.0003,
+      "use_cases": ["basic_tasks", "high_volume", "cost_sensitive"],
+      "languages": ["english"]
+    }
+  },
+  "task_configurations": {
+    "generation": {
+      "description": "General text generation and creative writing",
+      "suitable_models": ["anthropic.claude-3-sonnet-20240229-v1:0", "amazon.titan-text-express-v1"],
+      "default_params": {
+        "temperature": 0.7,
+        "max_tokens": 1000
+      }
+    },
+    "summary": {
+      "description": "Text summarization and condensation",
+      "suitable_models": ["anthropic.claude-3-sonnet-20240229-v1:0", "amazon.titan-text-express-v1"],
+      "default_params": {
+        "temperature": 0.3,
+        "max_tokens": 500
+      }
+    },
+    "translation": {
+      "description": "Language translation services",
+      "suitable_models": ["anthropic.claude-3-sonnet-20240229-v1:0"],
+      "default_params": {
+        "temperature": 0.1,
+        "max_tokens": 2000
+      }
+    },
+    "analysis": {
+      "description": "Text analysis and insights",
+      "suitable_models": ["anthropic.claude-3-sonnet-20240229-v1:0"],
+      "default_params": {
+        "temperature": 0.2,
+        "max_tokens": 1500
+      }
+    },
+    "rewrite": {
+      "description": "Text improvement and rewriting",
+      "suitable_models": ["anthropic.claude-3-sonnet-20240229-v1:0"],
+      "default_params": {
+        "temperature": 0.4,
+        "max_tokens": 1000
+      }
+    },
+    "qa": {
+      "description": "Question answering",
+      "suitable_models": ["anthropic.claude-3-sonnet-20240229-v1:0", "amazon.titan-text-express-v1"],
+      "default_params": {
+        "temperature": 0.1,
+        "max_tokens": 800
+      }
+    }
+  },
+  "security": {
+    "content_filters": {
+      "enabled": true,
+      "blocked_patterns": [
+        "personal_information",
+        "harmful_content",
+        "illegal_activities"
+      ]
+    },
+    "input_validation": {
+      "max_input_length": 100000,
+      "min_input_length": 5,
+      "allowed_characters": "utf-8"
+    },
+    "output_validation": {
+      "max_output_length": 50000,
+      "content_filtering": true
+    }
+  },
+  "monitoring": {
+    "metrics": {
+      "enabled": true,
+      "namespace": "TextGeneration",
+      "dimensions": ["Environment", "Model", "TaskType"]
+    },
+    "logging": {
+      "structured": true,
+      "include_request_id": true,
+      "include_user_id": false,
+      "include_content": false
+    },
+    "alerting": {
+      "error_threshold": 5,
+      "latency_threshold_ms": 30000,
+      "cost_threshold_daily": 100
+    }
+  },
+  "performance": {
+    "optimization": {
+      "enable_batch_processing": true,
+      "enable_connection_pooling": true,
+      "enable_request_deduplication": true
+    },
+    "caching": {
+      "strategy": "lru",
+      "max_cache_size": 1000,
+      "cache_key_algorithm": "sha256"
+    }
+  }
+}

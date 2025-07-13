@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda Functions for API Foundation'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name
+    
+  ProjectName:
+    Type: String
+    Default: api-foundation
+    Description: Project name
+    
+  LogLevel:
+    Type: String
+    Default: DEBUG
+    Description: Lambda function log level
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: CloudWatch Logs retention period
+
+Resources:
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+
+  # Hello Lambda Function
+  HelloFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-hello'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              const response = {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+                  },
+                  body: JSON.stringify({
+                      message: 'Hello from Lambda!',
+                      timestamp: new Date().toISOString(),
+                      requestId: event.requestContext ? event.requestContext.requestId : 'unknown',
+                      environment: process.env.ENVIRONMENT
+                  })
+              };
+              
+              return response;
+          };
+
+  # Data Lambda Function
+  DataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-data'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              try {
+                  // Parse request body
+                  const body = JSON.parse(event.body || '{}');
+                  
+                  // Basic validation
+                  if (!body.name) {
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          body: JSON.stringify({
+                              error: 'Name is required'
+                          })
+                      };
+                  }
+                  
+                  // Process data
+                  const processedData = {
+                      id: Math.random().toString(36).substr(2, 9),
+                      name: body.name,
+                      message: body.message || 'No message provided',
+                      processedAt: new Date().toISOString(),
+                      environment: process.env.ENVIRONMENT
+                  };
+                  
+                  return {
+                      statusCode: 200,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({
+                          success: true,
+                          data: processedData
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error:', error);
+                  
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error'
+                      })
+                  };
+              }
+          };
+
+  # CloudWatch Log Groups
+  HelloFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${HelloFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  DataFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+Outputs:
+  HelloFunctionArn:
+    Description: Hello Lambda function ARN
+    Value: !GetAtt HelloFunction.Arn
+    
+  HelloFunctionName:
+    Description: Hello Lambda function name
+    Value: !Ref HelloFunction
+    
+  DataFunctionArn:
+    Description: Data Lambda function ARN
+    Value: !GetAtt DataFunction.Arn
+    
+  DataFunctionName:
+    Description: Data Lambda function name
+    Value: !Ref DataFunction
+    
+  LambdaExecutionRoleArn:
+    Description: Lambda execution role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn

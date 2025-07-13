@@ -1,0 +1,832 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Comprehensive Observability Platform
+  
+  Enterprise-grade monitoring and observability infrastructure including:
+  - OpenTelemetry Collector deployment
+  - Custom CloudWatch dashboards
+  - Distributed tracing with X-Ray
+  - Synthetic monitoring with CloudWatch Synthetics
+  - Business metrics collection
+  - Anomaly detection with CloudWatch Anomaly Detector
+  - Multi-dimensional alerting system
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: enterprise-app
+    Description: Name of the application being monitored
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Environment name
+
+  # Notification Configuration
+  AlertEmail:
+    Type: String
+    Description: Email address for critical alerts
+    
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: Slack webhook URL for notifications (optional)
+    
+  PagerDutyRoutingKey:
+    Type: String
+    Default: ''
+    Description: PagerDuty routing key for critical incidents (optional)
+    NoEcho: true
+
+  # Monitoring Configuration
+  EnableSynthetics:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable CloudWatch Synthetics monitoring
+    
+  EnableXRayTracing:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable AWS X-Ray distributed tracing
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: CloudWatch Logs retention period in days
+
+  # Alert Thresholds
+  HighLatencyThreshold:
+    Type: Number
+    Default: 1000
+    Description: High latency threshold in milliseconds
+    
+  ErrorRateThreshold:
+    Type: Number
+    Default: 5
+    Description: Error rate threshold as percentage
+    
+  LowAvailabilityThreshold:
+    Type: Number
+    Default: 99
+    Description: Low availability threshold as percentage
+
+  # Synthetic Monitoring
+  SyntheticTestUrl:
+    Type: String
+    Default: ''
+    Description: URL for synthetic monitoring tests (leave empty to disable)
+
+Conditions:
+  EnableSyntheticsCondition: !Equals [!Ref EnableSynthetics, 'true']
+  EnableXRayCondition: !Equals [!Ref EnableXRayTracing, 'true']
+  HasSlackWebhook: !Not [!Equals [!Ref SlackWebhookUrl, '']]
+  HasPagerDuty: !Not [!Equals [!Ref PagerDutyRoutingKey, '']]
+  HasSyntheticUrl: !Not [!Equals [!Ref SyntheticTestUrl, '']]
+
+Resources:
+  # SNS Topics for Alerts
+  CriticalAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-critical-alerts'
+      DisplayName: 'Critical System Alerts'
+      
+  WarningAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-warning-alerts'
+      DisplayName: 'Warning System Alerts'
+
+  # SNS Subscriptions
+  CriticalAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CriticalAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  WarningAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WarningAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # CloudWatch Log Groups
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/applications/${ApplicationName}/${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      
+  OTelCollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/otel/${ApplicationName}/${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  SyntheticMonitoringLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableSyntheticsCondition
+    Properties:
+      LogGroupName: !Sub '/aws/synthetics/${ApplicationName}/${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # IAM Role for OpenTelemetry Collector
+  OTelCollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-${Environment}-otel-collector-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ecs-tasks.amazonaws.com
+                - ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: OTelCollectorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+
+  # X-Ray Tracing Configuration
+  XRayTracingConfig:
+    Type: AWS::XRay::SamplingRule
+    Condition: EnableXRayCondition
+    Properties:
+      SamplingRule:
+        RuleName: !Sub '${ApplicationName}-${Environment}-sampling'
+        Priority: 9000
+        FixedRate: 0.1
+        ReservoirSize: 1
+        ServiceName: !Sub '${ApplicationName}-*'
+        ServiceType: '*'
+        Host: '*'
+        URLPath: '*'
+        HTTPMethod: '*'
+        Version: 1
+
+  # CloudWatch Synthetics for Website Monitoring
+  SyntheticCanary:
+    Type: AWS::Synthetics::Canary
+    Condition: EnableSyntheticsCondition
+    Properties:
+      Name: !Sub '${ApplicationName}-${Environment}-availability-monitor'
+      RuntimeVersion: syn-nodejs-puppeteer-3.9
+      ExecutionRoleArn: !GetAtt SyntheticsExecutionRole.Arn
+      Schedule:
+        Expression: 'rate(5 minutes)'
+        DurationInSeconds: 0
+      FailureRetentionPeriod: 30
+      SuccessRetentionPeriod: 30
+      Code:
+        Handler: pageLoadBlueprint.handler
+        Script: !Sub |
+          const synthetics = require('Synthetics');
+          const log = require('SyntheticsLogger');
+          
+          const pageLoadBlueprint = async function () {
+              const page = await synthetics.getPage();
+              
+              // Performance monitoring
+              await synthetics.executeStep('loadPage', async function () {
+                  const response = await page.goto("${SyntheticTestUrl}", {
+                      waitUntil: 'networkidle0',
+                      timeout: 30000
+                  });
+                  
+                  if (!response.ok()) {
+                      throw new Error(`Page load failed with status: ${response.status()}`);
+                  }
+                  
+                  // Check page load time
+                  const performanceTiming = JSON.parse(
+                      await page.evaluate(() => JSON.stringify(window.performance.timing))
+                  );
+                  
+                  const loadTime = performanceTiming.loadEventEnd - performanceTiming.navigationStart;
+                  await synthetics.addUserAgentMetric('PageLoadTime', loadTime, 'Milliseconds');
+                  
+                  log.info(`Page load time: ${loadTime}ms`);
+              });
+              
+              // Custom business logic checks
+              await synthetics.executeStep('checkCriticalElements', async function () {
+                  // Check for critical page elements
+                  const criticalSelectors = ['.header', '.main-content', '.footer'];
+                  
+                  for (const selector of criticalSelectors) {
+                      const element = await page.$(selector);
+                      if (!element) {
+                          throw new Error(`Critical element not found: ${selector}`);
+                      }
+                  }
+              });
+              
+              // API health check
+              await synthetics.executeStep('checkAPIHealth', async function () {
+                  const apiResponse = await page.evaluate(async () => {
+                      const response = await fetch('/api/health');
+                      return {
+                          status: response.status,
+                          ok: response.ok
+                      };
+                  });
+                  
+                  if (!apiResponse.ok) {
+                      throw new Error(`API health check failed: ${apiResponse.status}`);
+                  }
+              });
+          };
+          
+          exports.handler = async () => {
+              return await synthetics.executeStep('pageLoadBlueprint', pageLoadBlueprint);
+          };
+
+  # IAM Role for Synthetics
+  SyntheticsExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: EnableSyntheticsCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SyntheticsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - synthetics:*
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda for Custom Metrics Collection
+  CustomMetricsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-${Environment}-custom-metrics'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt CustomMetricsRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timedelta
+          import urllib.request
+          import urllib.error
+          
+          cloudwatch = boto3.client('cloudwatch')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Application-specific custom metrics
+                  collect_business_metrics()
+                  collect_performance_metrics()
+                  collect_infrastructure_metrics()
+                  
+                  return {'statusCode': 200, 'body': 'Custom metrics collected successfully'}
+                  
+              except Exception as e:
+                  print(f"Error collecting custom metrics: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+          
+          def collect_business_metrics():
+              """Collect business-specific metrics"""
+              app_name = os.environ['APPLICATION_NAME']
+              env = os.environ['ENVIRONMENT']
+              
+              # Example: User activity metrics
+              try:
+                  # Simulate API call to get business metrics
+                  # In real implementation, this would call your application APIs
+                  user_count = get_active_user_count()
+                  transaction_count = get_transaction_count()
+                  revenue = get_current_revenue()
+                  
+                  # Send to CloudWatch
+                  cloudwatch.put_metric_data(
+                      Namespace=f'{app_name}/Business',
+                      MetricData=[
+                          {
+                              'MetricName': 'ActiveUsers',
+                              'Value': user_count,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': env}
+                              ]
+                          },
+                          {
+                              'MetricName': 'TransactionCount',
+                              'Value': transaction_count,
+                              'Unit': 'Count',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': env}
+                              ]
+                          },
+                          {
+                              'MetricName': 'Revenue',
+                              'Value': revenue,
+                              'Unit': 'None',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': env}
+                              ]
+                          }
+                      ]
+                  )
+                  
+              except Exception as e:
+                  print(f"Error collecting business metrics: {e}")
+          
+          def collect_performance_metrics():
+              """Collect application performance metrics"""
+              app_name = os.environ['APPLICATION_NAME']
+              env = os.environ['ENVIRONMENT']
+              
+              try:
+                  # Database connection pool metrics
+                  db_metrics = get_database_metrics()
+                  
+                  # Cache hit ratio
+                  cache_metrics = get_cache_metrics()
+                  
+                  # Queue metrics
+                  queue_metrics = get_queue_metrics()
+                  
+                  metric_data = []
+                  
+                  if db_metrics:
+                      metric_data.extend([
+                          {
+                              'MetricName': 'DatabaseConnections',
+                              'Value': db_metrics['active_connections'],
+                              'Unit': 'Count',
+                              'Dimensions': [{'Name': 'Environment', 'Value': env}]
+                          },
+                          {
+                              'MetricName': 'DatabaseQueryTime',
+                              'Value': db_metrics['avg_query_time'],
+                              'Unit': 'Milliseconds',
+                              'Dimensions': [{'Name': 'Environment', 'Value': env}]
+                          }
+                      ])
+                  
+                  if cache_metrics:
+                      metric_data.append({
+                          'MetricName': 'CacheHitRatio',
+                          'Value': cache_metrics['hit_ratio'],
+                          'Unit': 'Percent',
+                          'Dimensions': [{'Name': 'Environment', 'Value': env}]
+                      })
+                  
+                  if queue_metrics:
+                      metric_data.append({
+                          'MetricName': 'QueueDepth',
+                          'Value': queue_metrics['depth'],
+                          'Unit': 'Count',
+                          'Dimensions': [{'Name': 'Environment', 'Value': env}]
+                      })
+                  
+                  if metric_data:
+                      cloudwatch.put_metric_data(
+                          Namespace=f'{app_name}/Performance',
+                          MetricData=metric_data
+                      )
+                      
+              except Exception as e:
+                  print(f"Error collecting performance metrics: {e}")
+          
+          def collect_infrastructure_metrics():
+              """Collect infrastructure-specific metrics"""
+              app_name = os.environ['APPLICATION_NAME']
+              env = os.environ['ENVIRONMENT']
+              
+              try:
+                  # Disk usage metrics
+                  disk_usage = get_disk_usage()
+                  
+                  # Network connectivity tests
+                  connectivity_status = test_external_dependencies()
+                  
+                  metric_data = []
+                  
+                  if disk_usage:
+                      metric_data.append({
+                          'MetricName': 'DiskUsagePercent',
+                          'Value': disk_usage['usage_percent'],
+                          'Unit': 'Percent',
+                          'Dimensions': [{'Name': 'Environment', 'Value': env}]
+                      })
+                  
+                  for service, status in connectivity_status.items():
+                      metric_data.append({
+                          'MetricName': 'ExternalServiceConnectivity',
+                          'Value': 1 if status['connected'] else 0,
+                          'Unit': 'Count',
+                          'Dimensions': [
+                              {'Name': 'Environment', 'Value': env},
+                              {'Name': 'Service', 'Value': service}
+                          ]
+                      })
+                      
+                      if status['connected']:
+                          metric_data.append({
+                              'MetricName': 'ExternalServiceLatency',
+                              'Value': status['latency_ms'],
+                              'Unit': 'Milliseconds',
+                              'Dimensions': [
+                                  {'Name': 'Environment', 'Value': env},
+                                  {'Name': 'Service', 'Value': service}
+                              ]
+                          })
+                  
+                  if metric_data:
+                      cloudwatch.put_metric_data(
+                          Namespace=f'{app_name}/Infrastructure',
+                          MetricData=metric_data
+                      )
+                      
+              except Exception as e:
+                  print(f"Error collecting infrastructure metrics: {e}")
+          
+          # Mock functions - replace with actual implementation
+          def get_active_user_count():
+              return 150  # Mock data
+          
+          def get_transaction_count():
+              return 1250  # Mock data
+          
+          def get_current_revenue():
+              return 50000.00  # Mock data
+          
+          def get_database_metrics():
+              return {
+                  'active_connections': 25,
+                  'avg_query_time': 45
+              }
+          
+          def get_cache_metrics():
+              return {'hit_ratio': 95.5}
+          
+          def get_queue_metrics():
+              return {'depth': 12}
+          
+          def get_disk_usage():
+              return {'usage_percent': 78}
+          
+          def test_external_dependencies():
+              """Test connectivity to external services"""
+              dependencies = {
+                  'database': {'host': 'db.example.com', 'port': 5432},
+                  'cache': {'host': 'cache.example.com', 'port': 6379},
+                  'api': {'host': 'api.example.com', 'port': 443}
+              }
+              
+              results = {}
+              
+              for service, config in dependencies.items():
+                  try:
+                      start_time = datetime.now()
+                      # Simulate connectivity test
+                      # In real implementation, use socket or requests library
+                      latency = 25  # Mock latency
+                      
+                      results[service] = {
+                          'connected': True,
+                          'latency_ms': latency
+                      }
+                  except Exception:
+                      results[service] = {
+                          'connected': False,
+                          'latency_ms': 0
+                      }
+              
+              return results
+
+  # IAM Role for Custom Metrics Lambda
+  CustomMetricsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CustomMetricsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Schedule for Custom Metrics Collection
+  CustomMetricsSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger custom metrics collection every 5 minutes'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CustomMetricsLambda.Arn
+          Id: CustomMetricsTarget
+
+  CustomMetricsSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CustomMetricsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CustomMetricsSchedule.Arn
+
+  # CloudWatch Alarms
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-HighLatency'
+      AlarmDescription: 'Application latency is higher than threshold'
+      MetricName: 'TargetResponseTime'
+      Namespace: 'AWS/ApplicationELB'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref HighLatencyThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+      TreatMissingData: notBreaching
+
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-HighErrorRate'
+      AlarmDescription: 'Application error rate is higher than threshold'
+      MetricName: 'HTTPCode_Target_5XX_Count'
+      Namespace: 'AWS/ApplicationELB'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      TreatMissingData: notBreaching
+
+  LowAvailabilityAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-LowAvailability'
+      AlarmDescription: 'Application availability is lower than threshold'
+      MetricName: 'HealthyHostCount'
+      Namespace: 'AWS/ApplicationELB'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref LowAvailabilityThreshold
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref CriticalAlertsTopic
+      TreatMissingData: breaching
+
+  # Anomaly Detection
+  ApplicationLatencyAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      MetricName: 'TargetResponseTime'
+      Namespace: 'AWS/ApplicationELB'
+      Stat: Average
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Sub '${ApplicationName}-${Environment}-alb'
+
+  ApplicationLatencyAnomalyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-LatencyAnomaly'
+      AlarmDescription: 'Anomalous latency pattern detected'
+      ComparisonOperator: LessThanLowerOrGreaterThanUpperThreshold
+      EvaluationPeriods: 2
+      Metrics:
+        - Id: m1
+          MetricStat:
+            Metric:
+              MetricName: 'TargetResponseTime'
+              Namespace: 'AWS/ApplicationELB'
+            Period: 300
+            Stat: Average
+        - Id: ad1
+          AnomalyDetector:
+            MetricMathAnomalyDetector:
+              MetricDataQueries:
+                - Id: m1
+                  MetricStat:
+                    Metric:
+                      MetricName: 'TargetResponseTime'
+                      Namespace: 'AWS/ApplicationELB'
+                    Period: 300
+                    Stat: Average
+      ThresholdMetricId: ad1
+      AlarmActions:
+        - !Ref WarningAlertsTopic
+
+  # Comprehensive Dashboard
+  ObservabilityDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ApplicationName}-${Environment}-observability'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${ApplicationName}-${Environment}-alb"],
+                  [".", "RequestCount", ".", "."],
+                  [".", "HTTPCode_Target_2XX_Count", ".", "."],
+                  [".", "HTTPCode_Target_4XX_Count", ".", "."],
+                  [".", "HTTPCode_Target_5XX_Count", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Application Load Balancer Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${ApplicationName}/Business", "ActiveUsers", "Environment", "${Environment}"],
+                  [".", "TransactionCount", ".", "."],
+                  [".", "Revenue", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Business Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${ApplicationName}/Performance", "DatabaseConnections", "Environment", "${Environment}"],
+                  [".", "DatabaseQueryTime", ".", "."],
+                  [".", "CacheHitRatio", ".", "."],
+                  [".", "QueueDepth", ".", "."]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Performance Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${ApplicationName}/Infrastructure", "DiskUsagePercent", "Environment", "${Environment}"],
+                  [".", "ExternalServiceConnectivity", ".", ".", "Service", "database"],
+                  [".", ".", ".", ".", ".", "cache"],
+                  [".", ".", ".", ".", ".", "api"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Infrastructure Health"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 6,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["${ApplicationName}/Infrastructure", "ExternalServiceLatency", "Environment", "${Environment}", "Service", "database"],
+                  [".", ".", ".", ".", ".", "cache"],
+                  [".", ".", ".", ".", ".", "api"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "External Service Latency"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ObservabilityDashboardURL:
+    Description: URL for the comprehensive observability dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ApplicationName}-${Environment}-observability'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
+
+  CriticalAlertsTopicArn:
+    Description: SNS Topic ARN for critical alerts
+    Value: !Ref CriticalAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-CriticalAlertsTopic'
+
+  WarningAlertsTopicArn:
+    Description: SNS Topic ARN for warning alerts
+    Value: !Ref WarningAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-WarningAlertsTopic'
+
+  CustomMetricsLambdaArn:
+    Description: Custom metrics collection Lambda function ARN
+    Value: !GetAtt CustomMetricsLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomMetricsLambda'
+
+  SyntheticCanaryArn:
+    Condition: EnableSyntheticsCondition
+    Description: CloudWatch Synthetics Canary ARN
+    Value: !GetAtt SyntheticCanary.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SyntheticCanary'
+
+  ApplicationLogGroupName:
+    Description: Application log group name
+    Value: !Ref ApplicationLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLogGroup'
+
+  OTelCollectorRoleArn:
+    Description: OpenTelemetry Collector IAM Role ARN
+    Value: !GetAtt OTelCollectorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OTelCollectorRole'

@@ -1,0 +1,703 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SNS風アプリケーション - CRUD API スタック'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: 'デプロイ環境'
+  
+  ProjectName:
+    Type: String
+    Default: sns-app
+    Description: 'プロジェクト名'
+
+Resources:
+  # DynamoDB テーブル - 投稿
+  PostsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-posts-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: postId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: postId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # ユーザー別投稿取得用インデックス
+        - IndexName: userId-createdAt-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        # 時系列取得用インデックス
+        - IndexName: createdAt-index
+          KeySchema:
+            - AttributeName: createdAt
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda 実行ロール
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt PostsTable.Arn
+                  - !Sub '${PostsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda関数 - 投稿作成
+  CreatePostFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-create-post-${Environment}'
+      Runtime: nodejs18.x
+      Handler: posts.createPost
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          // プレースホルダー - 実際のコードはデプロイ時に置き換え
+          exports.createPost = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref PostsTable
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda関数 - 投稿取得
+  GetPostFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-get-post-${Environment}'
+      Runtime: nodejs18.x
+      Handler: posts.getPost
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.getPost = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref PostsTable
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - 投稿一覧取得
+  GetPostsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-get-posts-${Environment}'
+      Runtime: nodejs18.x
+      Handler: posts.getPosts
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.getPosts = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref PostsTable
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - ユーザー別投稿取得
+  GetPostsByUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-get-posts-by-user-${Environment}'
+      Runtime: nodejs18.x
+      Handler: posts.getPostsByUser
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.getPostsByUser = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref PostsTable
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - 投稿更新
+  UpdatePostFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-update-post-${Environment}'
+      Runtime: nodejs18.x
+      Handler: posts.updatePost
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.updatePost = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref PostsTable
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - 投稿削除
+  DeletePostFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-delete-post-${Environment}'
+      Runtime: nodejs18.x
+      Handler: posts.deletePost
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.deletePost = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref PostsTable
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - いいね機能
+  LikePostFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-like-post-${Environment}'
+      Runtime: nodejs18.x
+      Handler: posts.likePost
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.likePost = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref PostsTable
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # API Gateway REST API
+  PostsRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-posts-api-${Environment}'
+      Description: 'SNS風アプリケーション投稿API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      BinaryMediaTypes:
+        - '*/*'
+
+  # API Gateway - /posts リソース
+  PostsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ParentId: !GetAtt PostsRestApi.RootResourceId
+      PathPart: posts
+
+  # API Gateway - /posts/{postId} リソース
+  PostIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ParentId: !Ref PostsResource
+      PathPart: '{postId}'
+
+  # API Gateway - /posts/{postId}/like リソース
+  PostLikeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ParentId: !Ref PostIdResource
+      PathPart: like
+
+  # API Gateway - /users リソース
+  UsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ParentId: !GetAtt PostsRestApi.RootResourceId
+      PathPart: users
+
+  # API Gateway - /users/{userId} リソース
+  UserIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ParentId: !Ref UsersResource
+      PathPart: '{userId}'
+
+  # API Gateway - /users/{userId}/posts リソース
+  UserPostsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ParentId: !Ref UserIdResource
+      PathPart: posts
+
+  # メソッド: POST /posts (投稿作成)
+  CreatePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ResourceId: !Ref PostsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreatePostFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 400
+        - StatusCode: 500
+
+  # メソッド: GET /posts (投稿一覧取得)
+  GetPostsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ResourceId: !Ref PostsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.limit: false
+        method.request.querystring.lastKey: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetPostsFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # メソッド: GET /posts/{postId} (特定投稿取得)
+  GetPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ResourceId: !Ref PostIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.postId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetPostFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 404
+
+  # メソッド: PUT /posts/{postId} (投稿更新)
+  UpdatePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ResourceId: !Ref PostIdResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.postId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdatePostFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 400
+        - StatusCode: 404
+
+  # メソッド: DELETE /posts/{postId} (投稿削除)
+  DeletePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ResourceId: !Ref PostIdResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.postId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeletePostFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+        - StatusCode: 404
+
+  # メソッド: POST /posts/{postId}/like (いいね機能)
+  LikePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ResourceId: !Ref PostLikeResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.postId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LikePostFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # メソッド: GET /users/{userId}/posts (ユーザー別投稿取得)
+  GetPostsByUserMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ResourceId: !Ref UserPostsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.userId: true
+        method.request.querystring.limit: false
+        method.request.querystring.lastKey: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetPostsByUserFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # CORS設定用OPTIONSメソッド
+  PostsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ResourceId: !Ref PostsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  PostIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      ResourceId: !Ref PostIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda権限設定
+  CreatePostLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreatePostFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PostsRestApi}/*/*'
+
+  GetPostLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetPostFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PostsRestApi}/*/*'
+
+  GetPostsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetPostsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PostsRestApi}/*/*'
+
+  GetPostsByUserLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetPostsByUserFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PostsRestApi}/*/*'
+
+  UpdatePostLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdatePostFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PostsRestApi}/*/*'
+
+  DeletePostLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeletePostFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PostsRestApi}/*/*'
+
+  LikePostLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LikePostFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PostsRestApi}/*/*'
+
+  # API Gateway デプロイメント
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CreatePostMethod
+      - GetPostsMethod
+      - GetPostMethod
+      - UpdatePostMethod
+      - DeletePostMethod
+      - LikePostMethod
+      - GetPostsByUserMethod
+      - PostsOptionsMethod
+      - PostIdOptionsMethod
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      Description: 'Posts API deployment'
+
+  # API Gateway ステージ
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref PostsRestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub 'Posts API ${Environment} stage'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Variables:
+        environment: !Ref Environment
+
+  # CloudWatch Logs グループ
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-posts-api-${Environment}'
+      RetentionInDays: 14
+
+Outputs:
+  # API Gateway情報
+  ApiGatewayUrl:
+    Description: 'API Gateway URL'
+    Value: !Sub 'https://${PostsRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-api-url-${Environment}'
+
+  ApiGatewayId:
+    Description: 'API Gateway ID'
+    Value: !Ref PostsRestApi
+    Export:
+      Name: !Sub '${ProjectName}-api-id-${Environment}'
+
+  # DynamoDB情報
+  PostsTableName:
+    Description: 'Posts DynamoDB Table Name'
+    Value: !Ref PostsTable
+    Export:
+      Name: !Sub '${ProjectName}-posts-table-${Environment}'
+
+  PostsTableArn:
+    Description: 'Posts DynamoDB Table ARN'
+    Value: !GetAtt PostsTable.Arn
+    Export:
+      Name: !Sub '${ProjectName}-posts-table-arn-${Environment}'
+
+  # Lambda関数情報
+  CreatePostFunctionArn:
+    Description: 'Create Post Lambda Function ARN'
+    Value: !GetAtt CreatePostFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-create-post-function-arn-${Environment}'
+
+  GetPostsFunctionArn:
+    Description: 'Get Posts Lambda Function ARN'
+    Value: !GetAtt GetPostsFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-get-posts-function-arn-${Environment}'
+
+  # 環境情報
+  Environment:
+    Description: 'Environment name'
+    Value: !Ref Environment
+    Export:
+      Name: !Sub '${ProjectName}-environment'
+
+  Region:
+    Description: 'AWS Region'
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub '${ProjectName}-region-${Environment}'

@@ -1,0 +1,687 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SNS風アプリケーション - ファイルアップロード機能'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: 'デプロイ環境'
+  
+  ProjectName:
+    Type: String
+    Default: sns-app
+    Description: 'プロジェクト名'
+
+Resources:
+  # S3バケット - アップロード用
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-uploads-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ImageProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # S3バケット - 処理済み画像用
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 86400
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntelligentTiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 1
+                StorageClass: INTELLIGENT_TIERING
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudFront Origin Access Identity
+  CloudFrontOAI:
+    Type: AWS::CloudFront::OriginAccessIdentity
+    Properties:
+      OriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${ProjectName} processed images'
+
+  # S3バケットポリシー - CloudFrontアクセス用
+  ProcessedBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProcessedBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOAI}'
+            Action: 's3:GetObject'
+            Resource: !Sub '${ProcessedBucket.Arn}/*'
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName} image distribution'
+        DefaultCacheBehavior:
+          TargetOriginId: ProcessedImagesOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf # Managed-CORS-S3Origin
+          ResponseHeadersPolicyId: 5cc3b908-e619-4b99-88e5-2cf7f45965bd # Managed-SimpleCORS
+          Compress: true
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - Id: ProcessedImagesOrigin
+            DomainName: !GetAtt ProcessedBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        PriceClass: PriceClass_100 # 北米・ヨーロッパ・アジア
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /placeholder.jpg
+            ErrorCachingMinTTL: 300
+        DefaultRootObject: index.html
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda Layer - Sharp画像処理ライブラリ
+  SharpLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub '${ProjectName}-sharp-layer-${Environment}'
+      Description: 'Sharp image processing library for Node.js'
+      Content:
+        S3Bucket: !Sub 'lambda-layers-${AWS::Region}'
+        S3Key: 'sharp-layer.zip'
+      CompatibleRuntimes:
+        - nodejs18.x
+      CompatibleArchitectures:
+        - x86_64
+
+  # Lambda実行ロール - アップロード機能用
+  UploadLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-upload-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub '${UploadBucket.Arn}'
+                  - !Sub '${UploadBucket.Arn}/*'
+                  - !Sub '${ProcessedBucket.Arn}'
+                  - !Sub '${ProcessedBucket.Arn}/*'
+
+  # Lambda実行ロール - 画像処理用
+  ImageProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-image-processor-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub '${UploadBucket.Arn}/*'
+                  - !Sub '${ProcessedBucket.Arn}/*'
+
+  # Lambda関数 - プリサインドURL生成
+  GenerateUploadUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-generate-upload-url-${Environment}'
+      Runtime: nodejs18.x
+      Handler: upload.generateUploadUrl
+      Role: !GetAtt UploadLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.generateUploadUrl = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          CLOUDFRONT_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda関数 - アップロード完了通知
+  UploadCompleteFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-upload-complete-${Environment}'
+      Runtime: nodejs18.x
+      Handler: upload.uploadComplete
+      Role: !GetAtt UploadLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.uploadComplete = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          CLOUDFRONT_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - ファイル削除
+  DeleteFileFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-delete-file-${Environment}'
+      Runtime: nodejs18.x
+      Handler: upload.deleteFile
+      Role: !GetAtt UploadLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.deleteFile = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          CLOUDFRONT_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - ファイル一覧取得
+  ListFilesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-list-files-${Environment}'
+      Runtime: nodejs18.x
+      Handler: upload.listFiles
+      Role: !GetAtt UploadLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.listFiles = async (event) => {
+            return {
+              statusCode: 200,
+              headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message: 'Function not deployed yet' })
+            };
+          };
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          CLOUDFRONT_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - 画像処理
+  ImageProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-image-processor-${Environment}'
+      Runtime: nodejs18.x
+      Handler: imageProcessor.processImage
+      Role: !GetAtt ImageProcessorRole.Arn
+      Code:
+        ZipFile: |
+          exports.processImage = async (event) => {
+            console.log('Image processing triggered:', JSON.stringify(event, null, 2));
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ message: 'Image processing completed' })
+            };
+          };
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Ref UploadBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          CLOUDFRONT_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 300 # 5分
+      MemorySize: 1024
+      Layers:
+        - !Ref SharpLayer
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda権限 - S3からの呼び出し
+  ImageProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ImageProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${UploadBucket.Arn}'
+      SourceAccount: !Ref AWS::AccountId
+
+  # API Gateway REST API
+  UploadRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-upload-api-${Environment}'
+      Description: 'SNS風アプリケーション ファイルアップロードAPI'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      BinaryMediaTypes:
+        - '*/*'
+
+  # API Gateway リソース - /upload
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ParentId: !GetAtt UploadRestApi.RootResourceId
+      PathPart: upload
+
+  # API Gateway リソース - /upload/url
+  UploadUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ParentId: !Ref UploadResource
+      PathPart: url
+
+  # API Gateway リソース - /upload/complete
+  UploadCompleteResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ParentId: !Ref UploadResource
+      PathPart: complete
+
+  # API Gateway リソース - /upload/{key}
+  UploadKeyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ParentId: !Ref UploadResource
+      PathPart: '{key}'
+
+  # API Gateway リソース - /upload/list
+  UploadListResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ParentId: !Ref UploadResource
+      PathPart: list
+
+  # API Gateway リソース - /upload/list/{userId}
+  UploadListUserResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ParentId: !Ref UploadListResource
+      PathPart: '{userId}'
+
+  # メソッド: POST /upload/url
+  GenerateUploadUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ResourceId: !Ref UploadUrlResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateUploadUrlFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # メソッド: POST /upload/complete
+  UploadCompleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ResourceId: !Ref UploadCompleteResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadCompleteFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # メソッド: DELETE /upload/{key}
+  DeleteFileMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ResourceId: !Ref UploadKeyResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.key: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteFileFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # メソッド: GET /upload/list/{userId}
+  ListFilesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ResourceId: !Ref UploadListUserResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.userId: true
+        method.request.querystring.limit: false
+        method.request.querystring.marker: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListFilesFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # CORS設定
+  UploadUrlOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ResourceId: !Ref UploadUrlResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  UploadCompleteOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      ResourceId: !Ref UploadCompleteResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda権限設定
+  GenerateUploadUrlLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GenerateUploadUrlFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UploadRestApi}/*/*'
+
+  UploadCompleteLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UploadCompleteFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UploadRestApi}/*/*'
+
+  DeleteFileLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteFileFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UploadRestApi}/*/*'
+
+  ListFilesLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListFilesFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UploadRestApi}/*/*'
+
+  # API Gateway デプロイメント
+  UploadApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GenerateUploadUrlMethod
+      - UploadCompleteMethod
+      - DeleteFileMethod
+      - ListFilesMethod
+      - UploadUrlOptionsMethod
+      - UploadCompleteOptionsMethod
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      Description: 'Upload API deployment'
+
+  # API Gateway ステージ
+  UploadApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref UploadRestApi
+      DeploymentId: !Ref UploadApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub 'Upload API ${Environment} stage'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Variables:
+        environment: !Ref Environment
+
+  # CloudWatch Logs
+  UploadApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-upload-api-${Environment}'
+      RetentionInDays: 14
+
+Outputs:
+  # API Gateway情報
+  UploadApiUrl:
+    Description: 'Upload API Gateway URL'
+    Value: !Sub 'https://${UploadRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-upload-api-url-${Environment}'
+
+  # S3バケット情報
+  UploadBucketName:
+    Description: 'Upload S3 Bucket Name'
+    Value: !Ref UploadBucket
+    Export:
+      Name: !Sub '${ProjectName}-upload-bucket-${Environment}'
+
+  ProcessedBucketName:
+    Description: 'Processed Images S3 Bucket Name'
+    Value: !Ref ProcessedBucket
+    Export:
+      Name: !Sub '${ProjectName}-processed-bucket-${Environment}'
+
+  # CloudFront情報
+  CloudFrontDomain:
+    Description: 'CloudFront Distribution Domain'
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${ProjectName}-cloudfront-domain-${Environment}'
+
+  CloudFrontDistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${ProjectName}-cloudfront-id-${Environment}'
+
+  # Lambda関数情報
+  ImageProcessorFunctionArn:
+    Description: 'Image Processor Lambda Function ARN'
+    Value: !GetAtt ImageProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-image-processor-function-arn-${Environment}'

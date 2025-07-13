@@ -4,6 +4,29 @@
 
 このセクションでは、Amazon Bedrock Stable Diffusionモデルを使用した高度な画像生成機能の実装について学習します。テキストから画像を生成する基本的な機能から、高度な画像編集、スタイル転送、バッチ処理まで包括的にカバーします。
 
+## 🎨 画像生成システムの特徴
+
+### 主要な機能
+- **高品質画像生成**: Stable Diffusion XLによる高解像度画像生成
+- **多様なスタイル対応**: アート、写真、イラスト、デザインなど多彩なスタイル
+- **バッチ処理**: 複数画像の同時生成と効率的な処理
+- **画像編集**: インペインティング、アウトペインティング、変更機能
+- **プロンプト最適化**: AI支援によるプロンプト改良機能
+
+### ビジネス価値
+- **マーケティング素材**: 広告・プロモーション用画像の自動生成
+- **コンテンツ制作**: ブログ・記事・SNS用ビジュアル作成
+- **プロトタイピング**: 製品・UI・UXデザインの概念実証
+- **エンターテイメント**: ゲーム・アニメーション用アセット生成
+- **教育・研修**: 教材・プレゼンテーション用図表作成
+
+### 技術的優位性
+- **エンタープライズ対応**: 高可用性・スケーラビリティ・セキュリティ
+- **コスト最適化**: 効率的なリソース使用とバッチ処理
+- **品質管理**: 自動品質チェックとNSFWフィルタリング
+- **監査機能**: 完全な生成履歴とメタデータ管理
+- **国際化対応**: 多言語プロンプト・多地域デプロイ
+
 ### 習得できるスキル
 - Amazon Bedrock Stable Diffusionモデルの活用
 - Text-to-Image（テキストから画像）生成の実装
@@ -123,6 +146,1138 @@ graph TB
 - **Style Transfer Service**: 画像スタイル転送
 - **S3 Storage**: 画像ファイルの保存・管理
 - **DynamoDB**: 画像メタデータと生成履歴
+
+## 🛠 ハンズオン実装
+
+### ステップ1: CloudFormation インフラストラクチャの構築
+
+#### 1.1 基盤インフラストラクチャのデプロイ
+
+```bash
+# 画像生成システムのデプロイ
+cd cloudformation
+
+# 基盤インフラのデプロイ
+aws cloudformation create-stack \
+    --stack-name image-generation-infrastructure \
+    --template-body file://image-generation.yaml \
+    --parameters \
+        ParameterKey=EnvironmentName,ParameterValue=dev \
+        ParameterKey=ProjectName,ParameterValue=image-generation \
+        ParameterKey=BedrockStackName,ParameterValue=bedrock-setup-stack \
+    --capabilities CAPABILITY_IAM
+
+# デプロイ状況の確認
+aws cloudformation describe-stacks \
+    --stack-name image-generation-infrastructure \
+    --query 'Stacks[0].StackStatus'
+```
+
+### ステップ2: 高性能画像生成Lambda関数の実装
+
+#### 2.1 Text-to-Image生成サービス
+
+```python
+# lambda/text-to-image-generator/lambda_function.py
+import json
+import boto3
+import os
+import base64
+import uuid
+import hashlib
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
+import logging
+
+# AWS Services
+bedrock_runtime = boto3.client('bedrock-runtime')
+s3_client = boto3.client('s3')
+dynamodb = boto3.resource('dynamodb')
+rekognition = boto3.client('rekognition')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Environment Variables
+IMAGES_BUCKET = os.environ.get('IMAGES_BUCKET')
+METADATA_TABLE = os.environ.get('METADATA_TABLE')
+MAX_IMAGE_SIZE = int(os.environ.get('MAX_IMAGE_SIZE', '2048'))
+DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'stability.stable-diffusion-xl-v1:0')
+ENABLE_NSFW_FILTER = os.environ.get('ENABLE_NSFW_FILTER', 'true').lower() == 'true'
+
+class ImageGenerator:
+    """
+    高性能画像生成クラス
+    Stable Diffusion XLを使用したテキストから画像生成
+    """
+    
+    def __init__(self):
+        self.supported_models = {
+            'stability.stable-diffusion-xl-v1:0': self._generate_with_sdxl,
+            'stability.stable-diffusion-xl-v0:0': self._generate_with_sdxl,
+            'amazon.titan-image-generator-v1': self._generate_with_titan
+        }
+        
+        self.style_presets = {
+            'photographic': 'photographic',
+            'digital-art': 'digital-art',
+            'comic-book': 'comic-book',
+            'fantasy-art': 'fantasy-art',
+            'line-art': 'line-art',
+            'analog-film': 'analog-film',
+            'neon-punk': 'neon-punk',
+            'isometric': 'isometric',
+            'low-poly': 'low-poly',
+            'origami': 'origami',
+            'minimalist': 'minimalist',
+            'cinematic': 'cinematic'
+        }
+    
+    def generate_image(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        style: str = "photographic",
+        width: int = 1024,
+        height: int = 1024,
+        cfg_scale: float = 7.0,
+        steps: int = 30,
+        seed: Optional[int] = None,
+        model_id: str = None,
+        user_id: str = 'anonymous'
+    ) -> Dict[str, Any]:
+        """
+        メイン画像生成機能
+        """
+        try:
+            if not model_id:
+                model_id = DEFAULT_MODEL
+            
+            logger.info(f"Generating image with model: {model_id}")
+            
+            # プロンプトの検証と最適化
+            validated_prompt = self._validate_and_optimize_prompt(prompt)
+            
+            # 画像生成実行
+            if model_id not in self.supported_models:
+                raise ValueError(f"Unsupported model: {model_id}")
+            
+            generator_func = self.supported_models[model_id]
+            generation_result = generator_func(
+                prompt=validated_prompt,
+                negative_prompt=negative_prompt,
+                style=style,
+                width=width,
+                height=height,
+                cfg_scale=cfg_scale,
+                steps=steps,
+                seed=seed
+            )
+            
+            # 生成画像の品質チェック
+            quality_score = self._assess_image_quality(generation_result['image_data'])
+            
+            # NSFWフィルタリング
+            if ENABLE_NSFW_FILTER:
+                safety_result = self._check_content_safety(generation_result['image_data'])
+                if not safety_result['is_safe']:
+                    raise ValueError(f"Generated image violates content policy: {safety_result['reason']}")
+            
+            # S3への保存
+            image_key = self._save_image_to_s3(generation_result['image_data'], model_id, user_id)
+            
+            # メタデータの保存
+            metadata = {
+                'image_id': str(uuid.uuid4()),
+                'user_id': user_id,
+                'prompt': validated_prompt,
+                'negative_prompt': negative_prompt,
+                'model_id': model_id,
+                'style': style,
+                'width': width,
+                'height': height,
+                'cfg_scale': cfg_scale,
+                'steps': steps,
+                'seed': generation_result.get('seed'),
+                'quality_score': quality_score,
+                'image_key': image_key,
+                'created_at': datetime.now(timezone.utc).isoformat(),
+                'file_size': len(generation_result['image_data'])
+            }
+            
+            self._save_metadata(metadata)
+            
+            result = {
+                'image_id': metadata['image_id'],
+                'image_url': f"s3://{IMAGES_BUCKET}/{image_key}",
+                'metadata': metadata,
+                'quality_score': quality_score,
+                'generation_time': generation_result.get('generation_time', 0)
+            }
+            
+            logger.info(f"Successfully generated image: {metadata['image_id']}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error generating image: {str(e)}")
+            raise
+    
+    def _validate_and_optimize_prompt(self, prompt: str) -> str:
+        """プロンプトの検証と最適化"""
+        # 基本的な検証
+        if not prompt or len(prompt.strip()) == 0:
+            raise ValueError("Prompt cannot be empty")
+        
+        if len(prompt) > 2000:
+            raise ValueError("Prompt too long (max 2000 characters)")
+        
+        # 不適切なコンテンツのチェック
+        inappropriate_keywords = [
+            'nsfw', 'explicit', 'nude', 'violent', 'gore',
+            'hateful', 'discriminatory', 'illegal'
+        ]
+        
+        prompt_lower = prompt.lower()
+        for keyword in inappropriate_keywords:
+            if keyword in prompt_lower:
+                raise ValueError(f"Inappropriate content detected: {keyword}")
+        
+        # プロンプトの最適化
+        optimized_prompt = prompt.strip()
+        
+        # 品質向上のためのキーワード追加
+        quality_enhancers = ", high quality, detailed, professional"
+        if "high quality" not in optimized_prompt.lower():
+            optimized_prompt += quality_enhancers
+        
+        return optimized_prompt
+    
+    def _generate_with_sdxl(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        style: str = "photographic",
+        width: int = 1024,
+        height: int = 1024,
+        cfg_scale: float = 7.0,
+        steps: int = 30,
+        seed: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Stable Diffusion XLでの画像生成"""
+        try:
+            # リクエストボディの構築
+            body = {
+                "text_prompts": [
+                    {
+                        "text": prompt,
+                        "weight": 1.0
+                    }
+                ],
+                "cfg_scale": cfg_scale,
+                "width": width,
+                "height": height,
+                "steps": steps,
+                "style_preset": style if style in self.style_presets else "photographic"
+            }
+            
+            # ネガティブプロンプトの追加
+            if negative_prompt:
+                body["text_prompts"].append({
+                    "text": negative_prompt,
+                    "weight": -1.0
+                })
+            
+            # シードの設定
+            if seed is not None:
+                body["seed"] = seed
+            else:
+                body["seed"] = 0  # ランダムシード
+            
+            start_time = datetime.now()
+            
+            # Bedrock API呼び出し
+            response = bedrock_runtime.invoke_model(
+                modelId=DEFAULT_MODEL,
+                body=json.dumps(body),
+                contentType='application/json'
+            )
+            
+            end_time = datetime.now()
+            generation_time = (end_time - start_time).total_seconds()
+            
+            # レスポンス解析
+            response_body = json.loads(response['body'].read())
+            
+            if 'artifacts' not in response_body or not response_body['artifacts']:
+                raise ValueError("No image generated")
+            
+            artifact = response_body['artifacts'][0]
+            image_data = base64.b64decode(artifact['base64'])
+            
+            return {
+                'image_data': image_data,
+                'seed': artifact.get('seed', seed),
+                'finish_reason': artifact.get('finishReason', 'SUCCESS'),
+                'generation_time': generation_time
+            }
+            
+        except Exception as e:
+            logger.error(f"Error with Stable Diffusion XL: {str(e)}")
+            raise
+    
+    def _generate_with_titan(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        style: str = "photographic",
+        width: int = 1024,
+        height: int = 1024,
+        cfg_scale: float = 7.0,
+        steps: int = 30,
+        seed: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Amazon Titan Image Generatorでの画像生成"""
+        try:
+            # Titan用のリクエストボディ
+            body = {
+                "taskType": "TEXT_IMAGE",
+                "textToImageParams": {
+                    "text": prompt,
+                    "negativeText": negative_prompt if negative_prompt else "",
+                    "style": style
+                },
+                "imageGenerationConfig": {
+                    "numberOfImages": 1,
+                    "quality": "premium",
+                    "cfgScale": cfg_scale,
+                    "height": height,
+                    "width": width
+                }
+            }
+            
+            if seed is not None:
+                body["imageGenerationConfig"]["seed"] = seed
+            
+            start_time = datetime.now()
+            
+            response = bedrock_runtime.invoke_model(
+                modelId="amazon.titan-image-generator-v1",
+                body=json.dumps(body),
+                contentType='application/json'
+            )
+            
+            end_time = datetime.now()
+            generation_time = (end_time - start_time).total_seconds()
+            
+            response_body = json.loads(response['body'].read())
+            
+            if 'images' not in response_body or not response_body['images']:
+                raise ValueError("No image generated")
+            
+            image_data = base64.b64decode(response_body['images'][0])
+            
+            return {
+                'image_data': image_data,
+                'seed': seed,
+                'finish_reason': 'SUCCESS',
+                'generation_time': generation_time
+            }
+            
+        except Exception as e:
+            logger.error(f"Error with Titan Image Generator: {str(e)}")
+            raise
+    
+    def _assess_image_quality(self, image_data: bytes) -> float:
+        """画像品質の評価"""
+        try:
+            # Amazon Rekognitionを使用した基本的な品質評価
+            response = rekognition.detect_labels(
+                Image={'Bytes': image_data},
+                MaxLabels=10,
+                MinConfidence=70
+            )
+            
+            # ラベルの信頼度に基づく品質スコア計算
+            labels = response.get('Labels', [])
+            if not labels:
+                return 0.5  # デフォルトスコア
+            
+            confidence_scores = [label['Confidence'] for label in labels]
+            avg_confidence = sum(confidence_scores) / len(confidence_scores)
+            
+            # 0-1の範囲にスケール
+            quality_score = avg_confidence / 100.0
+            
+            return round(quality_score, 2)
+            
+        except Exception as e:
+            logger.warning(f"Quality assessment failed: {str(e)}")
+            return 0.5  # デフォルトスコア
+    
+    def _check_content_safety(self, image_data: bytes) -> Dict[str, Any]:
+        """コンテンツ安全性チェック"""
+        try:
+            # Amazon Rekognitionでの有害コンテンツ検出
+            response = rekognition.detect_moderation_labels(
+                Image={'Bytes': image_data},
+                MinConfidence=80
+            )
+            
+            moderation_labels = response.get('ModerationLabels', [])
+            
+            if moderation_labels:
+                unsafe_labels = [label['Name'] for label in moderation_labels]
+                return {
+                    'is_safe': False,
+                    'reason': f"Unsafe content detected: {', '.join(unsafe_labels)}",
+                    'labels': unsafe_labels
+                }
+            
+            return {
+                'is_safe': True,
+                'reason': 'Content is safe',
+                'labels': []
+            }
+            
+        except Exception as e:
+            logger.error(f"Safety check failed: {str(e)}")
+            # エラーの場合は安全とみなす（偽陰性を避ける）
+            return {
+                'is_safe': True,
+                'reason': 'Safety check unavailable',
+                'labels': []
+            }
+    
+    def _save_image_to_s3(self, image_data: bytes, model_id: str, user_id: str) -> str:
+        """画像をS3に保存"""
+        try:
+            # ファイル名の生成
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            image_hash = hashlib.md5(image_data).hexdigest()[:8]
+            model_name = model_id.split('.')[-1].split('-')[0]  # モデル名を短縮
+            
+            image_key = f"generated/{user_id}/{model_name}/{timestamp}_{image_hash}.png"
+            
+            # S3にアップロード
+            s3_client.put_object(
+                Bucket=IMAGES_BUCKET,
+                Key=image_key,
+                Body=image_data,
+                ContentType='image/png',
+                Metadata={
+                    'user_id': user_id,
+                    'model_id': model_id,
+                    'generated_at': datetime.now(timezone.utc).isoformat()
+                }
+            )
+            
+            logger.info(f"Image saved to S3: {image_key}")
+            return image_key
+            
+        except Exception as e:
+            logger.error(f"Failed to save image to S3: {str(e)}")
+            raise
+    
+    def _save_metadata(self, metadata: Dict[str, Any]) -> None:
+        """メタデータをDynamoDBに保存"""
+        try:
+            table = dynamodb.Table(METADATA_TABLE)
+            
+            # TTLを設定（1年後に自動削除）
+            ttl_timestamp = int(datetime.now(timezone.utc).timestamp()) + (365 * 24 * 60 * 60)
+            metadata['ttl'] = ttl_timestamp
+            
+            table.put_item(Item=metadata)
+            logger.info(f"Metadata saved: {metadata['image_id']}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save metadata: {str(e)}")
+            raise
+
+class ImageVariationGenerator:
+    """
+    画像バリエーション生成クラス
+    既存の画像から類似の画像を生成
+    """
+    
+    def __init__(self):
+        self.base_generator = ImageGenerator()
+    
+    def generate_variations(
+        self,
+        original_image_key: str,
+        variation_count: int = 4,
+        variation_strength: float = 0.75,
+        user_id: str = 'anonymous'
+    ) -> List[Dict[str, Any]]:
+        """画像バリエーションの生成"""
+        try:
+            # 元画像の取得
+            original_image = self._get_image_from_s3(original_image_key)
+            original_metadata = self._get_image_metadata(original_image_key)
+            
+            variations = []
+            
+            for i in range(variation_count):
+                # バリエーション用のプロンプト調整
+                base_prompt = original_metadata.get('prompt', 'A beautiful image')
+                variation_prompt = self._create_variation_prompt(base_prompt, i)
+                
+                # バリエーション生成
+                variation_result = self.base_generator.generate_image(
+                    prompt=variation_prompt,
+                    negative_prompt=original_metadata.get('negative_prompt', ''),
+                    style=original_metadata.get('style', 'photographic'),
+                    width=original_metadata.get('width', 1024),
+                    height=original_metadata.get('height', 1024),
+                    cfg_scale=original_metadata.get('cfg_scale', 7.0) * variation_strength,
+                    user_id=user_id
+                )
+                
+                variations.append(variation_result)
+            
+            return variations
+            
+        except Exception as e:
+            logger.error(f"Error generating variations: {str(e)}")
+            raise
+    
+    def _get_image_from_s3(self, image_key: str) -> bytes:
+        """S3から画像を取得"""
+        try:
+            response = s3_client.get_object(Bucket=IMAGES_BUCKET, Key=image_key)
+            return response['Body'].read()
+        except Exception as e:
+            logger.error(f"Failed to get image from S3: {str(e)}")
+            raise
+    
+    def _get_image_metadata(self, image_key: str) -> Dict[str, Any]:
+        """画像メタデータの取得"""
+        try:
+            table = dynamodb.Table(METADATA_TABLE)
+            
+            # image_keyからimage_idを検索
+            response = table.scan(
+                FilterExpression='image_key = :key',
+                ExpressionAttributeValues={':key': image_key}
+            )
+            
+            items = response.get('Items', [])
+            if items:
+                return items[0]
+            else:
+                return {}
+                
+        except Exception as e:
+            logger.error(f"Failed to get metadata: {str(e)}")
+            return {}
+    
+    def _create_variation_prompt(self, base_prompt: str, variation_index: int) -> str:
+        """バリエーション用プロンプトの作成"""
+        variation_modifiers = [
+            "slightly different perspective",
+            "alternative composition",
+            "different lighting",
+            "varied color palette",
+            "modified style",
+            "changed mood"
+        ]
+        
+        modifier = variation_modifiers[variation_index % len(variation_modifiers)]
+        return f"{base_prompt}, {modifier}"
+
+def lambda_handler(event, context):
+    """
+    メインのLambda ハンドラー関数
+    """
+    try:
+        # リクエストボディの解析
+        if 'body' in event:
+            request_body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+        else:
+            request_body = event
+        
+        # パラメータの取得
+        operation = request_body.get('operation', 'generate')
+        
+        if operation == 'generate':
+            return handle_image_generation(request_body)
+        elif operation == 'variations':
+            return handle_image_variations(request_body)
+        else:
+            raise ValueError(f"Unsupported operation: {operation}")
+            
+    except Exception as e:
+        logger.error(f"Error in image generation handler: {str(e)}")
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'success': False,
+                'error': str(e)
+            })
+        }
+
+def handle_image_generation(request_body: Dict[str, Any]) -> Dict[str, Any]:
+    """画像生成リクエストの処理"""
+    try:
+        # パラメータの取得
+        prompt = request_body.get('prompt', '')
+        negative_prompt = request_body.get('negative_prompt', '')
+        style = request_body.get('style', 'photographic')
+        width = int(request_body.get('width', 1024))
+        height = int(request_body.get('height', 1024))
+        cfg_scale = float(request_body.get('cfg_scale', 7.0))
+        steps = int(request_body.get('steps', 30))
+        seed = request_body.get('seed')
+        model_id = request_body.get('model_id')
+        user_id = request_body.get('user_id', 'anonymous')
+        
+        # 入力検証
+        if not prompt.strip():
+            raise ValueError("Prompt is required")
+        
+        # 画像生成実行
+        generator = ImageGenerator()
+        result = generator.generate_image(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            style=style,
+            width=width,
+            height=height,
+            cfg_scale=cfg_scale,
+            steps=steps,
+            seed=seed,
+            model_id=model_id,
+            user_id=user_id
+        )
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'success': True,
+                'data': result
+            })
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in image generation: {str(e)}")
+        raise
+
+def handle_image_variations(request_body: Dict[str, Any]) -> Dict[str, Any]:
+    """画像バリエーション生成リクエストの処理"""
+    try:
+        # パラメータの取得
+        original_image_key = request_body.get('original_image_key', '')
+        variation_count = int(request_body.get('variation_count', 4))
+        variation_strength = float(request_body.get('variation_strength', 0.75))
+        user_id = request_body.get('user_id', 'anonymous')
+        
+        # 入力検証
+        if not original_image_key:
+            raise ValueError("Original image key is required")
+        
+        # バリエーション生成実行
+        variation_generator = ImageVariationGenerator()
+        variations = variation_generator.generate_variations(
+            original_image_key=original_image_key,
+            variation_count=variation_count,
+            variation_strength=variation_strength,
+            user_id=user_id
+        )
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'success': True,
+                'data': {
+                    'variations': variations,
+                    'original_image_key': original_image_key
+                }
+            })
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in variation generation: {str(e)}")
+        raise
+```
+
+#### 2.2 画像編集・変換サービス
+
+```python
+# lambda/image-editor/lambda_function.py
+import json
+import boto3
+import os
+import base64
+import uuid
+from typing import Dict, Any, Optional
+from datetime import datetime, timezone
+import logging
+from PIL import Image, ImageEnhance, ImageFilter
+import io
+
+# AWS Services
+bedrock_runtime = boto3.client('bedrock-runtime')
+s3_client = boto3.client('s3')
+dynamodb = boto3.resource('dynamodb')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Environment Variables
+IMAGES_BUCKET = os.environ.get('IMAGES_BUCKET')
+METADATA_TABLE = os.environ.get('METADATA_TABLE')
+
+class ImageEditor:
+    """
+    高度な画像編集・変換クラス
+    """
+    
+    def __init__(self):
+        self.editing_operations = {
+            'inpaint': self._inpaint_image,
+            'outpaint': self._outpaint_image,
+            'enhance': self._enhance_image,
+            'resize': self._resize_image,
+            'style_transfer': self._style_transfer,
+            'remove_background': self._remove_background
+        }
+    
+    def edit_image(
+        self,
+        image_key: str,
+        operation: str,
+        parameters: Dict[str, Any],
+        user_id: str = 'anonymous'
+    ) -> Dict[str, Any]:
+        """メイン画像編集機能"""
+        try:
+            if operation not in self.editing_operations:
+                raise ValueError(f"Unsupported operation: {operation}")
+            
+            # 元画像の取得
+            original_image = self._get_image_from_s3(image_key)
+            
+            # 編集操作の実行
+            editor_func = self.editing_operations[operation]
+            edited_result = editor_func(original_image, parameters)
+            
+            # 編集済み画像の保存
+            edited_key = self._save_edited_image(
+                edited_result['image_data'], 
+                operation, 
+                user_id
+            )
+            
+            # メタデータの保存
+            metadata = {
+                'edit_id': str(uuid.uuid4()),
+                'user_id': user_id,
+                'original_image_key': image_key,
+                'edited_image_key': edited_key,
+                'operation': operation,
+                'parameters': parameters,
+                'created_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            self._save_edit_metadata(metadata)
+            
+            result = {
+                'edit_id': metadata['edit_id'],
+                'edited_image_url': f"s3://{IMAGES_BUCKET}/{edited_key}",
+                'operation': operation,
+                'metadata': metadata
+            }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error editing image: {str(e)}")
+            raise
+    
+    def _inpaint_image(self, image_data: bytes, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """インペインティング（部分修復）"""
+        try:
+            prompt = parameters.get('prompt', 'fill the masked area naturally')
+            mask_data = base64.b64decode(parameters.get('mask', ''))
+            
+            # Stable Diffusionでのインペインティング
+            body = {
+                "taskType": "INPAINTING",
+                "inPaintingParams": {
+                    "text": prompt,
+                    "image": base64.b64encode(image_data).decode('utf-8'),
+                    "maskImage": base64.b64encode(mask_data).decode('utf-8')
+                },
+                "imageGenerationConfig": {
+                    "numberOfImages": 1,
+                    "quality": "premium",
+                    "cfgScale": 8.0
+                }
+            }
+            
+            response = bedrock_runtime.invoke_model(
+                modelId="amazon.titan-image-generator-v1",
+                body=json.dumps(body),
+                contentType='application/json'
+            )
+            
+            response_body = json.loads(response['body'].read())
+            edited_image_data = base64.b64decode(response_body['images'][0])
+            
+            return {
+                'image_data': edited_image_data,
+                'operation': 'inpaint'
+            }
+            
+        except Exception as e:
+            logger.error(f"Inpainting failed: {str(e)}")
+            raise
+    
+    def _outpaint_image(self, image_data: bytes, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """アウトペインティング（画像拡張）"""
+        try:
+            prompt = parameters.get('prompt', 'extend the image naturally')
+            direction = parameters.get('direction', 'all')  # up, down, left, right, all
+            
+            # 画像の拡張処理
+            pil_image = Image.open(io.BytesIO(image_data))
+            original_width, original_height = pil_image.size
+            
+            # 拡張サイズの計算
+            if direction == 'all':
+                new_width = int(original_width * 1.5)
+                new_height = int(original_height * 1.5)
+            else:
+                new_width = original_width * 2 if direction in ['left', 'right'] else original_width
+                new_height = original_height * 2 if direction in ['up', 'down'] else original_height
+            
+            # 新しいキャンバスの作成
+            new_image = Image.new('RGB', (new_width, new_height), color='white')
+            
+            # 元画像の配置
+            if direction == 'all':
+                paste_x = (new_width - original_width) // 2
+                paste_y = (new_height - original_height) // 2
+            elif direction == 'right':
+                paste_x, paste_y = 0, 0
+            elif direction == 'left':
+                paste_x, paste_y = new_width - original_width, 0
+            elif direction == 'down':
+                paste_x, paste_y = 0, 0
+            elif direction == 'up':
+                paste_x, paste_y = 0, new_height - original_height
+            else:
+                paste_x, paste_y = 0, 0
+            
+            new_image.paste(pil_image, (paste_x, paste_y))
+            
+            # マスクの作成（拡張部分）
+            mask = Image.new('L', (new_width, new_height), color=255)
+            mask_draw = Image.new('L', (original_width, original_height), color=0)
+            mask.paste(mask_draw, (paste_x, paste_y))
+            
+            # アウトペインティング実行
+            new_image_bytes = io.BytesIO()
+            new_image.save(new_image_bytes, format='PNG')
+            new_image_data = new_image_bytes.getvalue()
+            
+            mask_bytes = io.BytesIO()
+            mask.save(mask_bytes, format='PNG')
+            mask_data = mask_bytes.getvalue()
+            
+            # Bedrockでのアウトペインティング
+            return self._inpaint_image(new_image_data, {
+                'prompt': prompt,
+                'mask': base64.b64encode(mask_data).decode('utf-8')
+            })
+            
+        except Exception as e:
+            logger.error(f"Outpainting failed: {str(e)}")
+            raise
+    
+    def _enhance_image(self, image_data: bytes, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """画像品質向上"""
+        try:
+            pil_image = Image.open(io.BytesIO(image_data))
+            
+            # 強化パラメータ
+            brightness = parameters.get('brightness', 1.0)
+            contrast = parameters.get('contrast', 1.0)
+            saturation = parameters.get('saturation', 1.0)
+            sharpness = parameters.get('sharpness', 1.0)
+            
+            # 画像強化の適用
+            if brightness != 1.0:
+                enhancer = ImageEnhance.Brightness(pil_image)
+                pil_image = enhancer.enhance(brightness)
+            
+            if contrast != 1.0:
+                enhancer = ImageEnhance.Contrast(pil_image)
+                pil_image = enhancer.enhance(contrast)
+            
+            if saturation != 1.0:
+                enhancer = ImageEnhance.Color(pil_image)
+                pil_image = enhancer.enhance(saturation)
+            
+            if sharpness != 1.0:
+                enhancer = ImageEnhance.Sharpness(pil_image)
+                pil_image = enhancer.enhance(sharpness)
+            
+            # ノイズ除去フィルタ（オプション）
+            if parameters.get('denoise', False):
+                pil_image = pil_image.filter(ImageFilter.MedianFilter(size=3))
+            
+            # 結果の保存
+            output_bytes = io.BytesIO()
+            pil_image.save(output_bytes, format='PNG', quality=95)
+            enhanced_data = output_bytes.getvalue()
+            
+            return {
+                'image_data': enhanced_data,
+                'operation': 'enhance'
+            }
+            
+        except Exception as e:
+            logger.error(f"Enhancement failed: {str(e)}")
+            raise
+    
+    def _resize_image(self, image_data: bytes, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """画像リサイズ"""
+        try:
+            pil_image = Image.open(io.BytesIO(image_data))
+            
+            target_width = parameters.get('width')
+            target_height = parameters.get('height')
+            maintain_aspect = parameters.get('maintain_aspect', True)
+            
+            if not target_width and not target_height:
+                raise ValueError("Width or height must be specified")
+            
+            original_width, original_height = pil_image.size
+            
+            if maintain_aspect:
+                if target_width and not target_height:
+                    aspect_ratio = original_height / original_width
+                    target_height = int(target_width * aspect_ratio)
+                elif target_height and not target_width:
+                    aspect_ratio = original_width / original_height
+                    target_width = int(target_height * aspect_ratio)
+            
+            # リサイズ実行
+            resized_image = pil_image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            
+            # 結果の保存
+            output_bytes = io.BytesIO()
+            resized_image.save(output_bytes, format='PNG', quality=95)
+            resized_data = output_bytes.getvalue()
+            
+            return {
+                'image_data': resized_data,
+                'operation': 'resize'
+            }
+            
+        except Exception as e:
+            logger.error(f"Resize failed: {str(e)}")
+            raise
+    
+    def _style_transfer(self, image_data: bytes, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """スタイル転送"""
+        try:
+            style_prompt = parameters.get('style_prompt', 'artistic style')
+            strength = parameters.get('strength', 0.8)
+            
+            # Image-to-Imageでのスタイル転送
+            body = {
+                "taskType": "TEXT_IMAGE",
+                "textToImageParams": {
+                    "text": f"Transform this image to {style_prompt}",
+                    "initImage": base64.b64encode(image_data).decode('utf-8'),
+                    "initImageMode": "IMAGE_STRENGTH"
+                },
+                "imageGenerationConfig": {
+                    "numberOfImages": 1,
+                    "quality": "premium",
+                    "cfgScale": 8.0,
+                    "strength": strength
+                }
+            }
+            
+            response = bedrock_runtime.invoke_model(
+                modelId="amazon.titan-image-generator-v1",
+                body=json.dumps(body),
+                contentType='application/json'
+            )
+            
+            response_body = json.loads(response['body'].read())
+            styled_image_data = base64.b64decode(response_body['images'][0])
+            
+            return {
+                'image_data': styled_image_data,
+                'operation': 'style_transfer'
+            }
+            
+        except Exception as e:
+            logger.error(f"Style transfer failed: {str(e)}")
+            raise
+    
+    def _remove_background(self, image_data: bytes, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """背景除去"""
+        try:
+            # 背景除去のためのマスク生成プロンプト
+            mask_prompt = "background removal mask, white foreground, black background"
+            
+            # セグメンテーション用のプロンプト
+            body = {
+                "taskType": "INPAINTING",
+                "inPaintingParams": {
+                    "text": "transparent background",
+                    "image": base64.b64encode(image_data).decode('utf-8'),
+                    "maskPrompt": mask_prompt
+                },
+                "imageGenerationConfig": {
+                    "numberOfImages": 1,
+                    "quality": "premium"
+                }
+            }
+            
+            response = bedrock_runtime.invoke_model(
+                modelId="amazon.titan-image-generator-v1",
+                body=json.dumps(body),
+                contentType='application/json'
+            )
+            
+            response_body = json.loads(response['body'].read())
+            processed_image_data = base64.b64decode(response_body['images'][0])
+            
+            return {
+                'image_data': processed_image_data,
+                'operation': 'remove_background'
+            }
+            
+        except Exception as e:
+            logger.error(f"Background removal failed: {str(e)}")
+            raise
+    
+    def _get_image_from_s3(self, image_key: str) -> bytes:
+        """S3から画像を取得"""
+        try:
+            response = s3_client.get_object(Bucket=IMAGES_BUCKET, Key=image_key)
+            return response['Body'].read()
+        except Exception as e:
+            logger.error(f"Failed to get image from S3: {str(e)}")
+            raise
+    
+    def _save_edited_image(self, image_data: bytes, operation: str, user_id: str) -> str:
+        """編集済み画像をS3に保存"""
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            image_key = f"edited/{user_id}/{operation}/{timestamp}_{uuid.uuid4().hex[:8]}.png"
+            
+            s3_client.put_object(
+                Bucket=IMAGES_BUCKET,
+                Key=image_key,
+                Body=image_data,
+                ContentType='image/png',
+                Metadata={
+                    'user_id': user_id,
+                    'operation': operation,
+                    'edited_at': datetime.now(timezone.utc).isoformat()
+                }
+            )
+            
+            return image_key
+            
+        except Exception as e:
+            logger.error(f"Failed to save edited image: {str(e)}")
+            raise
+    
+    def _save_edit_metadata(self, metadata: Dict[str, Any]) -> None:
+        """編集メタデータをDynamoDBに保存"""
+        try:
+            table = dynamodb.Table(METADATA_TABLE)
+            
+            # TTLを設定
+            ttl_timestamp = int(datetime.now(timezone.utc).timestamp()) + (180 * 24 * 60 * 60)  # 6ヶ月
+            metadata['ttl'] = ttl_timestamp
+            
+            table.put_item(Item=metadata)
+            
+        except Exception as e:
+            logger.error(f"Failed to save edit metadata: {str(e)}")
+            raise
+
+def lambda_handler(event, context):
+    """メインのLambda ハンドラー関数"""
+    try:
+        # リクエストボディの解析
+        if 'body' in event:
+            request_body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+        else:
+            request_body = event
+        
+        # パラメータの取得
+        image_key = request_body.get('image_key', '')
+        operation = request_body.get('operation', '')
+        parameters = request_body.get('parameters', {})
+        user_id = request_body.get('user_id', 'anonymous')
+        
+        # 入力検証
+        if not image_key:
+            raise ValueError("Image key is required")
+        
+        if not operation:
+            raise ValueError("Operation is required")
+        
+        # 画像編集実行
+        editor = ImageEditor()
+        result = editor.edit_image(
+            image_key=image_key,
+            operation=operation,
+            parameters=parameters,
+            user_id=user_id
+        )
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'success': True,
+                'data': result
+            })
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in image editing: {str(e)}")
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'success': False,
+                'error': str(e)
+            })
+        }
+```
 
 ## ハンズオン手順
 

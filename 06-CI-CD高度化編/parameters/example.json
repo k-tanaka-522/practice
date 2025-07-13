@@ -1,0 +1,68 @@
+{
+  "ApplicationName": "my-web-app",
+  "Environment": "production",
+  "Region": "ap-northeast-1",
+  "Parameters": {
+    "GitHubRepo": "username/my-web-app",
+    "GitHubBranch": "main",
+    "NotificationEmail": "admin@example.com",
+    "AlertEmail": "alerts@example.com",
+    "MonthlyBudget": "500",
+    "SlackWebhookUrl": "",
+    "PagerDutyRoutingKey": ""
+  },
+  "Infrastructure": {
+    "VpcId": "vpc-12345678",
+    "PrivateSubnetIds": [
+      "subnet-12345678",
+      "subnet-87654321"
+    ],
+    "PublicSubnetIds": [
+      "subnet-abcdef12",
+      "subnet-fedcba21"
+    ],
+    "ContainerImage": "nginx:latest"
+  },
+  "Monitoring": {
+    "EnableXRay": true,
+    "EnableSynthetics": true,
+    "LogRetentionDays": 14,
+    "AlarmThresholds": {
+      "ErrorRate": 0.05,
+      "ResponseTime": 0.5,
+      "SuccessRate": 0.999
+    }
+  },
+  "BlueGreen": {
+    "TerminationWaitTime": 5,
+    "HealthCheckGracePeriod": 300,
+    "AutoRollback": true
+  },
+  "Testing": {
+    "EnableUnitTests": true,
+    "EnableIntegrationTests": true,
+    "EnableE2ETests": true,
+    "EnablePerformanceTests": true,
+    "TestTimeout": 300,
+    "CoverageThreshold": 80
+  },
+  "Security": {
+    "EnableVulnerabilityScanning": true,
+    "EnableCodeAnalysis": true,
+    "EnableContainerScanning": true,
+    "SecurityScanThreshold": "HIGH"
+  },
+  "CostOptimization": {
+    "EnableAutoScheduling": true,
+    "DevEnvironmentSchedule": {
+      "StartTime": "08:00",
+      "StopTime": "19:00",
+      "TimeZone": "Asia/Tokyo",
+      "WorkingDays": ["MON", "TUE", "WED", "THU", "FRI"]
+    },
+    "AlertThresholds": {
+      "BudgetPercentage": 80,
+      "ForecastPercentage": 100
+    }
+  }
+}

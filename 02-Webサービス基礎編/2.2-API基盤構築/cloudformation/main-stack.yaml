@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'API Gateway + Lambda REST API Foundation - Main Stack'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  CFBucket:
+    Type: String
+    Description: S3 bucket containing CloudFormation templates
+    
+  ProjectName:
+    Type: String
+    Default: api-foundation
+    Description: Project name for resource naming
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      LogLevel: DEBUG
+      RetentionDays: 7
+    staging:
+      LogLevel: INFO
+      RetentionDays: 14
+    prod:
+      LogLevel: WARN
+      RetentionDays: 30
+
+Resources:
+  # Lambda Functions Stack
+  LambdaStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/api-foundation/lambda-functions.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        LogLevel: !FindInMap [EnvironmentMap, !Ref Environment, LogLevel]
+        LogRetentionDays: !FindInMap [EnvironmentMap, !Ref Environment, RetentionDays]
+
+  # API Gateway Stack
+  ApiGatewayStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: LambdaStack
+    Properties:
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/api-foundation/api-gateway.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        HelloFunctionArn: !GetAtt LambdaStack.Outputs.HelloFunctionArn
+        DataFunctionArn: !GetAtt LambdaStack.Outputs.DataFunctionArn
+
+Outputs:
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !GetAtt ApiGatewayStack.Outputs.ApiUrl
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-url'
+      
+  HelloFunctionName:
+    Description: Hello Lambda function name
+    Value: !GetAtt LambdaStack.Outputs.HelloFunctionName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-hello-function'
+      
+  DataFunctionName:
+    Description: Data Lambda function name
+    Value: !GetAtt LambdaStack.Outputs.DataFunctionName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-data-function'
+
+  StackName:
+    Description: Current stack name
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-stack-name'

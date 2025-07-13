@@ -1,16 +1,20 @@
-# CI-CD高度化編
+# 06-CI-CD高度化編
 
-## 概要
+## 🚀 モジュール概要
 
-このセクションでは、本格的なDevOpsパイプラインと運用監視システムを構築します。マルチステージデプロイメント、テスト自動化、包括的な監視、コスト最適化まで、エンタープライズレベルのCI/CDプラクティスを学習します。
+**学習時間**: 10時間 | **レベル**: 中級〜上級 | **前提モジュール**: 02-03完了
 
-## 学習目標
+このモジュールでは、モジュール02-03で構築したWebアプリケーションに対して、エンタープライズレベルのCI/CDパイプラインと運用監視システムを実装します。実践的なDevOpsスキルを身につけ、本番環境での継続的デリバリーを実現します。
 
-- 🚀 **マルチステージパイプライン**: 開発・ステージング・本番環境の自動デプロイ
-- 🧪 **テスト自動化**: 単体・統合・E2Eテストの完全自動化
-- 📊 **APM実装**: アプリケーションパフォーマンス監視
-- 💰 **コスト最適化**: リソース使用量監視と自動最適化
-- 🛡️ **セキュリティ統合**: SAST/DAST、脆弱性スキャン
+## 🎯 学習目標
+
+### 主要スキル習得
+- 🚀 **マルチステージパイプライン**: 開発・ステージング・本番環境の完全自動化
+- 🧪 **包括的テスト自動化**: 単体・統合・E2E・セキュリティテストの統合
+- 📊 **高度な監視とAPM**: 分散トレーシング、カスタムメトリクス、予防的アラート
+- 🔄 **高度なデプロイ戦略**: Blue/Green、カナリア、フィーチャーフラグ
+- 💰 **コスト最適化**: 自動スケーリング、リソース最適化、予算管理
+- 🛡️ **セキュリティ統合**: SAST/DAST、脆弱性スキャン、コンプライアンス
 
 ## アーキテクチャ概要
 
@@ -60,23 +64,47 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 学習パス
+## 📚 学習パス
 
-### 6.1 自動化パイプライン
-- **6.1.1** マルチステージビルド
-- **6.1.2** テスト自動化
+### 6.1 自動化パイプライン（4時間）
+- **6.1.1** [マルチステージビルド](6.1-自動化パイプライン/6.1.1-マルチステージビルド/README.md)
+  - CodePipeline/GitHub Actions統合
+  - マルチ環境デプロイメント
+  - 承認ワークフロー
+- **6.1.2** [テスト自動化](6.1-自動化パイプライン/6.1.2-テスト自動化/README.md)
+  - テストピラミッド実装
+  - 品質ゲート設定
+  - テストレポート統合
 
-### 6.2 モニタリングと最適化
-- **6.2.1** APM実装
-- **6.2.2** コスト最適化
+### 6.2 高度なデプロイ戦略（3時間）
+- **6.2.1** [Blue/Greenデプロイメント](6.2-高度なデプロイ戦略/6.2.1-BlueGreenデプロイ/README.md)
+  - ECS/EC2でのBlue/Green実装
+  - トラフィック切り替え戦略
+  - 自動ロールバック
+- **6.2.2** [カナリアリリース](6.2-高度なデプロイ戦略/6.2.2-カナリアリリース/README.md)
+  - Lambda@Edgeでのカナリア
+  - 段階的ロールアウト
+  - メトリクスベース判定
 
-### 6.3 エンタープライズ機能（拡張）
-- **6.3.1** セキュリティ統合
-- **6.3.2** 災害復旧と可用性
+### 6.3 モニタリングと最適化（3時間）
+- **6.3.1** [APM実装](6.3-モニタリングと最適化/6.3.1-APM実装/README.md)
+  - X-Ray分散トレーシング
+  - カスタムダッシュボード
+  - SLO/SLI設定
+- **6.3.2** [コスト最適化](6.3-モニタリングと最適化/6.3.2-コスト最適化/README.md)
+  - 自動リソース管理
+  - 予算アラート
+  - 使用量分析
 
-## クイックスタート
+## 🏗️ 前提条件
 
-### 前提条件
+### 必須要件
+- ✅ **モジュール02-03完了**: Webアプリケーションが構築済み
+- ✅ **AWSアカウント**: CodePipeline、CodeBuild等のアクセス権限
+- ✅ **GitHubアカウント**: リポジトリとActions使用権限
+- ✅ **開発環境**: Docker、Node.js、Python3インストール済み
+
+### 環境確認
 
 ```bash
 # AWS CLI確認
@@ -87,167 +115,465 @@ aws sts get-caller-identity
 docker --version
 
 # Node.js確認（テスト用）
-node --version
+node --version  # v16以上推奨
 npm --version
+
+# Python確認（スクリプト用）
+python3 --version  # 3.8以上推奨
 
 # GitHub CLI確認（リポジトリ連携用）
 gh --version
+gh auth status
 ```
 
-### 全体デプロイ
+## 🚀 クイックスタート
+
+### Step 1: 基盤セットアップ
 
 ```bash
-# CI/CD基盤の一括デプロイ
-./scripts/deploy-all-infrastructure.sh deploy-cicd
+# モジュール02-03のアプリケーションスタック確認
+aws cloudformation describe-stacks \
+  --stack-name web-app-stack \
+  --query 'Stacks[0].Outputs'
 
-# 段階的デプロイ
-./scripts/deploy-cicd.sh deploy-pipeline
-./scripts/deploy-cicd.sh deploy-monitoring
-./scripts/deploy-cicd.sh deploy-optimization
+# CI/CD用のパラメータ設定
+cp parameters/example.json parameters/my-config.json
+# parameters/my-config.jsonを編集して環境に合わせる
 ```
 
-## 学習コンテンツ詳細
+### Step 2: CI/CDパイプライン構築
+
+```bash
+# GitHub連携設定
+gh repo create my-web-app --public
+gh secret set AWS_ACCOUNT_ID --body "$(aws sts get-caller-identity --query Account --output text)"
+gh secret set AWS_REGION --body "ap-northeast-1"
+
+# CI/CD基盤の一括デプロイ
+./scripts/deploy-cicd.sh --config parameters/my-config.json deploy-all
+
+# 個別デプロイ（オプション）
+./scripts/deploy-cicd.sh deploy-pipeline    # パイプライン構築
+./scripts/deploy-cicd.sh deploy-testing     # テスト自動化
+./scripts/deploy-cicd.sh deploy-monitoring  # 監視設定
+./scripts/deploy-cicd.sh deploy-optimization # 最適化設定
+```
+
+### Step 3: 動作確認
+
+```bash
+# パイプライン状態確認
+./scripts/check-pipeline-status.sh
+
+# テスト実行
+npm run test:all
+
+# 監視ダッシュボード確認
+aws cloudformation describe-stacks \
+  --stack-name cicd-monitoring-stack \
+  --query 'Stacks[0].Outputs[?OutputKey==`DashboardURL`].OutputValue' \
+  --output text
+```
+
+## 📋 学習コンテンツ詳細
 
 ### 🚀 6.1.1 マルチステージビルド
 
 **学習内容:**
 - CI/CDパイプライン設計パターン
 - マルチステージデプロイメント戦略
-- ブランチ戦略とリリース管理
-- カナリアデプロイメント
+- ブランチ戦略とGitFlow実装
+- 環境別設定管理
 
 **実装内容:**
-- CodePipeline マルチステージ構成
-- CodeBuild プロジェクト設定
-- CloudFormation デプロイ自動化
-- 承認ワークフロー実装
+- CodePipeline/GitHub Actions統合
+- マルチ環境自動デプロイ
+- 承認ワークフローとゲート
+- アーティファクト管理
+
+**ハンズオン演習:**
+1. モジュール02のWebアプリにCI/CD追加
+2. dev→staging→prodの3環境構築
+3. 手動承認ゲートの実装
+4. 自動ロールバック設定
 
 **主要技術:**
-- AWS CodePipeline
+- AWS CodePipeline / GitHub Actions
 - AWS CodeBuild
 - AWS CodeDeploy
-- AWS CloudFormation
+- AWS Systems Manager
 
 ### 🧪 6.1.2 テスト自動化
 
 **学習内容:**
-- テスト戦略とピラミッド
-- 単体テスト自動化
-- 統合テスト実装
-- E2Eテスト設計
+- テストピラミッド戦略
+- 継続的品質管理
+- セキュリティテスト統合
+- パフォーマンステスト
 
 **実装内容:**
-- Jest/Mocha 単体テスト
-- API統合テスト
-- Selenium E2Eテスト
-- テストレポート生成
+- モジュール03のCRUD APIテスト
+- 認証フローのE2Eテスト
+- 負荷テストとベンチマーク
+- コードカバレッジ分析
+
+**ハンズオン演習:**
+1. CRUD操作の単体テスト作成
+2. API統合テストスイート構築
+3. Cypressでのユーザーフローテスト
+4. JMeterでの負荷テスト実装
 
 **主要技術:**
-- Jest/Mocha
-- Selenium WebDriver
-- TestCafe/Cypress
-- SonarQube
+- Jest / Vitest
+- Cypress / Playwright
+- Apache JMeter / K6
+- SonarQube / CodeGuru
 
-### 📊 6.2.1 APM実装
+### 🔄 6.2.1 Blue/Greenデプロイメント
 
 **学習内容:**
-- アプリケーション監視戦略
-- 分散トレーシング
-- カスタムメトリクス設計
-- アラート設定
+- Blue/Green戦略の理解
+- ゼロダウンタイムデプロイ
+- トラフィック切り替え手法
+- ロールバック戦略
 
 **実装内容:**
-- AWS X-Ray 分散トレーシング
-- CloudWatch カスタムダッシュボード
-- Application Insights 設定
-- パフォーマンスアラート
+- ECS Blue/Greenデプロイ
+- ALBターゲットグループ切り替え
+- Route 53重み付けルーティング
+- 自動化されたヘルスチェック
+
+**ハンズオン演習:**
+1. モジュール02アプリのBlue/Green化
+2. 自動切り替えスクリプト作成
+3. ロールバックシナリオ実践
+4. A/Bテスト実装
+
+**主要技術:**
+- AWS CodeDeploy
+- Amazon ECS / EC2
+- Application Load Balancer
+- Route 53
+
+### 🚦 6.2.2 カナリアリリース
+
+**学習内容:**
+- カナリアデプロイメント戦略
+- 段階的ロールアウト
+- メトリクスベース判定
+- フィーチャーフラグ
+
+**実装内容:**
+- Lambda加重エイリアス
+- API Gatewayカナリア設定
+- CloudFront段階的配信
+- 自動ロールバック条件
+
+**ハンズオン演習:**
+1. 10%→50%→100%の段階リリース
+2. エラー率ベースの自動判定
+3. フィーチャートグル実装
+4. A/Bテストメトリクス収集
+
+**主要技術:**
+- AWS Lambda Aliases
+- API Gateway Stages
+- CloudWatch Alarms
+- AWS AppConfig
+
+### 📊 6.3.1 APM実装
+
+**学習内容:**
+- 分散トレーシング戦略
+- SLO/SLI定義と監視
+- カスタムメトリクス設計
+- インシデント対応自動化
+
+**実装内容:**
+- X-Ray完全統合
+- ビジネスメトリクス追跡
+- 異常検知アラート
+- 自動修復アクション
+
+**ハンズオン演習:**
+1. エンドツーエンドトレース実装
+2. SLOダッシュボード作成
+3. 予防的アラート設定
+4. PagerDuty/Slack統合
 
 **主要技術:**
 - AWS X-Ray
-- AWS CloudWatch
-- Application Insights
-- AWS SNS
+- CloudWatch Synthetics
+- CloudWatch Anomaly Detector
+- AWS Systems Manager
 
-### 💰 6.2.2 コスト最適化
+### 💰 6.3.2 コスト最適化
 
 **学習内容:**
-- コスト監視戦略
-- リソース使用量分析
-- 自動スケーリング設定
-- 予算管理
+- コスト可視化戦略
+- リソース使用最適化
+- 予算管理と予測
+- FinOpsプラクティス
 
 **実装内容:**
-- AWS Cost Explorer 連携
-- 予算アラート設定
-- 自動リソース停止
-- コスト配分タグ
+- タグベースコスト配分
+- 自動スケーリング最適化
+- スポットインスタンス活用
+- 未使用リソース自動削除
+
+**ハンズオン演習:**
+1. コスト配分ダッシュボード構築
+2. 開発環境の自動停止設定
+3. リザーブドインスタンス分析
+4. 月次コストレポート自動化
 
 **主要技術:**
 - AWS Cost Explorer
 - AWS Budgets
-- AWS Lambda
-- AWS EventBridge
+- AWS Compute Optimizer
+- AWS Trusted Advisor
 
 ## 🏗️ 実装手順
 
-### Step 1: マルチステージパイプライン構築
+### Step 1: GitHub Actions パイプライン構築
 
 ```bash
-# GitHub リポジトリ設定
-gh repo create my-cicd-project --public
-gh repo clone my-cicd-project
-cd my-cicd-project
+# モジュール02-03のアプリケーションリポジトリに移動
+cd ../02-Web三層アーキテクチャ編/my-web-app
+
+# GitHub Actions ワークフロー作成
+mkdir -p .github/workflows
+cp ../../06-CI-CD高度化編/templates/github-actions/* .github/workflows/
+
+# シークレット設定
+gh secret set AWS_ACCOUNT_ID --body "$(aws sts get-caller-identity --query Account --output text)"
+gh secret set AWS_REGION --body "ap-northeast-1"
+gh secret set ECR_REPOSITORY --body "my-web-app"
+
+# プッシュしてワークフロー起動
+git add .
+git commit -m "Add CI/CD pipeline"
+git push origin main
+```
+
+### Step 2: CodePipeline マルチステージ構築
+
+```bash
+# パラメータファイル準備
+cat > parameters.json << EOF
+[
+  {"ParameterKey": "ApplicationName", "ParameterValue": "my-web-app"},
+  {"ParameterKey": "GitHubRepo", "ParameterValue": "${GITHUB_USER}/my-web-app"},
+  {"ParameterKey": "GitHubToken", "ParameterValue": "${GITHUB_TOKEN}"}
+]
+EOF
 
 # パイプライン作成
 aws cloudformation create-stack \
-  --stack-name my-cicd-pipeline \
+  --stack-name my-web-app-pipeline \
   --template-body file://06-CI-CD高度化編/6.1-自動化パイプライン/6.1.1-マルチステージビルド/cloudformation/codepipeline-multistage.yaml \
-  --parameters ParameterKey=GitHubRepo,ParameterValue=username/my-cicd-project \
-               ParameterKey=GitHubToken,ParameterValue=your_github_token \
+  --parameters file://parameters.json \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+### Step 3: テスト自動化実装
+
+```bash
+# テストプロジェクトセットアップ
+cd tests
+npm init -y
+npm install --save-dev jest @types/jest supertest cypress
+
+# テスト構造作成
+mkdir -p unit integration e2e performance security
+
+# テストスクリプト設定
+cat > package.json << EOF
+{
+  "scripts": {
+    "test:unit": "jest unit --coverage",
+    "test:integration": "jest integration",
+    "test:e2e": "cypress run",
+    "test:performance": "k6 run performance/load-test.js",
+    "test:security": "npm audit && snyk test",
+    "test:all": "npm run test:unit && npm run test:integration && npm run test:e2e"
+  }
+}
+EOF
+
+# CI/CDパイプラインにテスト統合
+aws cloudformation update-stack \
+  --stack-name test-automation-stack \
+  --template-body file://06-CI-CD高度化編/6.1-自動化パイプライン/6.1.2-テスト自動化/cloudformation/test-automation.yaml \
   --capabilities CAPABILITY_IAM
 ```
 
-### Step 2: テスト自動化設定
+### Step 4: Blue/Greenデプロイメント設定
 
 ```bash
-# テストインフラ構築
+# ECS Blue/Greenデプロイ設定
 aws cloudformation create-stack \
-  --stack-name test-automation \
-  --template-body file://06-CI-CD高度化編/6.1-自動化パイプライン/6.1.2-テスト自動化/cloudformation/test-infrastructure.yaml \
-  --capabilities CAPABILITY_IAM
+  --stack-name blue-green-deployment \
+  --template-body file://06-CI-CD高度化編/6.2-高度なデプロイ戦略/6.2.1-BlueGreenデプロイ/cloudformation/blue-green-ecs.yaml \
+  --parameters ParameterKey=ApplicationName,ParameterValue=my-web-app \
+  --capabilities CAPABILITY_NAMED_IAM
 
-# テストスイート実行
-npm install
-npm run test:unit
-npm run test:integration
-npm run test:e2e
+# デプロイメントテスト
+./scripts/test-blue-green-deployment.sh
 ```
 
-### Step 3: 監視システム構築
+### Step 5: 包括的監視システム構築
 
 ```bash
-# APM監視設定
+# X-Ray統合
 aws cloudformation create-stack \
   --stack-name apm-monitoring \
-  --template-body file://06-CI-CD高度化編/6.2-モニタリングと最適化/6.2.1-APM実装/cloudformation/x-ray-monitoring.yaml \
-  --parameters ParameterKey=AlertEmail,ParameterValue=your-email@example.com \
+  --template-body file://06-CI-CD高度化編/6.3-モニタリングと最適化/6.3.1-APM実装/cloudformation/x-ray-monitoring.yaml \
+  --parameters ParameterKey=ApplicationName,ParameterValue=my-web-app \
+               ParameterKey=AlertEmail,ParameterValue=your-email@example.com \
   --capabilities CAPABILITY_IAM
+
+# カスタムダッシュボード作成
+./scripts/create-custom-dashboard.sh --app-name my-web-app
 ```
 
-### Step 4: コスト最適化実装
+### Step 6: コスト最適化とFinOps実装
 
 ```bash
-# コスト監視設定
+# コスト最適化スタック作成
 aws cloudformation create-stack \
   --stack-name cost-optimization \
-  --template-body file://06-CI-CD高度化編/6.2-モニタリングと最適化/6.2.2-コスト最適化/cloudformation/cost-budgets.yaml \
-  --parameters ParameterKey=MonthlyBudget,ParameterValue=1000 \
+  --template-body file://06-CI-CD高度化編/6.3-モニタリングと最適化/6.3.2-コスト最適化/cloudformation/cost-optimization.yaml \
+  --parameters ParameterKey=MonthlyBudget,ParameterValue=500 \
+               ParameterKey=Environment,ParameterValue=production \
   --capabilities CAPABILITY_IAM
+
+# 自動スケジューラー設定
+./scripts/setup-resource-scheduler.sh --env dev --stop-time "19:00" --start-time "08:00"
 ```
 
-## 📋 buildspec.yml 例
+## 📋 実装例とテンプレート
 
-### マルチステージビルド用
+### GitHub Actions ワークフロー例
+
+```yaml
+# .github/workflows/ci-cd-pipeline.yml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: my-web-app
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run tests
+        run: |
+          npm run test:unit -- --coverage
+          npm run test:integration
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+  
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+  
+  build-and-push:
+    needs: [test, security-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Build and push image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+  
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Deploy to staging
+        run: |
+          aws ecs update-service \
+            --cluster staging-cluster \
+            --service my-web-app \
+            --force-new-deployment
+  
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Deploy to production
+        run: |
+          aws deploy create-deployment \
+            --application-name my-web-app \
+            --deployment-group-name production \
+            --deployment-config-name CodeDeployDefault.ECSBlueGreen
+```
+
+### CodeBuild buildspec.yml 例
 
 ```yaml
 version: 0.2
@@ -305,9 +631,9 @@ reports:
     base-directory: .
 ```
 
-## 🧪 テスト戦略
+## 🧪 テスト戦略とベストプラクティス
 
-### テストピラミッド実装
+### 包括的テストピラミッド
 
 ```javascript
 // 単体テスト例 (Jest)
@@ -399,9 +725,9 @@ describe('User Registration Flow', () => {
 });
 ```
 
-## 📊 監視とアラート
+## 📊 高度な監視とオブザーバビリティ
 
-### カスタムメトリクス実装
+### 分散トレーシングとカスタムメトリクス
 
 ```python
 # Lambda関数でのカスタムメトリクス
@@ -511,9 +837,9 @@ LowUserActivityAlarm:
       - !Ref SNSTopic
 ```
 
-## 💰 コスト最適化戦略
+## 💰 FinOpsとコスト最適化
 
-### 自動リソース管理
+### 自動化されたコスト管理
 
 ```python
 # Lambda関数による自動リソース停止
@@ -642,9 +968,9 @@ def send_cost_alert(current_cost, budget, breakdown):
     )
 ```
 
-## 🛠️ デプロイメント戦略
+## 🛠️ 高度なデプロイメント戦略
 
-### ブルーグリーンデプロイメント
+### Blue/Greenデプロイメント実装
 
 ```yaml
 # CodeDeploy設定
@@ -686,52 +1012,105 @@ LambdaAlias:
           FunctionWeight: 0.1  # 10%のトラフィックを新バージョンに
 ```
 
-## 📚 参考資料
+## 🔗 モジュール間の統合
 
-### AWS ドキュメント
-- [AWS DevOps Best Practices](https://aws.amazon.com/devops/)
-- [CI/CD Pipeline on AWS](https://aws.amazon.com/getting-started/hands-on/set-up-ci-cd-pipeline/)
-- [AWS Well-Architected Framework - DevOps](https://docs.aws.amazon.com/wellarchitected/latest/operational-excellence-pillar/)
+### モジュール02-03との連携
+- Webアプリケーションの自動デプロイ
+- CRUD APIのテスト自動化
+- 認証システムのセキュリティテスト
+- ファイルアップロード機能の負荷テスト
 
-### DevOps プラクティス
-- [The DevOps Handbook](https://itrevolution.com/book/the-devops-handbook/)
-- [Continuous Delivery](https://continuousdelivery.com/)
-- [Site Reliability Engineering](https://sre.google/)
+### モジュール08への準備
+- 運用監視基盤の確立
+- インシデント対応プロセス
+- SRE実践の基礎
+- オブザーバビリティ文化
+
+## 📚 参考資料とリソース
+
+### 必読ドキュメント
+- 📖 [AWS DevOps ホワイトペーパー](https://aws.amazon.com/devops/)
+- 🔧 [GitHub Actions ベストプラクティス](https://docs.github.com/actions)
+- 📊 [SRE ワークブック](https://sre.google/workbook/table-of-contents/)
+- 💡 [FinOps Foundation](https://www.finops.org/)
+
+### 推奨書籍
+- 「The DevOps Handbook」- Gene Kim他
+- 「Accelerate」- Nicole Forsgren他
+- 「Site Reliability Engineering」- Google
+- 「Cloud FinOps」- J.R. Storment他
+
+### コミュニティとサポート
+- AWS DevOps Blog
+- GitHub Community
+- CNCF Slack
+- FinOps Slack
 
 ## 📈 次のステップ
 
-完了後は以下に進んでください：
+### このモジュール完了後
 
-1. **[Claude Code & Bedrock編](../07-Claude-Code-Bedrock-AI駆動開発編/README.md)** - AI駆動開発
-2. **実際のプロダクト適用** - 学習した技術の実運用
-3. **高度な最適化** - 独自要件に応じたカスタマイズ
+1. **🤖 [07-Claude Code & Bedrock AI駆動開発編](../07-Claude-Code-Bedrock-AI駆動開発編/README.md)**
+   - AI活用開発プロセス
+   - 自動コード生成とレビュー
+   - インテリジェントな運用
+
+2. **🔧 08-運用とSRE編（次期リリース）**
+   - プロダクション運用
+   - SREプラクティス
+   - 大規模システム管理
+
+3. **🎯 実プロジェクトへの適用**
+   - 学習内容の実装
+   - カスタマイズと最適化
+   - チーム展開
 
 ---
 
-## 🎯 学習チェックリスト
+## 🎯 スキルチェックリスト
 
-### パイプライン構築
-- [ ] マルチステージパイプライン設計
-- [ ] 自動ビルド・テスト・デプロイ
-- [ ] 承認ワークフロー実装
-- [ ] 障害時ロールバック対応
+### 基礎スキル（必須）
+- [ ] GitHub Actions/CodePipelineでのCI/CD構築
+- [ ] マルチ環境へのデプロイメント管理
+- [ ] 基本的なテスト自動化（単体・統合）
+- [ ] CloudWatchでの基本監視
 
-### テスト自動化
-- [ ] 単体テスト実装
-- [ ] 統合テスト設定
-- [ ] E2Eテスト自動化
-- [ ] セキュリティテスト統合
+### 中級スキル（推奨）
+- [ ] Blue/Greenデプロイメント実装
+- [ ] E2Eテストとパフォーマンステスト
+- [ ] X-Rayでの分散トレーシング
+- [ ] コスト可視化とアラート
 
-### 監視・運用
-- [ ] APM実装
-- [ ] カスタムメトリクス設定
-- [ ] アラート設定
-- [ ] ダッシュボード作成
+### 上級スキル（発展）
+- [ ] カナリアリリースと段階的ロールアウト
+- [ ] セキュリティテストの完全統合
+- [ ] SLO/SLIベースの監視
+- [ ] FinOps実践とコスト最適化
 
-### 最適化
-- [ ] コスト監視設定
-- [ ] 自動リソース管理
-- [ ] パフォーマンス最適化
-- [ ] セキュリティ強化
+### プロジェクト成果物
+- [ ] 完全自動化されたCI/CDパイプライン
+- [ ] 包括的なテストスイート
+- [ ] プロダクション級の監視システム
+- [ ] コスト最適化の仕組み
 
-**準備ができたら次のセクションへ進みましょう！**
+## 🏁 モジュール完了基準
+
+以下をすべて達成したら、このモジュールは完了です：
+
+1. ✅ モジュール02-03のアプリケーションにCI/CD実装
+2. ✅ 3つの環境（dev/staging/prod）への自動デプロイ
+3. ✅ テストカバレッジ80%以上達成
+4. ✅ Blue/Greenまたはカナリアデプロイ実装
+5. ✅ 包括的な監視ダッシュボード構築
+6. ✅ コスト削減20%以上の実現
+
+---
+
+<div align="center">
+
+**🚀 DevOpsマスターへの道のり - 実践あるのみ！ 🚀**
+
+[![Next Module](https://img.shields.io/badge/Next-07--AI駆動開発編-blue?style=for-the-badge)](../07-Claude-Code-Bedrock-AI駆動開発編/README.md)
+[![Previous Module](https://img.shields.io/badge/Previous-05--AI--ML統合編-orange?style=for-the-badge)](../05-AI-ML統合編/README.md)
+
+</div>

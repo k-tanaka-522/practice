@@ -1,0 +1,453 @@
+# CI/CD Pipeline for Web Application
+# This workflow integrates with the infrastructure built in modules 02-03
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: my-web-app
+  APPLICATION_NAME: my-web-app
+
+jobs:
+  # Code Quality and Security Checks
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Shallow clones should be disabled for better analysis
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Prettier check
+        run: npm run format:check
+
+      - name: TypeScript check
+        run: npm run type-check
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # Security Scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+  # Unit and Integration Tests
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm run test:unit -- --coverage
+        env:
+          CI: true
+
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-umbrella
+
+      - name: Store test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results
+          path: |
+            coverage/
+            test-results.xml
+
+  # Build and Push Docker Image
+  build-and-push:
+    needs: [code-quality, security-scan, test]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image-uri: ${{ steps.build-image.outputs.image }}
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build Docker image
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          
+          # Push images
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Output image URI for next jobs
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image }}
+          format: 'sarif'
+          output: 'docker-trivy-results.sarif'
+
+      - name: Upload Docker scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'docker-trivy-results.sarif'
+
+  # Deploy to Development Environment
+  deploy-dev:
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    environment: development
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Development ECS
+        run: |
+          # Update ECS service with new image
+          aws ecs update-service \
+            --cluster ${{ env.APPLICATION_NAME }}-dev-cluster \
+            --service ${{ env.APPLICATION_NAME }}-dev-service \
+            --force-new-deployment
+
+      - name: Wait for deployment to complete
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.APPLICATION_NAME }}-dev-cluster \
+            --services ${{ env.APPLICATION_NAME }}-dev-service
+
+      - name: Run smoke tests
+        run: |
+          # Wait for service to be healthy
+          sleep 60
+          
+          # Get ALB URL
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.APPLICATION_NAME }}-dev-infrastructure \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          
+          # Run basic smoke tests
+          curl -f $ALB_URL/health || exit 1
+          curl -f $ALB_URL/api/status || exit 1
+
+  # End-to-End Tests
+  e2e-tests:
+    needs: [deploy-dev]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install E2E dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get development environment URL
+        id: get-url
+        run: |
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.APPLICATION_NAME }}-dev-infrastructure \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          echo "app-url=$ALB_URL" >> $GITHUB_OUTPUT
+
+      - name: Run E2E tests
+        run: npm run test:e2e
+        env:
+          BASE_URL: ${{ steps.get-url.outputs.app-url }}
+
+      - name: Upload E2E test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: e2e-results
+          path: |
+            test-results/
+            playwright-report/
+
+  # Performance Tests
+  performance-tests:
+    needs: [deploy-dev]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get development environment URL
+        id: get-url
+        run: |
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.APPLICATION_NAME }}-dev-infrastructure \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          echo "app-url=$ALB_URL" >> $GITHUB_OUTPUT
+
+      - name: Run K6 performance tests
+        uses: grafana/k6-action@v0.3.1
+        with:
+          filename: tests/performance/load-test.js
+        env:
+          BASE_URL: ${{ steps.get-url.outputs.app-url }}
+
+  # Deploy to Staging
+  deploy-staging:
+    needs: [e2e-tests, performance-tests]
+    runs-on: ubuntu-latest
+    environment: staging
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Staging using Blue/Green
+        run: |
+          # Create CodeDeploy deployment
+          aws deploy create-deployment \
+            --application-name ${{ env.APPLICATION_NAME }}-codedeploy \
+            --deployment-group-name staging \
+            --deployment-config-name CodeDeployDefault.ECSAllAtOnceBlueGreen \
+            --description "GitHub Actions deployment - ${{ github.sha }}"
+
+      - name: Monitor staging deployment
+        run: |
+          # Wait and monitor deployment
+          sleep 300  # 5 minutes
+          
+          # Get staging URL and run health checks
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.APPLICATION_NAME }}-staging-infrastructure \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          
+          curl -f $ALB_URL/health || exit 1
+
+  # Production Deployment (Manual Approval Required)
+  deploy-production:
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Production using Blue/Green
+        run: |
+          # Create CodeDeploy deployment
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name ${{ env.APPLICATION_NAME }}-codedeploy \
+            --deployment-group-name production \
+            --deployment-config-name CodeDeployDefault.ECSAllAtOnceBlueGreen \
+            --description "GitHub Actions production deployment - ${{ github.sha }}" \
+            --query 'deploymentId' \
+            --output text)
+          
+          echo "Deployment ID: $DEPLOYMENT_ID"
+
+      - name: Monitor production deployment
+        run: |
+          # Extended monitoring for production
+          sleep 600  # 10 minutes
+          
+          # Verify deployment success
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.APPLICATION_NAME }}-prod-infrastructure \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          
+          # Comprehensive health checks
+          curl -f $ALB_URL/health || exit 1
+          curl -f $ALB_URL/api/status || exit 1
+
+      - name: Send deployment notification
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: '🚀 Production deployment successful! Version: ${{ github.sha }}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Send failure notification
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: '❌ Production deployment failed! Please check the logs.'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Post-deployment monitoring
+  post-deployment-check:
+    needs: [deploy-production]
+    runs-on: ubuntu-latest
+    if: success() && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create CloudWatch annotation
+        run: |
+          # Create deployment annotation in CloudWatch
+          aws logs put-log-events \
+            --log-group-name "/aws/cicd/deployments" \
+            --log-stream-name "production-deployments" \
+            --log-events timestamp=$(date +%s000),message="Deployment completed: ${{ github.sha }}"
+
+      - name: Update deployment metrics
+        run: |
+          # Send custom metrics to CloudWatch
+          aws cloudwatch put-metric-data \
+            --namespace "CICD/Deployments" \
+            --metric-data MetricName=DeploymentSuccess,Value=1,Unit=Count,Dimensions=Environment=production,Application=${{ env.APPLICATION_NAME }}

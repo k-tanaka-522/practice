@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DynamoDB Database Foundation - Main Stack'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  CFBucket:
+    Type: String
+    Description: S3 bucket containing CloudFormation templates
+    
+  ProjectName:
+    Type: String
+    Default: database-basics
+    Description: Project name for resource naming
+    
+  AuthStackName:
+    Type: String
+    Default: auth-system
+    Description: Name of the authentication stack
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      LogLevel: DEBUG
+      RetentionDays: 7
+      BillingMode: PAY_PER_REQUEST
+    staging:
+      LogLevel: INFO
+      RetentionDays: 14
+      BillingMode: PAY_PER_REQUEST
+    prod:
+      LogLevel: WARN
+      RetentionDays: 30
+      BillingMode: PROVISIONED
+
+Resources:
+  # DynamoDB Tables Stack
+  DynamoDBStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/database-basics/dynamodb-tables.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        BillingMode: !FindInMap [EnvironmentMap, !Ref Environment, BillingMode]
+
+  # CRUD Lambda Functions Stack
+  CrudLambdaStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: DynamoDBStack
+    Properties:
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/database-basics/lambda-crud.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        LogLevel: !FindInMap [EnvironmentMap, !Ref Environment, LogLevel]
+        LogRetentionDays: !FindInMap [EnvironmentMap, !Ref Environment, RetentionDays]
+        UsersTableName: !GetAtt DynamoDBStack.Outputs.UsersTableName
+        ItemsTableName: !GetAtt DynamoDBStack.Outputs.ItemsTableName
+        AuthStackName: !Ref AuthStackName
+
+Outputs:
+  UsersTableName:
+    Description: Users DynamoDB table name
+    Value: !GetAtt DynamoDBStack.Outputs.UsersTableName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-users-table'
+      
+  ItemsTableName:
+    Description: Items DynamoDB table name
+    Value: !GetAtt DynamoDBStack.Outputs.ItemsTableName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-items-table'
+      
+  UsersTableArn:
+    Description: Users DynamoDB table ARN
+    Value: !GetAtt DynamoDBStack.Outputs.UsersTableArn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-users-table-arn'
+      
+  ItemsTableArn:
+    Description: Items DynamoDB table ARN
+    Value: !GetAtt DynamoDBStack.Outputs.ItemsTableArn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-items-table-arn'
+
+  CreateItemFunctionName:
+    Description: Create Item Lambda function name
+    Value: !GetAtt CrudLambdaStack.Outputs.CreateItemFunctionName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-create-item-function'
+      
+  ListItemsFunctionName:
+    Description: List Items Lambda function name
+    Value: !GetAtt CrudLambdaStack.Outputs.ListItemsFunctionName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-list-items-function'
+      
+  UpdateItemFunctionName:
+    Description: Update Item Lambda function name
+    Value: !GetAtt CrudLambdaStack.Outputs.UpdateItemFunctionName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-update-item-function'
+      
+  DeleteItemFunctionName:
+    Description: Delete Item Lambda function name
+    Value: !GetAtt CrudLambdaStack.Outputs.DeleteItemFunctionName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-delete-item-function'
+
+  StackName:
+    Description: Current stack name
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-stack-name'

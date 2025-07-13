@@ -1625,3 +1625,1057 @@ df_salted = df.withColumn("salt", F.rand() * 100).cast("int"))
 2. **リアルタイムETL**: ストリーミング処理統合
 3. **機械学習パイプライン**: 特徴量エンジニアリング
 4. **データリネージ追跡**: データ系譜管理システム
+
+## 🏗️ エンタープライズ級ETL実装パターン
+
+### データファクトリーパターン
+企業レベルでの複雑なデータ変換要件に対応する設計パターンです。
+
+```python
+# src/advanced/data_factory.py
+import boto3
+import pandas as pd
+from typing import Dict, List, Any, Optional, Callable
+from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
+import logging
+from datetime import datetime
+import json
+
+@dataclass
+class ETLJobConfig:
+    """ETLジョブ設定"""
+    job_name: str
+    source_config: Dict[str, Any]
+    target_config: Dict[str, Any]
+    transformation_rules: List[Dict[str, Any]]
+    quality_checks: List[Dict[str, Any]] = field(default_factory=list)
+    schedule: Optional[str] = None
+    dependencies: List[str] = field(default_factory=list)
+    retry_config: Dict[str, Any] = field(default_factory=lambda: {"max_retries": 3, "backoff_factor": 2})
+
+class DataTransformer(ABC):
+    """抽象データ変換クラス"""
+    
+    @abstractmethod
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        pass
+    
+    @abstractmethod
+    def validate(self, df: pd.DataFrame) -> bool:
+        pass
+
+class CustomerDataTransformer(DataTransformer):
+    """顧客データ変換"""
+    
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """顧客データの標準化と拡張"""
+        
+        # 電話番号正規化
+        df['phone_normalized'] = df['phone'].str.replace(r'[^\d]', '', regex=True)
+        
+        # メールドメイン抽出
+        df['email_domain'] = df['email'].str.extract(r'@(.+)$')
+        
+        # 年齢グループ計算
+        current_year = datetime.now().year
+        df['birth_year'] = pd.to_datetime(df['birth_date']).dt.year
+        df['age'] = current_year - df['birth_year']
+        df['age_group'] = pd.cut(df['age'], 
+                                bins=[0, 18, 30, 50, 65, 100],
+                                labels=['under_18', '18_30', '30_50', '50_65', 'over_65'])
+        
+        # 顧客セグメント計算
+        df['customer_segment'] = self._calculate_customer_segment(df)
+        
+        # データクリーニング
+        df = df.dropna(subset=['customer_id', 'email'])
+        df = df.drop_duplicates(subset=['customer_id'])
+        
+        return df
+    
+    def _calculate_customer_segment(self, df: pd.DataFrame) -> pd.Series:
+        """顧客セグメントの計算"""
+        conditions = [
+            (df['total_purchases'] >= 10) & (df['avg_order_value'] >= 100),
+            (df['total_purchases'] >= 5) & (df['avg_order_value'] >= 50),
+            (df['total_purchases'] >= 1)
+        ]
+        choices = ['premium', 'standard', 'basic']
+        return pd.Series(pd.np.select(conditions, choices, default='new'))
+    
+    def validate(self, df: pd.DataFrame) -> bool:
+        """データ品質検証"""
+        checks = [
+            df['customer_id'].notna().all(),
+            df['email'].str.contains('@').all(),
+            df['phone_normalized'].str.len().between(10, 15).all(),
+            df['age'].between(0, 120).all()
+        ]
+        return all(checks)
+
+class SalesDataTransformer(DataTransformer):
+    """売上データ変換"""
+    
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """売上データの集約と分析"""
+        
+        # 日付フィールド正規化
+        df['order_date'] = pd.to_datetime(df['order_date'])
+        df['year'] = df['order_date'].dt.year
+        df['month'] = df['order_date'].dt.month
+        df['quarter'] = df['order_date'].dt.quarter
+        df['day_of_week'] = df['order_date'].dt.day_name()
+        
+        # 売上メトリクス計算
+        df['total_amount'] = df['quantity'] * df['unit_price']
+        df['discount_amount'] = df['total_amount'] * df['discount_rate']
+        df['net_amount'] = df['total_amount'] - df['discount_amount']
+        
+        # 商品カテゴリ階層分析
+        df['main_category'] = df['product_category'].str.split(' > ').str[0]
+        df['sub_category'] = df['product_category'].str.split(' > ').str[1]
+        
+        # 季節性分析
+        df['season'] = df['month'].map({
+            12: 'winter', 1: 'winter', 2: 'winter',
+            3: 'spring', 4: 'spring', 5: 'spring',
+            6: 'summer', 7: 'summer', 8: 'summer',
+            9: 'autumn', 10: 'autumn', 11: 'autumn'
+        })
+        
+        # 地域分析
+        df['region'] = self._map_region(df['postal_code'])
+        
+        return df
+    
+    def _map_region(self, postal_codes: pd.Series) -> pd.Series:
+        """郵便番号から地域マッピング"""
+        # 日本の郵便番号パターンに基づく地域分類
+        region_map = {
+            '0': '北海道・東北', '1': '関東', '2': '関東',
+            '3': '中部', '4': '関西', '5': '中国・四国',
+            '6': '九州・沖縄', '7': '関東', '8': '中部', '9': '九州・沖縄'
+        }
+        return postal_codes.astype(str).str[0].map(region_map).fillna('不明')
+    
+    def validate(self, df: pd.DataFrame) -> bool:
+        """売上データ検証"""
+        checks = [
+            df['quantity'].gt(0).all(),
+            df['unit_price'].ge(0).all(),
+            df['discount_rate'].between(0, 1).all(),
+            df['order_date'].notna().all()
+        ]
+        return all(checks)
+
+class EnterpriseETLPipeline:
+    """エンタープライズETLパイプライン"""
+    
+    def __init__(self, config: ETLJobConfig):
+        self.config = config
+        self.glue = boto3.client('glue')
+        self.s3 = boto3.client('s3')
+        self.stepfunctions = boto3.client('stepfunctions')
+        self.logger = logging.getLogger(__name__)
+        
+        # トランスフォーマー登録
+        self.transformers = {
+            'customer': CustomerDataTransformer(),
+            'sales': SalesDataTransformer(),
+        }
+    
+    def execute_pipeline(self) -> Dict[str, Any]:
+        """パイプライン実行のメインエントリポイント"""
+        execution_id = f"{self.config.job_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        try:
+            # 実行前検証
+            self._validate_configuration()
+            
+            # データ抽出
+            raw_data = self._extract_data()
+            
+            # データ変換
+            transformed_data = self._transform_data(raw_data)
+            
+            # 品質チェック
+            quality_results = self._perform_quality_checks(transformed_data)
+            
+            # データロード
+            load_results = self._load_data(transformed_data)
+            
+            # メタデータ更新
+            self._update_metadata(transformed_data)
+            
+            # 実行結果
+            execution_results = {
+                'execution_id': execution_id,
+                'status': 'SUCCESS',
+                'records_processed': len(transformed_data),
+                'quality_score': quality_results['overall_score'],
+                'load_results': load_results,
+                'execution_time': datetime.now().isoformat()
+            }
+            
+            self.logger.info(f"Pipeline execution completed: {execution_results}")
+            return execution_results
+            
+        except Exception as e:
+            error_results = {
+                'execution_id': execution_id,
+                'status': 'FAILED',
+                'error': str(e),
+                'execution_time': datetime.now().isoformat()
+            }
+            self.logger.error(f"Pipeline execution failed: {error_results}")
+            raise
+    
+    def _extract_data(self) -> pd.DataFrame:
+        """データ抽出"""
+        source_type = self.config.source_config['type']
+        
+        if source_type == 's3':
+            return self._extract_from_s3()
+        elif source_type == 'rds':
+            return self._extract_from_rds()
+        elif source_type == 'api':
+            return self._extract_from_api()
+        else:
+            raise ValueError(f"Unsupported source type: {source_type}")
+    
+    def _extract_from_s3(self) -> pd.DataFrame:
+        """S3からのデータ抽出"""
+        bucket = self.config.source_config['bucket']
+        prefix = self.config.source_config['prefix']
+        
+        # S3オブジェクト一覧取得
+        objects = self.s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        
+        dataframes = []
+        for obj in objects.get('Contents', []):
+            if obj['Key'].endswith('.csv'):
+                df = pd.read_csv(f"s3://{bucket}/{obj['Key']}")
+                dataframes.append(df)
+            elif obj['Key'].endswith('.parquet'):
+                df = pd.read_parquet(f"s3://{bucket}/{obj['Key']}")
+                dataframes.append(df)
+        
+        return pd.concat(dataframes, ignore_index=True) if dataframes else pd.DataFrame()
+    
+    def _transform_data(self, raw_data: pd.DataFrame) -> pd.DataFrame:
+        """データ変換の実行"""
+        data = raw_data.copy()
+        
+        # 設定されたトランスフォーマーを順次適用
+        for rule in self.config.transformation_rules:
+            transformer_name = rule['transformer']
+            transformer = self.transformers.get(transformer_name)
+            
+            if transformer:
+                if transformer.validate(data):
+                    data = transformer.transform(data)
+                else:
+                    raise ValueError(f"Data validation failed for transformer: {transformer_name}")
+        
+        return data
+    
+    def _perform_quality_checks(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """データ品質チェック"""
+        quality_results = {
+            'checks': [],
+            'overall_score': 0.0
+        }
+        
+        total_score = 0
+        for check in self.config.quality_checks:
+            check_name = check['name']
+            check_type = check['type']
+            threshold = check.get('threshold', 0.95)
+            
+            if check_type == 'completeness':
+                score = self._check_completeness(data, check['columns'])
+            elif check_type == 'uniqueness':
+                score = self._check_uniqueness(data, check['columns'])
+            elif check_type == 'range':
+                score = self._check_range(data, check['column'], check['min'], check['max'])
+            else:
+                score = 1.0
+            
+            passed = score >= threshold
+            quality_results['checks'].append({
+                'name': check_name,
+                'type': check_type,
+                'score': score,
+                'threshold': threshold,
+                'passed': passed
+            })
+            
+            total_score += score
+        
+        quality_results['overall_score'] = total_score / len(self.config.quality_checks) if self.config.quality_checks else 1.0
+        return quality_results
+
+# 高度なGlueジョブスクリプト
+def advanced_glue_job_script():
+    """高度なGlueジョブスクリプトテンプレート"""
+    return """
+import sys
+import boto3
+import pandas as pd
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+from datetime import datetime, timedelta
+import logging
+
+# ログ設定
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+class AdvancedGlueJob:
+    \"\"\"高度なGlueジョブクラス\"\"\"
+    
+    def __init__(self):
+        self.args = getResolvedOptions(sys.argv, [
+            'JOB_NAME', 'raw_bucket', 'processed_bucket', 'curated_bucket',
+            'database_name', 'table_name', 'partition_date'
+        ])
+        
+        self.sc = SparkContext()
+        self.glueContext = GlueContext(self.sc)
+        self.spark = self.glueContext.spark_session
+        self.job = Job(self.glueContext)
+        self.job.init(self.args['JOB_NAME'], self.args)
+    
+    def run(self):
+        \"\"\"メイン実行関数\"\"\"
+        try:
+            logger.info(f"Starting job: {self.args['JOB_NAME']}")
+            
+            # データ読み込み
+            raw_df = self.read_raw_data()
+            
+            # データ品質チェック
+            if not self.validate_data_quality(raw_df):
+                raise Exception("Data quality validation failed")
+            
+            # データ変換
+            transformed_df = self.transform_data(raw_df)
+            
+            # 重複除去
+            deduped_df = self.deduplicate_data(transformed_df)
+            
+            # パーティション処理
+            partitioned_df = self.add_partitions(deduped_df)
+            
+            # データ書き込み
+            self.write_processed_data(partitioned_df)
+            
+            # 集約データ作成
+            aggregated_df = self.create_aggregations(partitioned_df)
+            self.write_curated_data(aggregated_df)
+            
+            # メタデータ更新
+            self.update_catalog()
+            
+            logger.info("Job completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Job failed: {str(e)}")
+            raise
+        finally:
+            self.job.commit()
+    
+    def read_raw_data(self):
+        \"\"\"生データ読み込み\"\"\"
+        input_path = f"s3://{self.args['raw_bucket']}/data/{self.args['partition_date']}"
+        
+        # スキーマ定義
+        schema = StructType([
+            StructField("transaction_id", StringType(), True),
+            StructField("customer_id", StringType(), True),
+            StructField("product_id", StringType(), True),
+            StructField("quantity", IntegerType(), True),
+            StructField("unit_price", DoubleType(), True),
+            StructField("transaction_date", TimestampType(), True),
+            StructField("store_id", StringType(), True)
+        ])
+        
+        df = self.spark.read.schema(schema).option("header", "true").csv(input_path)
+        logger.info(f"Read {df.count()} records from {input_path}")
+        
+        return df
+    
+    def validate_data_quality(self, df):
+        \"\"\"データ品質検証\"\"\"
+        total_records = df.count()
+        
+        # NULL値チェック
+        null_checks = {
+            'transaction_id': df.filter(F.col('transaction_id').isNull()).count(),
+            'customer_id': df.filter(F.col('customer_id').isNull()).count(),
+            'quantity': df.filter(F.col('quantity').isNull()).count(),
+            'unit_price': df.filter(F.col('unit_price').isNull()).count()
+        }
+        
+        # 品質メトリクス計算
+        quality_metrics = {}
+        for field, null_count in null_checks.items():
+            completeness = 1 - (null_count / total_records)
+            quality_metrics[f"{field}_completeness"] = completeness
+            
+            if completeness < 0.95:  # 95%未満は品質不良
+                logger.error(f"Data quality check failed for {field}: {completeness:.2%}")
+                return False
+        
+        # 範囲チェック
+        invalid_quantity = df.filter(F.col('quantity') <= 0).count()
+        invalid_price = df.filter(F.col('unit_price') < 0).count()
+        
+        if invalid_quantity > 0 or invalid_price > 0:
+            logger.error(f"Invalid data found: quantity={invalid_quantity}, price={invalid_price}")
+            return False
+        
+        logger.info(f"Data quality validation passed: {quality_metrics}")
+        return True
+    
+    def transform_data(self, df):
+        \"\"\"データ変換\"\"\"
+        # 計算フィールド追加
+        transformed_df = df.withColumn("total_amount", F.col("quantity") * F.col("unit_price")) \\
+                          .withColumn("transaction_year", F.year("transaction_date")) \\
+                          .withColumn("transaction_month", F.month("transaction_date")) \\
+                          .withColumn("transaction_day", F.dayofmonth("transaction_date")) \\
+                          .withColumn("day_of_week", F.dayofweek("transaction_date")) \\
+                          .withColumn("hour", F.hour("transaction_date"))
+        
+        # 顧客セグメント計算
+        customer_metrics = transformed_df.groupBy("customer_id") \\
+                                       .agg(F.sum("total_amount").alias("total_spent"),
+                                           F.count("transaction_id").alias("transaction_count"))
+        
+        segmentation_conditions = [
+            F.when((F.col("total_spent") >= 1000) & (F.col("transaction_count") >= 10), "premium")
+             .when((F.col("total_spent") >= 500) & (F.col("transaction_count") >= 5), "gold")
+             .when(F.col("total_spent") >= 100, "silver")
+             .otherwise("bronze")
+        ]
+        
+        customer_segments = customer_metrics.withColumn("customer_segment", segmentation_conditions[0])
+        
+        # メインデータに顧客セグメント結合
+        final_df = transformed_df.join(customer_segments.select("customer_id", "customer_segment"), 
+                                     "customer_id", "left")
+        
+        return final_df
+    
+    def write_processed_data(self, df):
+        \"\"\"処理済みデータ書き込み\"\"\"
+        output_path = f"s3://{self.args['processed_bucket']}/transactions/"
+        
+        df.write.mode("overwrite") \\
+          .partitionBy("transaction_year", "transaction_month", "transaction_day") \\
+          .parquet(output_path)
+        
+        logger.info(f"Wrote processed data to {output_path}")
+
+if __name__ == "__main__":
+    job = AdvancedGlueJob()
+    job.run()
+"""
+
+# 使用例
+def example_usage():
+    """使用例"""
+    config = ETLJobConfig(
+        job_name="customer_sales_etl",
+        source_config={
+            "type": "s3",
+            "bucket": "raw-data-bucket",
+            "prefix": "customer_data/"
+        },
+        target_config={
+            "type": "s3",
+            "bucket": "curated-data-bucket",
+            "prefix": "customer_analytics/"
+        },
+        transformation_rules=[
+            {"transformer": "customer"},
+            {"transformer": "sales"}
+        ],
+        quality_checks=[
+            {"name": "customer_completeness", "type": "completeness", "columns": ["customer_id", "email"], "threshold": 0.95},
+            {"name": "customer_uniqueness", "type": "uniqueness", "columns": ["customer_id"], "threshold": 0.99}
+        ]
+    )
+    
+    pipeline = EnterpriseETLPipeline(config)
+    results = pipeline.execute_pipeline()
+    print(f"Pipeline execution results: {results}")
+```
+
+### 📊 データ系譜管理システム
+データの流れと変換履歴を追跡するシステムです。
+
+```python
+# src/advanced/data_lineage.py
+import boto3
+import networkx as nx
+import matplotlib.pyplot as plt
+from typing import Dict, List, Set, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+import json
+
+@dataclass
+class DataAsset:
+    """データアセット定義"""
+    asset_id: str
+    asset_type: str  # table, file, api, etc.
+    location: str
+    schema: Dict[str, str]
+    owner: str
+    created_at: datetime
+    last_modified: datetime
+
+@dataclass
+class DataTransformation:
+    """データ変換定義"""
+    transformation_id: str
+    source_assets: List[str]
+    target_assets: List[str]
+    transformation_type: str  # etl_job, glue_job, lambda, etc.
+    code_location: str
+    executed_at: datetime
+    execution_context: Dict[str, str]
+
+class DataLineageTracker:
+    """データ系譜追跡システム"""
+    
+    def __init__(self):
+        self.graph = nx.DiGraph()
+        self.assets = {}
+        self.transformations = {}
+        self.glue = boto3.client('glue')
+        self.s3 = boto3.client('s3')
+    
+    def register_asset(self, asset: DataAsset):
+        """データアセット登録"""
+        self.assets[asset.asset_id] = asset
+        self.graph.add_node(asset.asset_id, **asset.__dict__)
+    
+    def register_transformation(self, transformation: DataTransformation):
+        """変換処理登録"""
+        self.transformations[transformation.transformation_id] = transformation
+        
+        # グラフにエッジ追加
+        for source in transformation.source_assets:
+            for target in transformation.target_assets:
+                self.graph.add_edge(
+                    source, target,
+                    transformation_id=transformation.transformation_id,
+                    **transformation.__dict__
+                )
+    
+    def trace_lineage_upstream(self, asset_id: str, max_depth: int = 10) -> Set[str]:
+        """上流系譜追跡"""
+        upstream_assets = set()
+        
+        def _traverse_upstream(current_asset, depth):
+            if depth > max_depth:
+                return
+            
+            predecessors = list(self.graph.predecessors(current_asset))
+            for pred in predecessors:
+                upstream_assets.add(pred)
+                _traverse_upstream(pred, depth + 1)
+        
+        _traverse_upstream(asset_id, 0)
+        return upstream_assets
+    
+    def trace_lineage_downstream(self, asset_id: str, max_depth: int = 10) -> Set[str]:
+        """下流系譜追跡"""
+        downstream_assets = set()
+        
+        def _traverse_downstream(current_asset, depth):
+            if depth > max_depth:
+                return
+            
+            successors = list(self.graph.successors(current_asset))
+            for succ in successors:
+                downstream_assets.add(succ)
+                _traverse_downstream(succ, depth + 1)
+        
+        _traverse_downstream(asset_id, 0)
+        return downstream_assets
+    
+    def find_impact_analysis(self, asset_id: str) -> Dict[str, List[str]]:
+        """影響分析"""
+        downstream = self.trace_lineage_downstream(asset_id)
+        
+        # 影響を受けるアセットを種類別に分類
+        impact_by_type = {}
+        for asset in downstream:
+            asset_info = self.assets.get(asset)
+            if asset_info:
+                asset_type = asset_info.asset_type
+                if asset_type not in impact_by_type:
+                    impact_by_type[asset_type] = []
+                impact_by_type[asset_type].append(asset)
+        
+        return impact_by_type
+    
+    def visualize_lineage(self, asset_id: str, output_path: str):
+        """系譜可視化"""
+        # 関連するアセットを抽出
+        upstream = self.trace_lineage_upstream(asset_id)
+        downstream = self.trace_lineage_downstream(asset_id)
+        related_assets = upstream.union(downstream).union({asset_id})
+        
+        # サブグラフ作成
+        subgraph = self.graph.subgraph(related_assets)
+        
+        # レイアウト計算
+        pos = nx.spring_layout(subgraph, k=3, iterations=50)
+        
+        # 描画
+        plt.figure(figsize=(15, 10))
+        
+        # ノード描画（種類別に色分け）
+        node_colors = {
+            'table': 'lightblue',
+            'file': 'lightgreen',
+            'api': 'lightyellow',
+            'view': 'lightcoral'
+        }
+        
+        for asset in related_assets:
+            asset_info = self.assets.get(asset, {})
+            color = node_colors.get(asset_info.asset_type if hasattr(asset_info, 'asset_type') else 'unknown', 'lightgray')
+            nx.draw_networkx_nodes(subgraph, pos, nodelist=[asset], node_color=color, node_size=1000)
+        
+        # エッジ描画
+        nx.draw_networkx_edges(subgraph, pos, edge_color='gray', arrows=True, arrowsize=20)
+        
+        # ラベル描画
+        nx.draw_networkx_labels(subgraph, pos, font_size=8)
+        
+        # 中心ノード強調
+        nx.draw_networkx_nodes(subgraph, pos, nodelist=[asset_id], node_color='red', node_size=1500)
+        
+        plt.title(f"Data Lineage for {asset_id}")
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    
+    def generate_lineage_report(self, asset_id: str) -> Dict[str, Any]:
+        """系譜レポート生成"""
+        upstream = self.trace_lineage_upstream(asset_id)
+        downstream = self.trace_lineage_downstream(asset_id)
+        impact_analysis = self.find_impact_analysis(asset_id)
+        
+        # 変換パス分析
+        transformation_paths = []
+        for source in upstream:
+            if self.graph.has_edge(source, asset_id):
+                edge_data = self.graph.get_edge_data(source, asset_id)
+                transformation_paths.append({
+                    'source': source,
+                    'target': asset_id,
+                    'transformation': edge_data.get('transformation_id'),
+                    'executed_at': edge_data.get('executed_at')
+                })
+        
+        report = {
+            'asset_id': asset_id,
+            'asset_info': self.assets.get(asset_id).__dict__ if asset_id in self.assets else {},
+            'upstream_count': len(upstream),
+            'downstream_count': len(downstream),
+            'upstream_assets': list(upstream),
+            'downstream_assets': list(downstream),
+            'impact_analysis': impact_analysis,
+            'transformation_paths': transformation_paths,
+            'generated_at': datetime.now().isoformat()
+        }
+        
+        return report
+
+# 使用例
+def setup_sample_lineage():
+    """サンプル系譜設定"""
+    tracker = DataLineageTracker()
+    
+    # データアセット登録
+    assets = [
+        DataAsset("raw_customers", "table", "s3://raw/customers/", {"id": "string", "name": "string"}, "data-team", datetime.now(), datetime.now()),
+        DataAsset("raw_orders", "table", "s3://raw/orders/", {"order_id": "string", "customer_id": "string"}, "data-team", datetime.now(), datetime.now()),
+        DataAsset("clean_customers", "table", "s3://processed/customers/", {"id": "string", "name": "string", "segment": "string"}, "data-team", datetime.now(), datetime.now()),
+        DataAsset("customer_analytics", "view", "redshift://analytics/customer_summary", {"customer_id": "string", "total_orders": "int"}, "analytics-team", datetime.now(), datetime.now())
+    ]
+    
+    for asset in assets:
+        tracker.register_asset(asset)
+    
+    # 変換処理登録
+    transformations = [
+        DataTransformation("customer_etl", ["raw_customers"], ["clean_customers"], "glue_job", "s3://scripts/customer_etl.py", datetime.now(), {"job_run_id": "jr_123"}),
+        DataTransformation("analytics_view", ["clean_customers", "raw_orders"], ["customer_analytics"], "sql_view", "redshift://views/customer_analytics.sql", datetime.now(), {"view_version": "v1"})
+    ]
+    
+    for transformation in transformations:
+        tracker.register_transformation(transformation)
+    
+    return tracker
+```
+
+### 🔄 リアルタイムETLパターン
+ストリーミングデータとバッチデータを統合したハイブリッドETLです。
+
+```python
+# src/advanced/realtime_etl.py
+import boto3
+import json
+import pandas as pd
+from typing import Dict, List, Any
+from datetime import datetime, timedelta
+import asyncio
+import logging
+
+class RealtimeETLProcessor:
+    """リアルタイムETLプロセッサー"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.kinesis = boto3.client('kinesis')
+        self.s3 = boto3.client('s3')
+        self.glue = boto3.client('glue')
+        self.dynamodb = boto3.resource('dynamodb')
+        self.logger = logging.getLogger(__name__)
+        
+        # 状態管理テーブル
+        self.state_table = self.dynamodb.Table(config['state_table_name'])
+    
+    async def process_stream_batch(self, records: List[Dict]) -> Dict[str, Any]:
+        """ストリームバッチ処理"""
+        start_time = datetime.now()
+        
+        # レコード前処理
+        processed_records = []
+        for record in records:
+            try:
+                processed_record = await self._preprocess_record(record)
+                if processed_record:
+                    processed_records.append(processed_record)
+            except Exception as e:
+                self.logger.error(f"Record preprocessing failed: {e}")
+        
+        # バッチサイズチェック
+        if len(processed_records) < self.config.get('min_batch_size', 1):
+            return {'status': 'skipped', 'reason': 'insufficient_records'}
+        
+        # リアルタイム変換
+        transformed_records = await self._transform_records(processed_records)
+        
+        # 状態更新
+        await self._update_processing_state(transformed_records)
+        
+        # マイクロバッチロード
+        load_result = await self._load_microbatch(transformed_records)
+        
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        return {
+            'status': 'success',
+            'records_processed': len(processed_records),
+            'records_transformed': len(transformed_records),
+            'processing_time_seconds': processing_time,
+            'load_result': load_result
+        }
+    
+    async def _preprocess_record(self, record: Dict) -> Dict:
+        """レコード前処理"""
+        # データ検証
+        if not self._validate_record_schema(record):
+            return None
+        
+        # エンリッチメント
+        enriched_record = await self._enrich_record(record)
+        
+        # 重複チェック
+        if await self._is_duplicate(enriched_record):
+            return None
+        
+        return enriched_record
+    
+    def _validate_record_schema(self, record: Dict) -> bool:
+        """レコードスキーマ検証"""
+        required_fields = self.config.get('required_fields', [])
+        return all(field in record for field in required_fields)
+    
+    async def _enrich_record(self, record: Dict) -> Dict:
+        """レコードエンリッチメント"""
+        enriched = record.copy()
+        
+        # タイムスタンプ正規化
+        if 'timestamp' in record:
+            enriched['processed_timestamp'] = datetime.now().isoformat()
+        
+        # 地理的エンリッチメント
+        if 'ip_address' in record:
+            geo_info = await self._lookup_geo_info(record['ip_address'])
+            enriched.update(geo_info)
+        
+        # 顧客データエンリッチメント
+        if 'customer_id' in record:
+            customer_info = await self._lookup_customer_info(record['customer_id'])
+            enriched.update(customer_info)
+        
+        return enriched
+    
+    async def _lookup_geo_info(self, ip_address: str) -> Dict:
+        """IP地理情報検索"""
+        # 実装例: 外部APIまたはローカルDBからGeoIPデータ取得
+        # ここではモックデータを返す
+        return {
+            'country': 'JP',
+            'region': 'Tokyo',
+            'city': 'Tokyo'
+        }
+    
+    async def _lookup_customer_info(self, customer_id: str) -> Dict:
+        """顧客情報検索"""
+        try:
+            # DynamoDBから顧客情報取得
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.state_table.get_item(Key={'customer_id': customer_id})
+            )
+            
+            if 'Item' in response:
+                return {
+                    'customer_segment': response['Item'].get('segment', 'unknown'),
+                    'customer_tier': response['Item'].get('tier', 'standard')
+                }
+        except Exception as e:
+            self.logger.warning(f"Customer lookup failed: {e}")
+        
+        return {'customer_segment': 'unknown', 'customer_tier': 'standard'}
+    
+    async def _is_duplicate(self, record: Dict) -> bool:
+        """重複チェック"""
+        # 実装例: レコードの一意キーを使用して重複チェック
+        unique_key = f"{record.get('event_id', '')}_{record.get('timestamp', '')}"
+        
+        try:
+            response = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.state_table.get_item(Key={'record_key': unique_key})
+            )
+            return 'Item' in response
+        except:
+            return False
+
+# Lambda関数実装例
+def realtime_etl_lambda_handler(event, context):
+    """リアルタイムETL Lambda関数"""
+    
+    config = {
+        'state_table_name': 'etl-processing-state',
+        'required_fields': ['event_id', 'timestamp', 'user_id'],
+        'min_batch_size': 10,
+        'output_bucket': 'realtime-processed-data'
+    }
+    
+    processor = RealtimeETLProcessor(config)
+    
+    # Kinesisレコード処理
+    records = []
+    for record in event['Records']:
+        try:
+            data = json.loads(base64.b64decode(record['kinesis']['data']))
+            records.append(data)
+        except Exception as e:
+            print(f"Error decoding record: {e}")
+    
+    # 非同期処理実行
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        result = loop.run_until_complete(processor.process_stream_batch(records))
+        return {
+            'statusCode': 200,
+            'body': json.dumps(result)
+        }
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+    finally:
+        loop.close()
+```
+
+### 🧪 ETL自動テストフレームワーク
+
+```python
+# src/testing/etl_test_framework.py
+import pytest
+import pandas as pd
+import boto3
+from moto import mock_s3, mock_glue
+from typing import Dict, List, Any
+import tempfile
+import os
+
+class ETLTestFramework:
+    """ETL自動テストフレームワーク"""
+    
+    def __init__(self):
+        self.test_data_path = tempfile.mkdtemp()
+    
+    def create_test_data(self, schema: Dict[str, str], num_records: int = 100) -> pd.DataFrame:
+        """テストデータ生成"""
+        import random
+        from faker import Faker
+        
+        fake = Faker('ja_JP')
+        data = {}
+        
+        for column, data_type in schema.items():
+            if data_type == 'string':
+                data[column] = [fake.name() for _ in range(num_records)]
+            elif data_type == 'int':
+                data[column] = [random.randint(1, 1000) for _ in range(num_records)]
+            elif data_type == 'float':
+                data[column] = [random.uniform(0, 1000) for _ in range(num_records)]
+            elif data_type == 'datetime':
+                data[column] = [fake.date_time_this_year() for _ in range(num_records)]
+            elif data_type == 'email':
+                data[column] = [fake.email() for _ in range(num_records)]
+        
+        return pd.DataFrame(data)
+    
+    def assert_data_quality(self, df: pd.DataFrame, quality_rules: List[Dict]) -> bool:
+        """データ品質アサーション"""
+        for rule in quality_rules:
+            rule_type = rule['type']
+            
+            if rule_type == 'not_null':
+                columns = rule['columns']
+                for col in columns:
+                    null_count = df[col].isnull().sum()
+                    assert null_count == 0, f"Column {col} has {null_count} null values"
+            
+            elif rule_type == 'unique':
+                columns = rule['columns']
+                for col in columns:
+                    duplicate_count = df.duplicated(subset=[col]).sum()
+                    assert duplicate_count == 0, f"Column {col} has {duplicate_count} duplicate values"
+            
+            elif rule_type == 'range':
+                col = rule['column']
+                min_val = rule['min']
+                max_val = rule['max']
+                out_of_range = df[(df[col] < min_val) | (df[col] > max_val)].shape[0]
+                assert out_of_range == 0, f"Column {col} has {out_of_range} values out of range [{min_val}, {max_val}]"
+        
+        return True
+    
+    def compare_schemas(self, expected_schema: Dict, actual_df: pd.DataFrame) -> bool:
+        """スキーマ比較"""
+        actual_columns = set(actual_df.columns)
+        expected_columns = set(expected_schema.keys())
+        
+        missing_columns = expected_columns - actual_columns
+        extra_columns = actual_columns - expected_columns
+        
+        assert len(missing_columns) == 0, f"Missing columns: {missing_columns}"
+        assert len(extra_columns) == 0, f"Extra columns: {extra_columns}"
+        
+        return True
+
+# テスト実装例
+class TestCustomerETL:
+    """顧客ETLテスト"""
+    
+    def setup_method(self):
+        self.test_framework = ETLTestFramework()
+    
+    def test_customer_data_transformation(self):
+        """顧客データ変換テスト"""
+        # テストデータ作成
+        schema = {
+            'customer_id': 'string',
+            'name': 'string',
+            'email': 'email',
+            'birth_date': 'datetime',
+            'phone': 'string'
+        }
+        
+        test_data = self.test_framework.create_test_data(schema, 50)
+        
+        # ETL変換実行
+        transformer = CustomerDataTransformer()
+        result_data = transformer.transform(test_data)
+        
+        # 品質チェック
+        quality_rules = [
+            {'type': 'not_null', 'columns': ['customer_id', 'email']},
+            {'type': 'unique', 'columns': ['customer_id']},
+            {'type': 'range', 'column': 'age', 'min': 0, 'max': 120}
+        ]
+        
+        self.test_framework.assert_data_quality(result_data, quality_rules)
+        
+        # スキーマチェック
+        expected_schema = {
+            'customer_id': 'string',
+            'name': 'string',
+            'email': 'string',
+            'age': 'int',
+            'customer_segment': 'string'
+        }
+        
+        self.test_framework.compare_schemas(expected_schema, result_data)
+    
+    @mock_s3
+    def test_s3_data_loading(self):
+        """S3データロードテスト"""
+        # モックS3設定
+        s3 = boto3.client('s3')
+        bucket_name = 'test-bucket'
+        s3.create_bucket(Bucket=bucket_name)
+        
+        # テストデータ準備
+        test_data = pd.DataFrame({
+            'id': [1, 2, 3],
+            'value': ['a', 'b', 'c']
+        })
+        
+        # S3への書き込みテスト
+        csv_buffer = test_data.to_csv(index=False)
+        s3.put_object(Bucket=bucket_name, Key='test/data.csv', Body=csv_buffer)
+        
+        # データ読み込みテスト
+        response = s3.get_object(Bucket=bucket_name, Key='test/data.csv')
+        loaded_data = pd.read_csv(response['Body'])
+        
+        # データ整合性確認
+        pd.testing.assert_frame_equal(test_data, loaded_data)
+```
+
+これらの拡張により、ETLパイプラインに以下の高度な機能が追加されました：
+
+1. **エンタープライズ級データファクトリー**: 設定駆動のETLパイプライン、高度なデータ変換、品質チェック
+2. **データ系譜管理**: データの流れと変換履歴の追跡、影響分析、可視化
+3. **リアルタイムETL**: ストリーミング・バッチ統合処理、非同期処理、状態管理
+4. **自動テストフレームワーク**: データ品質テスト、スキーマ検証、モックサービス
+
+これにより、実際のエンタープライズ環境で求められる高度なETL機能を学習できます。

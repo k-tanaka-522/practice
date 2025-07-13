@@ -1,0 +1,561 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SNS風アプリケーション - WebSocketリアルタイム通信機能'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: 'デプロイ環境'
+  
+  ProjectName:
+    Type: String
+    Default: sns-app
+    Description: 'プロジェクト名'
+
+Resources:
+  # DynamoDB テーブル - WebSocket接続管理
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-connections-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: lastHeartbeat
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # ユーザーIDでの検索用
+        - IndexName: userId-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        # ハートビート時刻での検索用（古い接続のクリーンアップ）
+        - IndexName: lastHeartbeat-index
+          KeySchema:
+            - AttributeName: lastHeartbeat
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DynamoDB テーブル - 通知管理
+  NotificationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-notifications-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: notificationId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: notificationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # ユーザー別通知取得用
+        - IndexName: userId-createdAt-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda実行ロール - WebSocket機能用
+  WebSocketLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-websocket-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ConnectionsTable.Arn
+                  - !Sub '${ConnectionsTable.Arn}/index/*'
+                  - !GetAtt NotificationsTable.Arn
+                  - !Sub '${NotificationsTable.Arn}/index/*'
+        - PolicyName: ApiGatewayManagementAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  # SNS トピック - 通知配信用
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: 'SNS App Notifications'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda関数 - WebSocket接続
+  WebSocketConnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-websocket-connect-${Environment}'
+      Runtime: nodejs18.x
+      Handler: connect.handler
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('WebSocket Connect:', JSON.stringify(event, null, 2));
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ message: 'Connected' })
+            };
+          };
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          NOTIFICATIONS_TABLE: !Ref NotificationsTable
+          WEBSOCKET_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda関数 - WebSocket切断
+  WebSocketDisconnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-websocket-disconnect-${Environment}'
+      Runtime: nodejs18.x
+      Handler: disconnect.handler
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('WebSocket Disconnect:', JSON.stringify(event, null, 2));
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ message: 'Disconnected' })
+            };
+          };
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          NOTIFICATIONS_TABLE: !Ref NotificationsTable
+          WEBSOCKET_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - WebSocketメッセージ処理
+  WebSocketMessageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-websocket-message-${Environment}'
+      Runtime: nodejs18.x
+      Handler: message.handler
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('WebSocket Message:', JSON.stringify(event, null, 2));
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ message: 'Message processed' })
+            };
+          };
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          NOTIFICATIONS_TABLE: !Ref NotificationsTable
+          WEBSOCKET_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 30
+      MemorySize: 256
+
+  # Lambda関数 - ブロードキャスト配信
+  WebSocketBroadcastFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-websocket-broadcast-${Environment}'
+      Runtime: nodejs18.x
+      Handler: broadcast.handler
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('WebSocket Broadcast:', JSON.stringify(event, null, 2));
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ message: 'Broadcast completed' })
+            };
+          };
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          NOTIFICATIONS_TABLE: !Ref NotificationsTable
+          WEBSOCKET_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 300 # 5分（ブロードキャストは時間がかかる可能性）
+      MemorySize: 512
+
+  # Lambda関数 - 古い接続のクリーンアップ
+  ConnectionCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-connection-cleanup-${Environment}'
+      Runtime: nodejs18.x
+      Handler: cleanup.handler
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('Connection Cleanup:', JSON.stringify(event, null, 2));
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ message: 'Cleanup completed' })
+            };
+          };
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          WEBSOCKET_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+          AWS_REGION: !Ref AWS::Region
+          ENVIRONMENT: !Ref Environment
+      Timeout: 300
+      MemorySize: 256
+
+  # EventBridge スケジュール - 接続クリーンアップ
+  ConnectionCleanupSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-connection-cleanup-${Environment}'
+      Description: 'Clean up stale WebSocket connections'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ConnectionCleanupFunction.Arn
+          Id: 'ConnectionCleanupTarget'
+
+  # Lambda権限 - EventBridge
+  ConnectionCleanupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConnectionCleanupFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConnectionCleanupSchedule.Arn
+
+  # API Gateway WebSocket API
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-websocket-api-${Environment}'
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.action'
+      Description: 'WebSocket API for real-time communication'
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # WebSocket ルート - $connect
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: '$connect'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${ConnectIntegration}'
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketConnectFunction.Arn}/invocations'
+
+  # WebSocket ルート - $disconnect
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: '$disconnect'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${DisconnectIntegration}'
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketDisconnectFunction.Arn}/invocations'
+
+  # WebSocket ルート - $default (メッセージ処理)
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: '$default'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${MessageIntegration}'
+
+  MessageIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketMessageFunction.Arn}/invocations'
+
+  # WebSocket デプロイメント
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - DefaultRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+      Description: !Sub 'WebSocket API deployment for ${Environment}'
+
+  # WebSocket ステージ
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      DeploymentId: !Ref WebSocketDeployment
+      StageName: !Ref Environment
+      Description: !Sub 'WebSocket API ${Environment} stage'
+      DefaultRouteSettings:
+        LoggingLevel: INFO
+        DataTraceEnabled: true
+        DetailedMetricsEnabled: true
+        ThrottlingRateLimit: 1000
+        ThrottlingBurstLimit: 2000
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  # Lambda権限 - API Gateway WebSocket
+  ConnectLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebSocketConnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+
+  DisconnectLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebSocketDisconnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+
+  MessageLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebSocketMessageFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/*'
+
+  # CloudWatch Logs グループ
+  WebSocketConnectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-websocket-connect-${Environment}'
+      RetentionInDays: 14
+
+  WebSocketDisconnectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-websocket-disconnect-${Environment}'
+      RetentionInDays: 14
+
+  WebSocketMessageLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-websocket-message-${Environment}'
+      RetentionInDays: 14
+
+  WebSocketBroadcastLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-websocket-broadcast-${Environment}'
+      RetentionInDays: 14
+
+  ConnectionCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-connection-cleanup-${Environment}'
+      RetentionInDays: 14
+
+  # CloudWatch アラーム - WebSocket接続数
+  WebSocketConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-websocket-connections-${Environment}'
+      AlarmDescription: 'High number of WebSocket connections'
+      MetricName: ConnectionCount
+      Namespace: AWS/ApiGateway
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-websocket-api-${Environment}'
+      TreatMissingData: notBreaching
+
+  # CloudWatch アラーム - メッセージエラー率
+  WebSocketErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-websocket-errors-${Environment}'
+      AlarmDescription: 'High WebSocket error rate'
+      MetricName: ClientError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub '${ProjectName}-websocket-api-${Environment}'
+      TreatMissingData: notBreaching
+
+  # SNS 通知用サブスクリプション（E-mail、オプション）
+  # EmailNotificationSubscription:
+  #   Type: AWS::SNS::Subscription
+  #   Properties:
+  #     Protocol: email
+  #     TopicArn: !Ref NotificationTopic
+  #     Endpoint: admin@example.com
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Outputs:
+  # WebSocket API情報
+  WebSocketApiId:
+    Description: 'WebSocket API ID'
+    Value: !Ref WebSocketApi
+    Export:
+      Name: !Sub '${ProjectName}-websocket-api-id-${Environment}'
+
+  WebSocketUrl:
+    Description: 'WebSocket API URL'
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-websocket-url-${Environment}'
+
+  WebSocketEndpoint:
+    Description: 'WebSocket API Endpoint for Lambda'
+    Value: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-websocket-endpoint-${Environment}'
+
+  # DynamoDB テーブル情報
+  ConnectionsTableName:
+    Description: 'Connections DynamoDB Table Name'
+    Value: !Ref ConnectionsTable
+    Export:
+      Name: !Sub '${ProjectName}-connections-table-${Environment}'
+
+  NotificationsTableName:
+    Description: 'Notifications DynamoDB Table Name'
+    Value: !Ref NotificationsTable
+    Export:
+      Name: !Sub '${ProjectName}-notifications-table-${Environment}'
+
+  # Lambda関数情報
+  WebSocketBroadcastFunctionArn:
+    Description: 'WebSocket Broadcast Function ARN'
+    Value: !GetAtt WebSocketBroadcastFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-websocket-broadcast-function-arn-${Environment}'
+
+  # SNS トピック情報
+  NotificationTopicArn:
+    Description: 'Notification Topic ARN'
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-notification-topic-arn-${Environment}'
+
+  # Lambda実行ロール
+  WebSocketLambdaRoleArn:
+    Description: 'WebSocket Lambda Execution Role ARN'
+    Value: !GetAtt WebSocketLambdaRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-websocket-lambda-role-arn-${Environment}'

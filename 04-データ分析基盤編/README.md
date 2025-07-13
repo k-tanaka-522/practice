@@ -1,615 +1,374 @@
-# データ分析基盤編
+# エンタープライズデータ分析基盤編 🏗️📊
 
 ## 概要
 
-このセクションでは、AWSを使用したモダンなデータ分析基盤を構築します。リアルタイムデータ処理、ETLパイプライン、データ可視化まで、エンドツーエンドのデータプラットフォームを学習します。
+このモジュールでは、AWSを使用したモダンなエンタープライズ級データ分析基盤を構築します。リアルタイムデータ処理から高度な分析まで、スケーラブルで信頼性の高いデータプラットフォームの実装を学習します。
 
-## 学習目標
+## 🎯 学習目標
 
-- 📊 **データ収集**: Kinesis、EventBridge、IoTによるリアルタイムデータ取得
-- 🔄 **データ処理**: ETL/ELTパイプライン、Lambda、Glue
-- 🗄️ **データ保存**: S3 Data Lake、Redshift、Athena
-- 📈 **データ可視化**: QuickSight、CloudWatch、カスタムダッシュボード
-- 🤖 **機械学習統合**: SageMaker、予測分析、異常検知
+### 1. データエンジニアリング基礎
+- **リアルタイムデータ収集**: Kinesis Streams/Firehose、EventBridge
+- **バッチデータ処理**: AWS Glue、Step Functions、Lambda
+- **データレイク設計**: S3階層アーキテクチャ、パーティション戦略
+- **データ品質管理**: Great Expectations、AWS Deequ、カスタム検証
 
-## アーキテクチャ概要
+### 2. 高度なデータ処理
+- **ストリーミング処理**: Kinesis Analytics、Lambda、実用的な使用例
+- **ETL/ELTパイプライン**: Spark on Glue、コードベースのワークフロー
+- **データ変換**: スキーマ進化、型変換、データクレンジング
+- **ワークフロー管理**: Step Functions、エラーハンドリング、再試行戦略
+
+### 3. ビジネスインテリジェンス
+- **ダッシュボード設計**: QuickSight、エグゼクティブ/オペレーショナル/アナリティカルビュー
+- **セルフサービス分析**: 埋め込み分析、API統合、自動化
+- **リアルタイム監視**: CloudWatch、カスタムメトリクス、アラート
+- **コスト最適化**: パフォーマンス監視、リソース最適化
+
+### 4. エンタープライズ機能
+- **セキュリティ**: 暗号化、アクセス制御、監査ログ
+- **ガバナンス**: データリネージュ、メタデータ管理、コンプライアンス
+- **災害復旧**: マルチリージョン、バックアップ戦略、フェイルオーバー
+- **運用自動化**: Infrastructure as Code、CI/CD、監視
+
+## 🏗️ アーキテクチャ概要
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Data Sources                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────┐ │
-│  │ Web/Mobile  │  │     IoT     │  │ External    │  │  APIs   │ │
-│  │    Apps     │  │   Devices   │  │    APIs     │  │         │ │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Data Ingestion                               │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────┐ │
-│  │   Kinesis   │  │ EventBridge │  │   Lambda    │  │   SQS   │ │
-│  │  Streams    │  │   Events    │  │  Functions  │  │ Queues  │ │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Data Processing                               │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────┐ │
-│  │    Glue     │  │   Lambda    │  │     EMR     │  │  Step   │ │
-│  │  ETL Jobs   │  │ Processing  │  │   Clusters  │  │Function │ │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Data Storage                                 │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────┐ │
-│  │   S3 Data   │  │  Redshift   │  │  DynamoDB   │  │ RDS     │ │
-│  │    Lake     │  │    DWH      │  │   NoSQL     │  │   DB    │ │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                 Analytics & Visualization                       │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────┐ │
-│  │  QuickSight │  │   Athena    │  │ CloudWatch  │  │ Custom  │ │
-│  │ Dashboards  │  │   Queries   │  │  Metrics    │  │   UIs   │ │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────┘ │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                               Data Sources                                       │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ │
+│ │ Web/Mobile  │ │     IoT     │ │  External   │ │    APIs     │ │ Enterprise  │ │
+│ │    Apps     │ │   Devices   │ │    APIs     │ │             │ │   Systems   │ │
+│ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              Data Ingestion                                     │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ │
+│ │   Kinesis   │ │ EventBridge │ │   Lambda    │ │     SQS     │ │    API      │ │
+│ │   Streams   │ │   Events    │ │  Functions  │ │   Queues    │ │  Gateway    │ │
+│ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │
+│ │ │Sharding │ │ │ │ Rules   │ │ │ │Triggers │ │ │ │  DLQ    │ │ │ │Throttle │ │ │
+│ │ │Scaling  │ │ │ │Patterns │ │ │ │Batching │ │ │ │Handling │ │ │ │ Limits  │ │ │
+│ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │
+│ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                            Stream Processing                                    │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ │
+│ │  Kinesis    │ │   Lambda    │ │    Glue     │ │     EMR     │ │  Managed    │ │
+│ │ Analytics   │ │ Processors  │ │ Streaming   │ │   Spark     │ │  Flink      │ │
+│ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │
+│ │ │Windows  │ │ │ │Parallel │ │ │ │Catalog  │ │ │ │Dynamic  │ │ │ │Windows  │ │ │
+│ │ │Triggers │ │ │ │Execution│ │ │ │Updates  │ │ │ │Scaling  │ │ │ │Checkpts │ │ │
+│ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │
+│ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                               Data Lake                                         │
+│ ┌─────────────────────────────────────────────────────────────────────────────┐ │
+│ │                            S3 Data Lake Architecture                       │ │
+│ │ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────┐ │ │
+│ │ │     Raw     │ │ Processed   │ │  Curated    │ │  Archive    │ │  Logs   │ │ │
+│ │ │    Zone     │ │    Zone     │ │    Zone     │ │    Zone     │ │  Zone   │ │ │
+│ │ │             │ │             │ │             │ │             │ │         │ │ │
+│ │ │• Original   │ │• Cleaned    │ │• Business   │ │• Historical │ │• Audit  │ │ │
+│ │ │  Format     │ │• Validated  │ │  Ready      │ │  Data       │ │  Trails │ │ │
+│ │ │• Immutable  │ │• Enriched   │ │• Optimized  │ │• Compressed │ │• Access │ │ │
+│ │ │• Partitioned│ │• Deduplicated│ │• Aggregated │ │• Glacier    │ │  Logs   │ │ │
+│ │ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ └─────────┘ │ │
+│ └─────────────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                             Batch Processing                                   │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ │
+│ │    Glue     │ │    Step     │ │   Lambda    │ │    EMR      │ │   Athena    │ │
+│ │  ETL Jobs   │ │ Functions   │ │  Functions  │ │  Clusters   │ │   Queries   │ │
+│ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │
+│ │ │Spark    │ │ │ │Workflow │ │ │ │Triggers │ │ │ │Jupyter  │ │ │ │Query    │ │ │
+│ │ │Python   │ │ │ │Parallel │ │ │ │Schedule │ │ │ │Notebooks│ │ │ │Engine   │ │ │
+│ │ │Scala    │ │ │ │Error    │ │ │ │Events   │ │ │ │Spark    │ │ │ │Presto   │ │ │
+│ │ │         │ │ │ │Handling │ │ │ │Batching │ │ │ │ML       │ │ │ │         │ │ │
+│ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │
+│ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          Analytics & Visualization                             │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ │
+│ │ QuickSight  │ │   Redshift  │ │  CloudWatch │ │   Grafana   │ │   Custom    │ │
+│ │ Dashboards  │ │  Spectrum   │ │ Dashboards  │ │    OSS      │ │  Analytics  │ │
+│ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │ ┌─────────┐ │ │
+│ │ │Executive│ │ │ │Columnar │ │ │ │Metrics  │ │ │ │Time     │ │ │ │API      │ │ │
+│ │ │Ops      │ │ │ │Storage  │ │ │ │Alarms   │ │ │ │Series   │ │ │ │Gateway  │ │ │
+│ │ │Analytics│ │ │ │Fast     │ │ │ │Insights │ │ │ │Alerts   │ │ │ │Lambda   │ │ │
+│ │ │Customer │ │ │ │Queries  │ │ │ │Anomaly  │ │ │ │         │ │ │ │React    │ │ │
+│ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │ └─────────┘ │ │
+│ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘ │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 学習パス
+## 📚 モジュール構成
 
 ### 4.1 データ収集と保存
-- **4.1.1** Kinesisストリーミング
-- **4.1.2** ETLパイプライン（Glue）
+
+#### 4.1.1 [Kinesisストリーミング](./4.1-データ収集と保存/4.1.1-Kinesisストリーミング/)
+- **リアルタイムデータ取り込み**: マルチソース対応、イベント駆動アーキテクチャ
+- **エンタープライズパターン**: シャーディング戦略、自動スケーリング、障害対応
+- **データ品質監視**: リアルタイム検証、アラート、メトリクス
+- **実践ツール**: 高度なデータジェネレーター、運用自動化スクリプト
+
+**主要成果物:**
+- `advanced_data_generator.py`: 6種類のリアルデータ生成（623行）
+- エンタープライズKinesis処理パターン
+- 運用自動化スクリプト（健全性チェック、メトリクス収集）
+
+#### 4.1.2 [ETLパイプライン](./4.1-データ収集と保存/4.1.2-ETLパイプライン/)
+- **本格的ETLワークフロー**: Glue + Step Functions、エラーハンドリング
+- **データファクトリーパターン**: 再利用可能コンポーネント、設定駆動
+- **データリネージュ**: 履歴追跡、メタデータ管理、影響分析
+- **テスト自動化**: データ品質検証、パフォーマンステスト
+
+**主要成果物:**
+- `enterprise_etl_job.py`: 本格的ETLジョブ（573行）
+- データ変換パターン（Customer、Sales）
+- リアルタイム・バッチ統合処理フレームワーク
 
 ### 4.2 可視化と分析
-- **4.2.1** QuickSightダッシュボード
-- **4.2.2** CloudWatchメトリクス
 
-### 4.3 高度な分析（拡張）
-- **4.3.1** Athenaクエリエンジン
-- **4.3.2** SageMaker機械学習統合
+#### 4.2.1 [QuickSightダッシュボード](./4.2-可視化と分析/4.2.1-QuickSightダッシュボード/)
+- **マルチレベルダッシュボード**: エグゼクティブ、オペレーショナル、分析用
+- **埋め込み分析**: API統合、セキュア配信、カスタマイゼーション
+- **自動化とスケジューリング**: リフレッシュ、アラート、レポーティング
+- **高度な可視化**: 予測分析、異常検知、インタラクティブ探索
 
-## クイックスタート
+**主要成果物:**
+- `dashboard_automation.py`: 4種類のダッシュボード自動生成（551行）
+- エンタープライズ権限管理
+- PDF エクスポート、埋め込みURL生成
 
-### 前提条件
+#### 4.2.2 [CloudWatchメトリクス](./4.2-可視化と分析/4.2.2-CloudWatchメトリクス/)
+- **高度な監視**: カスタムメトリクス、異常検知、予測スケーリング
+- **SLA監視**: 可用性、パフォーマンス、コスト追跡
+- **インテリジェントアラート**: 動的閾値、機械学習ベース検知
+- **コスト最適化**: 使用状況分析、推奨事項、自動化
 
+**主要成果物:**
+- `advanced_monitoring.py`: エンタープライズ監視（456行）
+- 異常検知、予測分析機能
+- コスト分析、SLA監視フレームワーク
+
+## 🛠️ 実践ツールと自動化
+
+### 設定管理
+- **`enterprise_data_platform_config.json`**: 包括的設定（443行）
+  - 全サービス統合設定
+  - セキュリティ、ネットワーキング、ガバナンス
+  - パフォーマンス最適化、災害復旧
+
+### デプロイメント自動化
+- **`deploy_enterprise_platform.sh`**: 統合デプロイメント（723行）
+  - インフラストラクチャー、Kinesis、ETL、分析、監視
+  - 検証、ドライラン、リソース破棄
+  - 前提条件チェック、環境設定、ログ管理
+
+### テスト自動化
+- **`test_data_platform.py`**: 包括的テストスイート（802行）
+  - 8つのテストスイート（インフラ、Kinesis、ETL、分析、監視、品質、パフォーマンス、セキュリティ）
+  - 実テストとモック実装
+  - 詳細レポート生成、結果集計
+
+## 🚀 クイックスタート
+
+### 1. 環境準備
 ```bash
-# AWS CLI確認
-aws --version
+# AWS CLIとクレデンシャル設定
+aws configure
 
-# Python環境確認（データ処理用）
-python3 --version
-pip3 --version
+# 依存関係インストール
+pip install boto3 pandas numpy faker
 
-# Node.js確認（Lambda関数用）
-node --version
-npm --version
+# プロジェクト設定
+cd 04-データ分析基盤編
 ```
 
-### 全体デプロイ
-
+### 2. 完全デプロイメント
 ```bash
-# データ分析基盤の一括デプロイ
-./scripts/deploy-all-infrastructure.sh deploy-data
+# 包括的なプラットフォームデプロイ
+./scripts/deploy_enterprise_platform.sh --environment prod --all
 
-# 段階的デプロイ
-./scripts/deploy-data-platform.sh deploy-ingestion
-./scripts/deploy-data-platform.sh deploy-processing
-./scripts/deploy-data-platform.sh deploy-analytics
+# 特定コンポーネントのみ
+./scripts/deploy_enterprise_platform.sh --environment dev kinesis etl
 ```
 
-## 学習コンテンツ詳細
-
-### 📊 4.1.1 Kinesisストリーミング
-
-**学習内容:**
-- リアルタイムデータストリーミング
-- Kinesis Data Streams設計
-- Kinesis Analytics でのリアルタイム分析
-- 並列処理とスケーリング戦略
-
-**実装内容:**
-- Kinesis Data Streams構築
-- Lambda コンシューマー実装
-- Kinesis Analytics アプリケーション
-- CloudWatch監視設定
-
-**主要技術:**
-- Amazon Kinesis Data Streams
-- Amazon Kinesis Analytics
-- AWS Lambda
-- Amazon CloudWatch
-
-### 🔄 4.1.2 ETLパイプライン
-
-**学習内容:**
-- データ変換処理の設計
-- AWS Glue によるサーバーレス ETL
-- データカタログ管理
-- スケジューリングと依存関係管理
-
-**実装内容:**
-- Glue ETL ジョブ実装
-- Glue Data Catalog 設定
-- Step Functions ワークフロー
-- 品質チェックとエラーハンドリング
-
-**主要技術:**
-- AWS Glue
-- AWS Step Functions
-- Amazon S3
-- AWS Lambda
-
-### 📈 4.2.1 QuickSightダッシュボード
-
-**学習内容:**
-- ビジネスインテリジェンス設計
-- インタラクティブダッシュボード作成
-- データセット設計と最適化
-- 組み込み分析とセキュリティ
-
-**実装内容:**
-- QuickSight データセット作成
-- ダッシュボード設計と実装
-- 自動レポート生成
-- 埋め込み分析機能
-
-**主要技術:**
-- Amazon QuickSight
-- Amazon Athena
-- Amazon Redshift
-- S3 Data Lake
-
-### 📊 4.2.2 CloudWatchメトリクス
-
-**学習内容:**
-- カスタムメトリクス設計
-- アラートとダッシュボード
-- ログ分析とインサイト
-- コスト監視と最適化
-
-**実装内容:**
-- カスタムメトリクス実装
-- CloudWatch ダッシュボード作成
-- アラームとSNS通知
-- ログ集約と分析
-
-**主要技術:**
-- Amazon CloudWatch
-- CloudWatch Logs
-- Amazon SNS
-- AWS X-Ray
-
-## 🏗️ 実装手順
-
-### Step 1: データ収集層の構築
-
+### 3. データ生成開始
 ```bash
-# Kinesisストリーム作成
-aws kinesis create-stream \
-  --stream-name data-ingestion-stream \
-  --shard-count 2
-
-# データ生成Lambda関数デプロイ
-cd 04-データ分析基盤編/4.1-データ収集と保存/4.1.1-Kinesisストリーミング
-aws cloudformation create-stack \
-  --stack-name data-ingestion \
-  --template-body file://cloudformation/kinesis-streaming.yaml \
-  --capabilities CAPABILITY_IAM
+# リアルタイムデータ生成
+python 4.1-データ収集と保存/4.1.1-Kinesisストリーミング/scripts/advanced_data_generator.py \
+  --stream-name enterprise-data-stream \
+  --events-per-second 100 \
+  --duration-seconds 3600
 ```
 
-### Step 2: データ処理層の構築
-
+### 4. ダッシュボード作成
 ```bash
-# Glue ETLジョブの設定
-aws glue create-job \
-  --name data-transformation-job \
-  --role GlueServiceRole \
-  --command ScriptLocation=s3://my-bucket/etl-script.py
-
-# Step Functions ワークフロー作成
-aws stepfunctions create-state-machine \
-  --name data-processing-workflow \
-  --definition file://step-functions-definition.json
+# エンタープライズダッシュボードスイート
+python 4.2-可視化と分析/4.2.1-QuickSightダッシュボード/scripts/dashboard_automation.py \
+  --account-id 123456789012 \
+  --config-file config/enterprise_data_platform_config.json \
+  --action create
 ```
 
-### Step 3: データ保存層の構築
-
+### 5. 監視設定
 ```bash
-# S3 Data Lake バケット作成
-aws s3 mb s3://my-data-lake-bucket
-aws s3api put-bucket-encryption \
-  --bucket my-data-lake-bucket \
-  --server-side-encryption-configuration file://encryption-config.json
-
-# Athena データベース作成
-aws athena start-query-execution \
-  --query-string "CREATE DATABASE analytics_db"
+# 高度な監視設定
+python 4.2-可視化と分析/4.2.2-CloudWatchメトリクス/scripts/advanced_monitoring.py \
+  --config-file config/enterprise_data_platform_config.json \
+  --action setup
 ```
 
-### Step 4: 分析・可視化層の構築
-
+### 6. テスト実行
 ```bash
-# QuickSight データセット作成
-aws quicksight create-data-set \
-  --aws-account-id 123456789012 \
-  --data-set-id my-dataset \
-  --name "Analytics Dataset"
-
-# CloudWatch カスタムダッシュボード作成
-aws cloudwatch put-dashboard \
-  --dashboard-name "DataPlatformDashboard" \
-  --dashboard-body file://dashboard-config.json
+# 包括的テストスイート
+python testing/test_data_platform.py \
+  --config config/enterprise_data_platform_config.json \
+  --output test_results.json
 ```
 
-## 💾 データモデリング
+## 🎓 学習パス
 
-### データレイク設計
+### ビギナー: データ分析基盤の基礎（推定時間: 8時間）
+1. **Kinesis基礎**: ストリーム作成、データ送信、基本的な消費
+2. **S3データレイク**: バケット構造、パーティション戦略
+3. **Glue ETL**: シンプルなデータ変換ジョブ
+4. **QuickSight基礎**: 基本的なダッシュボード作成
 
-```
-s3://my-data-lake/
-├── raw/                    # 生データ
-│   ├── year=2024/
-│   │   ├── month=01/
-│   │   │   ├── day=15/
-│   │   │   │   └── events/
-│   └── source=app/
-├── processed/              # 処理済みデータ
-│   ├── aggregated/
-│   ├── cleaned/
-│   └── enriched/
-└── curated/               # キュレーション済み
-    ├── analytics/
-    ├── ml/
-    └── reporting/
-```
+### インターミディエート: 実用的なデータパイプライン（推定時間: 12時間）
+1. **ストリーミング処理**: Kinesis Analytics、Lambda統合
+2. **バッチ処理**: Glue + Step Functions、スケジューリング
+3. **データ品質**: 検証ルール、エラーハンドリング
+4. **監視とアラート**: CloudWatch、カスタムメトリクス
 
-### パーティション戦略
+### アドバンスド: エンタープライズ級システム（推定時間: 16時間）
+1. **マルチソース統合**: 複数データソース、リアルタイム + バッチ
+2. **高度な分析**: 機械学習統合、予測分析、異常検知
+3. **ガバナンスとセキュリティ**: データリネージュ、暗号化、アクセス制御
+4. **運用自動化**: CI/CD、Infrastructure as Code、災害復旧
 
-```sql
--- Athena テーブル作成例
-CREATE TABLE events (
-  event_id string,
-  user_id string,
-  event_type string,
-  timestamp timestamp,
-  properties map<string,string>
-)
-PARTITIONED BY (
-  year int,
-  month int,
-  day int,
-  source string
-)
-STORED AS PARQUET
-LOCATION 's3://my-data-lake/processed/events/'
-```
+### エキスパート: プラットフォーム運用とスケーリング（推定時間: 20時間）
+1. **パフォーマンス最適化**: コスト効率、スループット最適化
+2. **マルチリージョン展開**: 災害復旧、データ複製
+3. **高度な可視化**: カスタム分析、埋め込み分析
+4. **プラットフォーム戦略**: 組織展開、チーム構造、運用モデル
 
-## 🧪 データ品質管理
-
-### データバリデーション
-
-```python
-# Glue ETL スクリプト例
-import sys
-from awsglue.transforms import *
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
-
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
-
-# データ品質チェック
-def validate_data(df):
-    # NULL値チェック
-    null_count = df.filter(df.user_id.isNull()).count()
-    if null_count > 0:
-        raise ValueError(f"NULL values found: {null_count}")
-    
-    # データ型チェック
-    numeric_columns = ['amount', 'quantity']
-    for col in numeric_columns:
-        if df.filter(~df[col].cast('double').isNotNull()).count() > 0:
-            raise ValueError(f"Invalid numeric values in {col}")
-    
-    return True
-
-# ETL処理
-datasource = glueContext.create_dynamic_frame.from_catalog(
-    database="analytics_db",
-    table_name="raw_events"
-)
-
-# データクリーニング
-df = datasource.toDF()
-validate_data(df)  # 品質チェック
-
-# 変換処理
-transformed_df = df.filter(df.event_type != 'test') \
-                  .withColumn('processed_at', current_timestamp())
-
-# 出力
-output_frame = DynamicFrame.fromDF(transformed_df, glueContext, "output")
-glueContext.write_dynamic_frame.from_options(
-    frame=output_frame,
-    connection_type="s3",
-    connection_options={
-        "path": "s3://my-data-lake/processed/events/",
-        "partitionKeys": ["year", "month", "day"]
-    },
-    format="parquet"
-)
-
-job.commit()
-```
-
-## 📊 パフォーマンス最適化
-
-### Kinesis 最適化
-
-```yaml
-# Kinesis設定例
-KinesisStream:
-  ShardCount: !Ref ShardCount  # 書き込み速度に応じて調整
-  RetentionPeriod: 168         # 7日間保持
-  ShardLevelMetrics:
-    - IncomingRecords
-    - OutgoingRecords
-```
-
-### Athena 最適化
-
-```sql
--- パーティション射影を使用した高速クエリ
-CREATE TABLE optimized_events (
-  event_id string,
-  user_id string,
-  event_type string,
-  properties string
-)
-PARTITIONED BY (
-  year int,
-  month int,
-  day int
-)
-STORED AS PARQUET
-LOCATION 's3://my-data-lake/optimized/events/'
-TBLPROPERTIES (
-  'projection.enabled'='true',
-  'projection.year.type'='integer',
-  'projection.year.range'='2020,2030',
-  'projection.month.type'='integer',
-  'projection.month.range'='1,12',
-  'projection.day.type'='integer',
-  'projection.day.range'='1,31',
-  'storage.location.template'='s3://my-data-lake/optimized/events/year=${year}/month=${month}/day=${day}/'
-);
-```
-
-## 🔍 監視とアラート
-
-### データパイプライン監視
-
-```bash
-# CloudWatch カスタムメトリクス送信
-aws cloudwatch put-metric-data \
-  --namespace "DataPipeline" \
-  --metric-data MetricName=ProcessedRecords,Value=1000,Unit=Count
-
-# データ品質アラート
-aws cloudwatch put-metric-alarm \
-  --alarm-name "DataQualityFailure" \
-  --alarm-description "Data quality check failed" \
-  --metric-name "QualityCheckFailures" \
-  --namespace "DataPipeline" \
-  --statistic "Sum" \
-  --period 300 \
-  --threshold 1 \
-  --comparison-operator "GreaterThanOrEqualToThreshold"
-```
-
-### コスト監視
-
-```python
-# Lambda関数でコスト監視
-import boto3
-import json
-
-def lambda_handler(event, context):
-    ce = boto3.client('ce')
-    
-    # S3ストレージコスト取得
-    response = ce.get_cost_and_usage(
-        TimePeriod={
-            'Start': '2024-01-01',
-            'End': '2024-01-31'
-        },
-        Granularity='MONTHLY',
-        Metrics=['BlendedCost'],
-        GroupBy=[
-            {
-                'Type': 'DIMENSION',
-                'Key': 'SERVICE'
-            }
-        ]
-    )
-    
-    # コストアラート
-    for group in response['ResultsByTime'][0]['Groups']:
-        service = group['Keys'][0]
-        cost = float(group['Metrics']['BlendedCost']['Amount'])
-        
-        if service == 'Amazon Simple Storage Service' and cost > 1000:
-            sns = boto3.client('sns')
-            sns.publish(
-                TopicArn='arn:aws:sns:us-east-1:123456789012:cost-alerts',
-                Message=f'S3 cost exceeded $1000: ${cost:.2f}',
-                Subject='High S3 Cost Alert'
-            )
-    
-    return {'statusCode': 200}
-```
-
-## 🛠️ トラブルシューティング
+## 🔧 トラブルシューティング
 
 ### よくある問題と解決方法
 
-#### 1. Kinesis スロットリング
-
-```python
-# 指数バックオフリトライ
-import time
-import random
-
-def put_record_with_retry(kinesis_client, stream_name, data, partition_key, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            response = kinesis_client.put_record(
-                StreamName=stream_name,
-                Data=data,
-                PartitionKey=partition_key
-            )
-            return response
-        except kinesis_client.exceptions.ProvisionedThroughputExceededException:
-            if attempt < max_retries - 1:
-                sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(sleep_time)
-            else:
-                raise
-```
-
-#### 2. Glue ETL メモリエラー
-
-```python
-# データフレームの最適化
-def optimize_dataframe(df):
-    # カラムのデータ型最適化
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            try:
-                df[col] = pd.to_numeric(df[col], downcast='integer')
-            except:
-                pass
-    
-    # 不要カラムの削除
-    df = df.drop(['temp_column'], axis=1, errors='ignore')
-    
-    return df
-```
-
-#### 3. Athena クエリタイムアウト
-
-```sql
--- クエリ最適化のベストプラクティス
--- 1. パーティション射映の使用
--- 2. カラムナーフォーマット（Parquet）の使用
--- 3. 適切なデータ型の選択
-
--- 効率的なクエリ例
-SELECT 
-    event_type,
-    COUNT(*) as event_count
-FROM events
-WHERE year = 2024 
-    AND month = 1 
-    AND day BETWEEN 1 AND 7
-GROUP BY event_type
-LIMIT 1000;
-```
-
-## 💰 コスト最適化
-
-### S3 ストレージ最適化
-
-```yaml
-# ライフサイクルポリシー
-LifecycleConfiguration:
-  Rules:
-    - Id: DataArchiving
-      Status: Enabled
-      Transitions:
-        - Days: 30
-          StorageClass: STANDARD_IA
-        - Days: 90
-          StorageClass: GLACIER
-        - Days: 365
-          StorageClass: DEEP_ARCHIVE
-      ExpirationInDays: 2555  # 7年後削除
-```
-
-### Kinesis コスト最適化
-
+#### Kinesisシャード制限
 ```bash
-# オンデマンドモード（推奨）
-aws kinesis put-record \
-  --stream-name my-stream \
-  --data "sample data" \
-  --partition-key "key1"
-
-# シャード数動的調整
-aws application-autoscaling register-scalable-target \
-  --service-namespace kinesis \
-  --resource-id stream/my-stream \
-  --scalable-dimension kinesis:stream:shard-count
+# シャード数の確認と増加
+aws kinesis describe-stream --stream-name enterprise-data-stream
+aws kinesis update-shard-count --stream-name enterprise-data-stream --target-shard-count 10
 ```
 
-## 📚 参考資料
+#### Glueジョブのメモリ不足
+```python
+# Glueジョブ設定でワーカータイプを調整
+job_config = {
+    "WorkerType": "G.2X",  # G.1X -> G.2X -> G.4X -> G.8X
+    "NumberOfWorkers": 20,
+    "MaxCapacity": 100
+}
+```
 
-### AWS ドキュメント
-- [Big Data Analytics Options on AWS](https://aws.amazon.com/big-data/analytics-options/)
-- [Data Lake Implementation Guide](https://aws.amazon.com/solutions/implementations/data-lake-solution/)
-- [Analytics Lens - Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/analytics-lens/)
+#### QuickSightエラー
+```bash
+# データソース接続確認
+aws quicksight describe-data-source --aws-account-id 123456789012 --data-source-id data-source-id
 
-### データエンジニアリング
-- [The Data Engineering Handbook](https://github.com/DataExpert-io/data-engineer-handbook)
-- [Apache Parquet Best Practices](https://parquet.apache.org/docs/)
-- [Data Modeling for Analytics](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/)
+# 権限設定確認
+aws quicksight describe-dashboard-permissions --aws-account-id 123456789012 --dashboard-id dashboard-id
+```
+
+## 📊 パフォーマンス基準
+
+### スループット目標
+- **Kinesis**: 1,000+ events/second per shard
+- **Glue ETL**: 1TB/hour processing capability
+- **QuickSight**: <3秒 dashboard refresh time
+- **CloudWatch**: <1分 alert notification
+
+### コスト最適化
+- **S3**: Intelligent Tiering for 20-30% cost reduction
+- **Kinesis**: Auto-scaling based on utilization
+- **Glue**: Spot instances for non-critical workloads
+- **QuickSight**: SPICE optimization for fast queries
+
+## 🔒 セキュリティとコンプライアンス
+
+### データ保護
+- **暗号化**: 転送時・保存時の暗号化（KMS）
+- **アクセス制御**: IAM、QuickSight権限、VPC設定
+- **監査**: CloudTrail、アクセスログ、データリネージュ
+- **データマスキング**: 機密データの自動検出・マスキング
+
+### コンプライアンス
+- **GDPR**: データ削除、ポータビリティ、プライバシー
+- **HIPAA**: 医療データの適切な取り扱い
+- **SOX**: 財務データの監査証跡
+- **PCI-DSS**: 決済データのセキュリティ基準
+
+## 🌍 本番運用
+
+### 監視・アラート
+- **ダッシュボード**: システム健全性、ビジネスKPI
+- **アラート**: SLA違反、異常検知、コスト増加
+- **レポート**: 週次/月次/四半期レポート自動生成
+
+### 災害復旧
+- **バックアップ**: 自動バックアップ、クロスリージョン複製
+- **フェイルオーバー**: 自動フェイルオーバー、RTO/RPO目標
+- **テスト**: 定期的な災害復旧テスト
+
+### スケーラビリティ
+- **水平スケーリング**: Kinesis シャード、Glue ワーカー
+- **垂直スケーリング**: インスタンスタイプ、メモリ、CPU
+- **コスト最適化**: 使用パターンに基づく自動スケーリング
 
 ## 📈 次のステップ
 
-完了後は以下に進んでください：
+### モジュール5: AI・ML統合編
+- SageMaker統合
+- リアルタイム推論
+- MLOps パイプライン
+- A/Bテスト基盤
 
-1. **[AI-ML統合編](../05-AI-ML統合編/README.md)** - 機械学習パイプライン
-2. **[CI-CD高度化編](../06-CI-CD高度化編/README.md)** - 自動化パイプライン
-3. **[Claude Code & Bedrock編](../07-Claude-Code-Bedrock-AI駆動開発編/README.md)** - AI駆動開発
+### 高度なトピック
+- **マルチテナント**: 組織間データ分離
+- **リアルタイムML**: ストリーミング機械学習
+- **グラフ分析**: Neptune、関係性分析
+- **時系列分析**: Timestream、予測・異常検知
 
 ---
 
-## 🎯 学習チェックリスト
+## 📞 サポートとコミュニティ
 
-### データ収集
-- [ ] Kinesis Data Streams設定
-- [ ] リアルタイムデータ処理
-- [ ] イベント駆動アーキテクチャ
-- [ ] データ取り込みパイプライン
+- **ドキュメント**: 各セクションの詳細README
+- **サンプルコード**: 実践的な実装例
+- **トラブルシューティング**: 一般的な問題と解決策
+- **ベストプラクティス**: 本番運用での推奨事項
 
-### データ処理
-- [ ] Glue ETL ジョブ設計
-- [ ] データ変換とクリーニング
-- [ ] 品質チェック実装
-- [ ] ワークフロー管理
+### 貢献
+- バグレポート、機能要求はIssueで
+- 改善提案はPull Requestで
+- ドキュメント改善も歓迎
 
-### データ保存
-- [ ] Data Lake 設計
-- [ ] パーティション戦略
-- [ ] データカタログ管理
-- [ ] セキュリティ設定
-
-### 分析・可視化
-- [ ] QuickSight ダッシュボード作成
-- [ ] Athena クエリ最適化
-- [ ] カスタムメトリクス実装
-- [ ] アラート設定
-
-**準備ができたら次のセクションへ進みましょう！**
+**🎯 このモジュールで、本格的なエンタープライズデータ分析基盤を構築し、実践的なデータエンジニアリングスキルを習得しましょう！**

@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DynamoDB Tables for Basic CRUD Operations'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment name
+    
+  ProjectName:
+    Type: String
+    Default: database-basics
+    Description: Project name
+    
+  BillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: DynamoDB billing mode
+
+Conditions:
+  IsProvisionedBilling: !Equals [!Ref BillingMode, PROVISIONED]
+
+Resources:
+  # Users Table
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-users'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisionedBilling
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+            - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref 'AWS::NoValue'
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: UserManagement
+
+  # Items Table
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-items'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisionedBilling
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+            - !Ref 'AWS::NoValue'
+        - IndexName: UserStatusIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisionedBilling
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+            - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref 'AWS::NoValue'
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: ItemManagement
+
+  # DynamoDB Auto Scaling for Provisioned mode (if needed)
+  UsersTableReadCapacityScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: IsProvisionedBilling
+    Properties:
+      MaxCapacity: 20
+      MinCapacity: 5
+      ResourceId: !Sub 'table/${UsersTable}'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/application-autoscaling-dynamodb-table'
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  UsersTableWriteCapacityScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: IsProvisionedBilling
+    Properties:
+      MaxCapacity: 20
+      MinCapacity: 5
+      ResourceId: !Sub 'table/${UsersTable}'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/application-autoscaling-dynamodb-table'
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+  ItemsTableReadCapacityScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: IsProvisionedBilling
+    Properties:
+      MaxCapacity: 20
+      MinCapacity: 5
+      ResourceId: !Sub 'table/${ItemsTable}'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/application-autoscaling-dynamodb-table'
+      ScalableDimension: dynamodb:table:ReadCapacityUnits
+      ServiceNamespace: dynamodb
+
+  ItemsTableWriteCapacityScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: IsProvisionedBilling
+    Properties:
+      MaxCapacity: 20
+      MinCapacity: 5
+      ResourceId: !Sub 'table/${ItemsTable}'
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/application-autoscaling-dynamodb-table'
+      ScalableDimension: dynamodb:table:WriteCapacityUnits
+      ServiceNamespace: dynamodb
+
+Outputs:
+  UsersTableName:
+    Description: Users table name
+    Value: !Ref UsersTable
+    
+  UsersTableArn:
+    Description: Users table ARN
+    Value: !GetAtt UsersTable.Arn
+    
+  UsersTableStreamArn:
+    Description: Users table stream ARN
+    Value: !GetAtt UsersTable.StreamArn
+    
+  ItemsTableName:
+    Description: Items table name
+    Value: !Ref ItemsTable
+    
+  ItemsTableArn:
+    Description: Items table ARN
+    Value: !GetAtt ItemsTable.Arn
+    
+  ItemsTableStreamArn:
+    Description: Items table stream ARN
+    Value: !GetAtt ItemsTable.StreamArn
+    
+  StatusIndexName:
+    Description: Status GSI name
+    Value: StatusIndex
+    
+  UserStatusIndexName:
+    Description: User Status GSI name
+    Value: UserStatusIndex
+    
+  EmailIndexName:
+    Description: Email GSI name
+    Value: EmailIndex

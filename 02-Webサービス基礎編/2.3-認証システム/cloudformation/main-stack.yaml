@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cognito User Pool Authentication System - Main Stack'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  CFBucket:
+    Type: String
+    Description: S3 bucket containing CloudFormation templates
+    
+  ProjectName:
+    Type: String
+    Default: auth-system
+    Description: Project name for resource naming
+    
+  ApiStackName:
+    Type: String
+    Default: api-foundation
+    Description: Name of the API foundation stack
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      LogLevel: DEBUG
+      RetentionDays: 7
+      PasswordMinLength: 8
+    staging:
+      LogLevel: INFO
+      RetentionDays: 14
+      PasswordMinLength: 8
+    prod:
+      LogLevel: WARN
+      RetentionDays: 30
+      PasswordMinLength: 12
+
+Resources:
+  # Cognito User Pool Stack
+  CognitoStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/auth-system/cognito-user-pool.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        PasswordMinLength: !FindInMap [EnvironmentMap, !Ref Environment, PasswordMinLength]
+
+  # Authentication Lambda Functions Stack
+  AuthLambdaStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: CognitoStack
+    Properties:
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/auth-system/lambda-auth.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        LogLevel: !FindInMap [EnvironmentMap, !Ref Environment, LogLevel]
+        LogRetentionDays: !FindInMap [EnvironmentMap, !Ref Environment, RetentionDays]
+        UserPoolId: !GetAtt CognitoStack.Outputs.UserPoolId
+        UserPoolClientId: !GetAtt CognitoStack.Outputs.UserPoolClientId
+
+  # API Gateway Authorization Stack
+  AuthorizerStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: 
+      - CognitoStack
+      - AuthLambdaStack
+    Properties:
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/auth-system/api-authorizer.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ApiStackName: !Ref ApiStackName
+        UserPoolArn: !GetAtt CognitoStack.Outputs.UserPoolArn
+        SignupFunctionArn: !GetAtt AuthLambdaStack.Outputs.SignupFunctionArn
+        SigninFunctionArn: !GetAtt AuthLambdaStack.Outputs.SigninFunctionArn
+        ProfileFunctionArn: !GetAtt AuthLambdaStack.Outputs.ProfileFunctionArn
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !GetAtt CognitoStack.Outputs.UserPoolId
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-user-pool-id'
+      
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !GetAtt CognitoStack.Outputs.UserPoolClientId
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-user-pool-client-id'
+      
+  UserPoolArn:
+    Description: Cognito User Pool ARN
+    Value: !GetAtt CognitoStack.Outputs.UserPoolArn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-user-pool-arn'
+
+  AuthApiUrl:
+    Description: Authentication API endpoint URL
+    Value: !GetAtt AuthorizerStack.Outputs.AuthApiUrl
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-auth-api-url'
+      
+  CognitoAuthorizer:
+    Description: Cognito Authorizer ID
+    Value: !GetAtt AuthorizerStack.Outputs.CognitoAuthorizerId
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-cognito-authorizer'
+
+  StackName:
+    Description: Current stack name
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-stack-name'

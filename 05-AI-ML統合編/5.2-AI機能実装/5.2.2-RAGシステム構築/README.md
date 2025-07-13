@@ -2,6 +2,22 @@
 
 このモジュールでは、RAG（Retrieval-Augmented Generation）アーキテクチャを用いた高度な知識ベース質問応答システムを構築します。大規模言語モデルの知識を外部データで拡張し、正確で最新の情報に基づく回答を生成するシステムを実装します。
 
+## 🌟 RAGシステムの特徴
+
+### 主要な利点
+- **最新情報の活用**: LLMの学習データの期限を超えた最新情報の提供
+- **ドメイン特化性**: 企業固有の文書や専門知識の活用
+- **回答の信頼性**: 情報源の明示と引用による透明性の確保
+- **動的更新**: リアルタイムでの知識ベース更新
+- **コスト効率**: 事前学習済みモデルの活用によるファインチューニング不要
+
+### 技術的優位性
+- **ハイブリッド検索**: ベクトル検索とキーワード検索の組み合わせ
+- **多言語対応**: 日本語・英語・多言語文書の統合処理
+- **スケーラビリティ**: 数百万文書規模への対応
+- **リアルタイム性**: ストリーミング回答生成
+- **エンタープライズ対応**: 高セキュリティ・監査機能
+
 ## 📋 前提条件
 
 ### 必須の完了モジュール
@@ -198,9 +214,33 @@ sequenceDiagram
 
 ## 🛠 ハンズオン実装
 
-### ステップ1: 文書処理パイプラインの構築
+### ステップ1: CloudFormation インフラストラクチャの構築
 
-#### 1.1 文書取り込み・処理Lambda関数の実装
+#### 1.1 基盤インフラストラクチャのデプロイ
+
+```bash
+# RAGシステムのデプロイ
+cd cloudformation
+
+# 基盤インフラのデプロイ
+aws cloudformation create-stack \
+    --stack-name rag-system-infrastructure \
+    --template-body file://rag-system.yaml \
+    --parameters \
+        ParameterKey=EnvironmentName,ParameterValue=dev \
+        ParameterKey=ProjectName,ParameterValue=rag-system \
+        ParameterKey=BedrockStackName,ParameterValue=bedrock-setup-stack \
+    --capabilities CAPABILITY_IAM
+
+# デプロイ状況の確認
+aws cloudformation describe-stacks \
+    --stack-name rag-system-infrastructure \
+    --query 'Stacks[0].StackStatus'
+```
+
+### ステップ2: 文書処理パイプラインの構築
+
+#### 2.1 高性能文書処理Lambda関数の実装
 
 ```python
 # lambda/document-processor/lambda_function.py
@@ -208,25 +248,525 @@ import json
 import boto3
 import os
 import re
-from typing import List, Dict, Any, Optional
+import hashlib
+import uuid
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import unquote_plus
+from datetime import datetime, timezone
+import logging
+
+# Document processing libraries
 import fitz  # PyMuPDF for PDF processing
 import docx  # python-docx for Word documents
 from bs4 import BeautifulSoup  # For HTML processing
+import pandas as pd  # For Excel/CSV files
 import nltk
-from nltk.tokenize import sent_tokenize
-from sentence_transformers import SentenceTransformer
+from nltk.tokenize import sent_tokenize, word_tokenize
+from nltk.corpus import stopwords
+import spacy
 
 # AWS Services
 s3_client = boto3.client('s3')
 bedrock_runtime = boto3.client('bedrock-runtime')
-opensearch_client = boto3.client('opensearchserverless')
+opensearch_client = boto3.client('opensearch')
+dynamodb = boto3.resource('dynamodb')
+stepfunctions = boto3.client('stepfunctions')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Environment Variables
 OPENSEARCH_ENDPOINT = os.environ.get('OPENSEARCH_ENDPOINT')
+OPENSEARCH_INDEX = os.environ.get('OPENSEARCH_INDEX', 'documents')
 EMBEDDINGS_MODEL_ID = os.environ.get('EMBEDDINGS_MODEL_ID', 'amazon.titan-embed-text-v1')
 CHUNK_SIZE = int(os.environ.get('CHUNK_SIZE', '1000'))
 CHUNK_OVERLAP = int(os.environ.get('CHUNK_OVERLAP', '200'))
+METADATA_TABLE = os.environ.get('METADATA_TABLE')
+MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', '10485760'))  # 10MB
+
+# Load NLP models
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    nlp = spacy.load('en_core_web_sm')
+except:
+    logger.warning("NLP models not fully loaded. Some features may be limited.")
+    nlp = None
+
+class DocumentProcessor:
+    """
+    高性能文書処理クラス
+    多様な形式の文書を統一的に処理し、ベクトル化してOpenSearchに保存
+    """
+    
+    def __init__(self):
+        self.supported_formats = {
+            '.pdf': self._process_pdf,
+            '.docx': self._process_docx,
+            '.doc': self._process_doc,
+            '.txt': self._process_text,
+            '.html': self._process_html,
+            '.htm': self._process_html,
+            '.md': self._process_markdown,
+            '.csv': self._process_csv,
+            '.xlsx': self._process_excel,
+            '.json': self._process_json
+        }
+    
+    def process_document(self, bucket: str, key: str) -> Dict[str, Any]:
+        """
+        文書処理のメイン関数
+        """
+        try:
+            logger.info(f"Processing document: s3://{bucket}/{key}")
+            
+            # ファイル情報の取得
+            file_info = self._get_file_info(bucket, key)
+            
+            # ファイルサイズチェック
+            if file_info['size'] > MAX_FILE_SIZE:
+                raise ValueError(f"File too large: {file_info['size']} bytes")
+            
+            # ファイル拡張子の確認
+            file_extension = os.path.splitext(key.lower())[1]
+            if file_extension not in self.supported_formats:
+                raise ValueError(f"Unsupported file format: {file_extension}")
+            
+            # ファイルの読み込み
+            file_content = self._download_file(bucket, key)
+            
+            # 文書の処理
+            processor = self.supported_formats[file_extension]
+            extracted_text, metadata = processor(file_content, file_info)
+            
+            # テキストの前処理とクリーニング
+            cleaned_text = self._clean_text(extracted_text)
+            
+            # テキストの分割
+            chunks = self._split_text(cleaned_text)
+            
+            # 各チャンクの埋め込みベクトル生成
+            chunks_with_embeddings = []
+            for i, chunk in enumerate(chunks):
+                embedding = self._generate_embedding(chunk)
+                
+                chunk_metadata = {
+                    **metadata,
+                    'chunk_index': i,
+                    'chunk_text': chunk,
+                    'chunk_length': len(chunk),
+                    'source_key': key,
+                    'source_bucket': bucket,
+                    'processed_at': datetime.now(timezone.utc).isoformat()
+                }
+                
+                chunks_with_embeddings.append({
+                    'chunk_id': f"{metadata['document_id']}_chunk_{i}",
+                    'text': chunk,
+                    'embedding': embedding,
+                    'metadata': chunk_metadata
+                })
+            
+            # OpenSearchへの保存
+            self._save_to_opensearch(chunks_with_embeddings)
+            
+            # メタデータをDynamoDBに保存
+            self._save_metadata(metadata)
+            
+            result = {
+                'document_id': metadata['document_id'],
+                'total_chunks': len(chunks_with_embeddings),
+                'total_length': len(cleaned_text),
+                'status': 'success',
+                'processed_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            logger.info(f"Successfully processed document: {metadata['document_id']}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing document {key}: {str(e)}")
+            raise
+    
+    def _get_file_info(self, bucket: str, key: str) -> Dict[str, Any]:
+        """ファイル情報の取得"""
+        try:
+            response = s3_client.head_object(Bucket=bucket, Key=key)
+            return {
+                'size': response['ContentLength'],
+                'last_modified': response['LastModified'],
+                'etag': response['ETag'].strip('"'),
+                'content_type': response.get('ContentType', ''),
+                'metadata': response.get('Metadata', {})
+            }
+        except Exception as e:
+            logger.error(f"Failed to get file info: {str(e)}")
+            raise
+    
+    def _download_file(self, bucket: str, key: str) -> bytes:
+        """S3からファイルをダウンロード"""
+        try:
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            return response['Body'].read()
+        except Exception as e:
+            logger.error(f"Failed to download file: {str(e)}")
+            raise
+    
+    def _process_pdf(self, content: bytes, file_info: Dict) -> Tuple[str, Dict]:
+        """PDF文書の処理"""
+        try:
+            doc = fitz.open(stream=content, filetype="pdf")
+            text_parts = []
+            
+            # メタデータの抽出
+            pdf_metadata = doc.metadata
+            
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                text = page.get_text()
+                
+                # 表やイメージの情報も抽出
+                tables = page.find_tables()
+                if tables:
+                    for table in tables:
+                        table_text = table.extract()
+                        text += f"\nTable: {table_text}"
+                
+                text_parts.append(text)
+            
+            doc.close()
+            
+            full_text = "\n".join(text_parts)
+            
+            metadata = {
+                'document_id': str(uuid.uuid4()),
+                'file_type': 'pdf',
+                'title': pdf_metadata.get('title', ''),
+                'author': pdf_metadata.get('author', ''),
+                'subject': pdf_metadata.get('subject', ''),
+                'page_count': len(doc),
+                'creation_date': pdf_metadata.get('creationDate', ''),
+                'modification_date': pdf_metadata.get('modDate', ''),
+                'file_size': file_info['size']
+            }
+            
+            return full_text, metadata
+            
+        except Exception as e:
+            logger.error(f"Error processing PDF: {str(e)}")
+            raise
+    
+    def _process_docx(self, content: bytes, file_info: Dict) -> Tuple[str, Dict]:
+        """Word文書（.docx）の処理"""
+        try:
+            import io
+            doc = docx.Document(io.BytesIO(content))
+            
+            text_parts = []
+            
+            # パラグラフからテキストを抽出
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    text_parts.append(paragraph.text)
+            
+            # 表からテキストを抽出
+            for table in doc.tables:
+                table_text = []
+                for row in table.rows:
+                    row_text = [cell.text.strip() for cell in row.cells]
+                    table_text.append(" | ".join(row_text))
+                text_parts.append("Table:\n" + "\n".join(table_text))
+            
+            full_text = "\n\n".join(text_parts)
+            
+            # ドキュメントプロパティの取得
+            core_props = doc.core_properties
+            
+            metadata = {
+                'document_id': str(uuid.uuid4()),
+                'file_type': 'docx',
+                'title': core_props.title or '',
+                'author': core_props.author or '',
+                'subject': core_props.subject or '',
+                'created': str(core_props.created) if core_props.created else '',
+                'modified': str(core_props.modified) if core_props.modified else '',
+                'file_size': file_info['size']
+            }
+            
+            return full_text, metadata
+            
+        except Exception as e:
+            logger.error(f"Error processing DOCX: {str(e)}")
+            raise
+    
+    def _process_text(self, content: bytes, file_info: Dict) -> Tuple[str, Dict]:
+        """テキストファイルの処理"""
+        try:
+            # エンコーディングの自動検出
+            encodings = ['utf-8', 'utf-16', 'latin-1', 'cp1252']
+            text = None
+            
+            for encoding in encodings:
+                try:
+                    text = content.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            
+            if text is None:
+                raise ValueError("Unable to decode text file")
+            
+            metadata = {
+                'document_id': str(uuid.uuid4()),
+                'file_type': 'text',
+                'character_count': len(text),
+                'line_count': len(text.split('\n')),
+                'file_size': file_info['size']
+            }
+            
+            return text, metadata
+            
+        except Exception as e:
+            logger.error(f"Error processing text file: {str(e)}")
+            raise
+    
+    def _process_html(self, content: bytes, file_info: Dict) -> Tuple[str, Dict]:
+        """HTML文書の処理"""
+        try:
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # メタタグの抽出
+            title = soup.find('title')
+            title_text = title.get_text() if title else ''
+            
+            meta_description = soup.find('meta', attrs={'name': 'description'})
+            description = meta_description.get('content', '') if meta_description else ''
+            
+            # スクリプトやスタイルを除去
+            for script in soup(["script", "style", "nav", "footer", "header"]):
+                script.decompose()
+            
+            # テキストの抽出
+            text = soup.get_text()
+            
+            # 余分な空白を除去
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = ' '.join(chunk for chunk in chunks if chunk)
+            
+            metadata = {
+                'document_id': str(uuid.uuid4()),
+                'file_type': 'html',
+                'title': title_text,
+                'description': description,
+                'file_size': file_info['size']
+            }
+            
+            return text, metadata
+            
+        except Exception as e:
+            logger.error(f"Error processing HTML: {str(e)}")
+            raise
+    
+    def _process_csv(self, content: bytes, file_info: Dict) -> Tuple[str, Dict]:
+        """CSV文書の処理"""
+        try:
+            import io
+            df = pd.read_csv(io.BytesIO(content))
+            
+            # データフレームをテキストに変換
+            text_parts = []
+            
+            # ヘッダー情報
+            text_parts.append(f"Columns: {', '.join(df.columns.tolist())}")
+            
+            # データの概要
+            text_parts.append(f"Rows: {len(df)}")
+            text_parts.append(f"Data Summary:\n{df.describe().to_string()}")
+            
+            # 実際のデータ（最初の100行）
+            preview_data = df.head(100).to_string()
+            text_parts.append(f"Data Preview:\n{preview_data}")
+            
+            full_text = "\n\n".join(text_parts)
+            
+            metadata = {
+                'document_id': str(uuid.uuid4()),
+                'file_type': 'csv',
+                'row_count': len(df),
+                'column_count': len(df.columns),
+                'columns': df.columns.tolist(),
+                'file_size': file_info['size']
+            }
+            
+            return full_text, metadata
+            
+        except Exception as e:
+            logger.error(f"Error processing CSV: {str(e)}")
+            raise
+    
+    def _clean_text(self, text: str) -> str:
+        """テキストのクリーニング"""
+        # 複数の空白を単一の空白に
+        text = re.sub(r'\s+', ' ', text)
+        
+        # 特殊文字の除去
+        text = re.sub(r'[^\w\s\-.,!?;:()\[\]{}"\']', '', text)
+        
+        # 行頭・行末の空白を除去
+        text = text.strip()
+        
+        return text
+    
+    def _split_text(self, text: str) -> List[str]:
+        """
+        テキストを意味のあるチャンクに分割
+        文の境界を尊重しながら指定されたサイズに分割
+        """
+        if len(text) <= CHUNK_SIZE:
+            return [text]
+        
+        # 文に分割
+        sentences = sent_tokenize(text)
+        chunks = []
+        current_chunk = ""
+        
+        for sentence in sentences:
+            # 現在のチャンクに文を追加した場合のサイズを確認
+            if len(current_chunk + " " + sentence) <= CHUNK_SIZE:
+                current_chunk += " " + sentence if current_chunk else sentence
+            else:
+                # 現在のチャンクを保存
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                
+                # 文が長すぎる場合は強制的に分割
+                if len(sentence) > CHUNK_SIZE:
+                    words = sentence.split()
+                    temp_chunk = ""
+                    for word in words:
+                        if len(temp_chunk + " " + word) <= CHUNK_SIZE:
+                            temp_chunk += " " + word if temp_chunk else word
+                        else:
+                            if temp_chunk:
+                                chunks.append(temp_chunk.strip())
+                            temp_chunk = word
+                    current_chunk = temp_chunk
+                else:
+                    current_chunk = sentence
+        
+        # 最後のチャンクを追加
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        # オーバーラップの処理
+        if CHUNK_OVERLAP > 0 and len(chunks) > 1:
+            overlapped_chunks = []
+            for i, chunk in enumerate(chunks):
+                if i == 0:
+                    overlapped_chunks.append(chunk)
+                else:
+                    # 前のチャンクの末尾部分を追加
+                    prev_chunk_words = chunks[i-1].split()
+                    overlap_words = prev_chunk_words[-CHUNK_OVERLAP:]
+                    overlapped_chunk = " ".join(overlap_words) + " " + chunk
+                    overlapped_chunks.append(overlapped_chunk)
+            return overlapped_chunks
+        
+        return chunks
+    
+    def _generate_embedding(self, text: str) -> List[float]:
+        """
+        Bedrockを使用してテキストの埋め込みベクトルを生成
+        """
+        try:
+            # テキストの長さ制限
+            if len(text) > 8000:  # Titanの制限
+                text = text[:8000]
+            
+            request_body = {
+                "inputText": text
+            }
+            
+            response = bedrock_runtime.invoke_model(
+                modelId=EMBEDDINGS_MODEL_ID,
+                body=json.dumps(request_body),
+                contentType='application/json'
+            )
+            
+            response_body = json.loads(response['body'].read())
+            return response_body['embedding']
+            
+        except Exception as e:
+            logger.error(f"Error generating embedding: {str(e)}")
+            raise
+    
+    def _save_to_opensearch(self, chunks: List[Dict]) -> None:
+        """
+        チャンクをOpenSearchに保存
+        """
+        try:
+            from opensearchpy import OpenSearch, RequestsHttpConnection
+            from aws_requests_auth.aws_auth import AWSRequestsAuth
+            
+            # OpenSearchクライアントの設定
+            credentials = boto3.Session().get_credentials()
+            awsauth = AWSRequestsAuth(credentials, os.environ['AWS_REGION'], 'es')
+            
+            client = OpenSearch(
+                hosts=[{'host': OPENSEARCH_ENDPOINT.replace('https://', ''), 'port': 443}],
+                http_auth=awsauth,
+                use_ssl=True,
+                verify_certs=True,
+                connection_class=RequestsHttpConnection
+            )
+            
+            # バルクインサート用のデータ準備
+            actions = []
+            for chunk in chunks:
+                action = {
+                    "_index": OPENSEARCH_INDEX,
+                    "_id": chunk['chunk_id'],
+                    "_source": {
+                        "text": chunk['text'],
+                        "embedding": chunk['embedding'],
+                        "metadata": chunk['metadata']
+                    }
+                }
+                actions.append(action)
+            
+            # バルクインサート実行
+            from opensearchpy.helpers import bulk
+            success, failed = bulk(client, actions)
+            
+            logger.info(f"Successfully indexed {success} chunks to OpenSearch")
+            if failed:
+                logger.warning(f"Failed to index {len(failed)} chunks")
+            
+        except Exception as e:
+            logger.error(f"Error saving to OpenSearch: {str(e)}")
+            raise
+    
+    def _save_metadata(self, metadata: Dict) -> None:
+        """
+        文書メタデータをDynamoDBに保存
+        """
+        try:
+            table = dynamodb.Table(METADATA_TABLE)
+            
+            item = {
+                **metadata,
+                'created_at': datetime.now(timezone.utc).isoformat(),
+                'status': 'processed'
+            }
+            
+            table.put_item(Item=item)
+            logger.info(f"Saved metadata for document: {metadata['document_id']}")
+            
+        except Exception as e:
+            logger.error(f"Error saving metadata: {str(e)}")
+            raise
 
 def lambda_handler(event, context):
     """
@@ -234,7 +774,1013 @@ def lambda_handler(event, context):
     S3イベントから文書を処理し、ベクトル化してOpenSearchに保存
     """
     try:
+        processor = DocumentProcessor()
+        results = []
+        
         # S3イベントから情報を抽出
+        for record in event['Records']:
+            # S3イベントの場合
+            if 'eventSource' in record and record['eventSource'] == 'aws:s3':
+                bucket = record['s3']['bucket']['name']
+                key = unquote_plus(record['s3']['object']['key'])
+                
+                # 文書処理実行
+                result = processor.process_document(bucket, key)
+                results.append(result)
+            
+            # SQSイベントの場合（非同期処理）
+            elif 'eventSource' in record and record['eventSource'] == 'aws:sqs':
+                message_body = json.loads(record['body'])
+                bucket = message_body['bucket']
+                key = message_body['key']
+                
+                result = processor.process_document(bucket, key)
+                results.append(result)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Successfully processed documents',
+                'results': results,
+                'processed_count': len(results)
+            })
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in document processing: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e),
+                'message': 'Failed to process documents'
+            })
+        }
+```
+
+#### 2.2 Lambda依存関係設定
+
+```bash
+# requirements.txt
+boto3>=1.34.0
+botocore>=1.34.0
+PyMuPDF>=1.23.0
+python-docx>=0.8.11
+beautifulsoup4>=4.12.0
+pandas>=2.0.0
+nltk>=3.8.0
+spacy>=3.7.0
+opensearch-py>=2.4.0
+aws-requests-auth>=0.4.3
+sentence-transformers>=2.2.0
+```
+
+```bash
+# Lambda レイヤー作成スクリプト
+#!/bin/bash
+# scripts/create-lambda-layer.sh
+
+mkdir -p layer/python
+pip install -r requirements.txt -t layer/python/
+cd layer
+zip -r ../document-processor-layer.zip python/
+cd ..
+
+# Lambda レイヤーの作成
+aws lambda publish-layer-version \
+    --layer-name rag-document-processor-dependencies \
+    --zip-file fileb://document-processor-layer.zip \
+    --compatible-runtimes python3.9 python3.10 python3.11
+```
+
+### ステップ3: 高性能検索・回答生成システムの実装
+
+#### 3.1 RAG検索エンジンLambda関数
+
+```python
+# lambda/rag-search-engine/lambda_function.py
+import json
+import boto3
+import os
+import re
+from typing import List, Dict, Any, Optional, Tuple
+import logging
+from datetime import datetime, timezone
+
+# AWS Services
+bedrock_runtime = boto3.client('bedrock-runtime')
+dynamodb = boto3.resource('dynamodb')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Environment Variables
+OPENSEARCH_ENDPOINT = os.environ.get('OPENSEARCH_ENDPOINT')
+OPENSEARCH_INDEX = os.environ.get('OPENSEARCH_INDEX', 'documents')
+EMBEDDINGS_MODEL_ID = os.environ.get('EMBEDDINGS_MODEL_ID', 'amazon.titan-embed-text-v1')
+LLM_MODEL_ID = os.environ.get('LLM_MODEL_ID', 'anthropic.claude-3-sonnet-20240229-v1:0')
+MAX_CONTEXT_LENGTH = int(os.environ.get('MAX_CONTEXT_LENGTH', '4000'))
+MAX_SEARCH_RESULTS = int(os.environ.get('MAX_SEARCH_RESULTS', '10'))
+SIMILARITY_THRESHOLD = float(os.environ.get('SIMILARITY_THRESHOLD', '0.7'))
+SEARCH_HISTORY_TABLE = os.environ.get('SEARCH_HISTORY_TABLE')
+
+class RAGSearchEngine:
+    """
+    高性能RAG検索エンジン
+    ハイブリッド検索（ベクトル + キーワード）とLLM回答生成を統合
+    """
+    
+    def __init__(self):
+        self.opensearch_client = self._init_opensearch_client()
+    
+    def _init_opensearch_client(self):
+        """OpenSearchクライアントの初期化"""
+        try:
+            from opensearchpy import OpenSearch, RequestsHttpConnection
+            from aws_requests_auth.aws_auth import AWSRequestsAuth
+            
+            credentials = boto3.Session().get_credentials()
+            awsauth = AWSRequestsAuth(credentials, os.environ['AWS_REGION'], 'es')
+            
+            return OpenSearch(
+                hosts=[{'host': OPENSEARCH_ENDPOINT.replace('https://', ''), 'port': 443}],
+                http_auth=awsauth,
+                use_ssl=True,
+                verify_certs=True,
+                connection_class=RequestsHttpConnection
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize OpenSearch client: {str(e)}")
+            raise
+    
+    def search_and_generate(
+        self, 
+        query: str, 
+        user_id: str = 'anonymous',
+        search_type: str = 'hybrid',
+        include_sources: bool = True
+    ) -> Dict[str, Any]:
+        """
+        メインの検索・回答生成機能
+        """
+        try:
+            logger.info(f"Processing query: {query[:100]}...")
+            
+            # クエリの前処理
+            processed_query = self._preprocess_query(query)
+            
+            # 検索実行
+            search_results = self._execute_search(processed_query, search_type)
+            
+            # 結果のリランキング
+            ranked_results = self._rerank_results(processed_query, search_results)
+            
+            # コンテキストの構築
+            context = self._build_context(ranked_results)
+            
+            # LLMでの回答生成
+            answer = self._generate_answer(processed_query, context)
+            
+            # 引用情報の抽出
+            citations = self._extract_citations(ranked_results) if include_sources else []
+            
+            # 検索履歴の保存
+            self._save_search_history(user_id, query, answer, citations)
+            
+            result = {
+                'answer': answer,
+                'citations': citations,
+                'context_used': len(ranked_results),
+                'search_type': search_type,
+                'query_processed': processed_query,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }
+            
+            logger.info(f"Successfully generated answer for query")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in search and generate: {str(e)}")
+            raise
+    
+    def _preprocess_query(self, query: str) -> str:
+        """クエリの前処理"""
+        # 不要な文字の除去
+        query = re.sub(r'[^\w\s\-.,!?;:()\[\]{}"\']', '', query)
+        
+        # 複数の空白を単一の空白に
+        query = re.sub(r'\s+', ' ', query)
+        
+        # 前後の空白を除去
+        query = query.strip()
+        
+        return query
+    
+    def _execute_search(self, query: str, search_type: str) -> List[Dict]:
+        """検索実行（ハイブリッド、ベクトル、キーワード）"""
+        try:
+            if search_type == 'hybrid':
+                return self._hybrid_search(query)
+            elif search_type == 'vector':
+                return self._vector_search(query)
+            elif search_type == 'keyword':
+                return self._keyword_search(query)
+            else:
+                raise ValueError(f"Unsupported search type: {search_type}")
+        except Exception as e:
+            logger.error(f"Search execution failed: {str(e)}")
+            raise
+    
+    def _hybrid_search(self, query: str) -> List[Dict]:
+        """ハイブリッド検索（ベクトル + キーワード検索の組み合わせ）"""
+        # クエリのベクトル化
+        query_embedding = self._generate_query_embedding(query)
+        
+        # ハイブリッド検索クエリ
+        search_body = {
+            "size": MAX_SEARCH_RESULTS,
+            "query": {
+                "hybrid": {
+                    "queries": [
+                        {
+                            "knn": {
+                                "embedding": {
+                                    "vector": query_embedding,
+                                    "k": MAX_SEARCH_RESULTS
+                                }
+                            }
+                        },
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": ["text^2", "metadata.title^3", "metadata.subject"],
+                                "type": "best_fields",
+                                "fuzziness": "AUTO"
+                            }
+                        }
+                    ]
+                }
+            },
+            "highlight": {
+                "fields": {
+                    "text": {
+                        "fragment_size": 150,
+                        "number_of_fragments": 3
+                    }
+                }
+            },
+            "_source": ["text", "metadata", "chunk_id"]
+        }
+        
+        response = self.opensearch_client.search(
+            index=OPENSEARCH_INDEX,
+            body=search_body
+        )
+        
+        return self._process_search_response(response)
+    
+    def _vector_search(self, query: str) -> List[Dict]:
+        """ベクトル検索"""
+        query_embedding = self._generate_query_embedding(query)
+        
+        search_body = {
+            "size": MAX_SEARCH_RESULTS,
+            "query": {
+                "knn": {
+                    "embedding": {
+                        "vector": query_embedding,
+                        "k": MAX_SEARCH_RESULTS
+                    }
+                }
+            },
+            "_source": ["text", "metadata", "chunk_id"]
+        }
+        
+        response = self.opensearch_client.search(
+            index=OPENSEARCH_INDEX,
+            body=search_body
+        )
+        
+        return self._process_search_response(response)
+    
+    def _keyword_search(self, query: str) -> List[Dict]:
+        """キーワード検索"""
+        search_body = {
+            "size": MAX_SEARCH_RESULTS,
+            "query": {
+                "multi_match": {
+                    "query": query,
+                    "fields": ["text^2", "metadata.title^3", "metadata.subject"],
+                    "type": "best_fields",
+                    "fuzziness": "AUTO"
+                }
+            },
+            "highlight": {
+                "fields": {
+                    "text": {
+                        "fragment_size": 150,
+                        "number_of_fragments": 3
+                    }
+                }
+            },
+            "_source": ["text", "metadata", "chunk_id"]
+        }
+        
+        response = self.opensearch_client.search(
+            index=OPENSEARCH_INDEX,
+            body=search_body
+        )
+        
+        return self._process_search_response(response)
+    
+    def _generate_query_embedding(self, query: str) -> List[float]:
+        """クエリのベクトル化"""
+        try:
+            request_body = {
+                "inputText": query
+            }
+            
+            response = bedrock_runtime.invoke_model(
+                modelId=EMBEDDINGS_MODEL_ID,
+                body=json.dumps(request_body),
+                contentType='application/json'
+            )
+            
+            response_body = json.loads(response['body'].read())
+            return response_body['embedding']
+            
+        except Exception as e:
+            logger.error(f"Error generating query embedding: {str(e)}")
+            raise
+    
+    def _process_search_response(self, response: Dict) -> List[Dict]:
+        """検索結果の処理"""
+        results = []
+        
+        for hit in response['hits']['hits']:
+            result = {
+                'score': hit['_score'],
+                'text': hit['_source']['text'],
+                'metadata': hit['_source']['metadata'],
+                'chunk_id': hit['_source']['chunk_id'],
+                'highlights': hit.get('highlight', {})
+            }
+            
+            # 類似度フィルタリング
+            if result['score'] >= SIMILARITY_THRESHOLD:
+                results.append(result)
+        
+        return results
+    
+    def _rerank_results(self, query: str, results: List[Dict]) -> List[Dict]:
+        """結果のリランキング"""
+        # 簡単なスコアベースのリランキング
+        # より高度な実装では、Cross-Encoderやその他のリランキングモデルを使用
+        
+        def calculate_relevance_score(result: Dict) -> float:
+            base_score = result['score']
+            
+            # メタデータによるブースト
+            metadata = result['metadata']
+            boost = 1.0
+            
+            # タイトルマッチボーナス
+            if 'title' in metadata and query.lower() in metadata['title'].lower():
+                boost += 0.3
+            
+            # 最新性ボーナス
+            if 'processed_at' in metadata:
+                try:
+                    processed_date = datetime.fromisoformat(metadata['processed_at'].replace('Z', '+00:00'))
+                    days_old = (datetime.now(timezone.utc) - processed_date).days
+                    if days_old <= 30:  # 30日以内
+                        boost += 0.2
+                except:
+                    pass
+            
+            # ファイルタイプボーナス
+            if metadata.get('file_type') in ['pdf', 'docx']:
+                boost += 0.1
+            
+            return base_score * boost
+        
+        # スコアの再計算とソート
+        for result in results:
+            result['relevance_score'] = calculate_relevance_score(result)
+        
+        return sorted(results, key=lambda x: x['relevance_score'], reverse=True)
+    
+    def _build_context(self, results: List[Dict]) -> str:
+        """検索結果からコンテキストを構築"""
+        context_parts = []
+        current_length = 0
+        
+        for i, result in enumerate(results):
+            text = result['text']
+            metadata = result['metadata']
+            
+            # ソース情報を含める
+            source_info = f"[Source {i+1}]"
+            if 'title' in metadata and metadata['title']:
+                source_info += f" {metadata['title']}"
+            
+            chunk_text = f"{source_info}\n{text}\n"
+            
+            # 長さ制限チェック
+            if current_length + len(chunk_text) > MAX_CONTEXT_LENGTH:
+                break
+            
+            context_parts.append(chunk_text)
+            current_length += len(chunk_text)
+        
+        return "\n".join(context_parts)
+    
+    def _generate_answer(self, query: str, context: str) -> str:
+        """LLMを使用した回答生成"""
+        try:
+            # プロンプトの構築
+            prompt = self._build_answer_prompt(query, context)
+            
+            # Claude 3での回答生成
+            if 'claude' in LLM_MODEL_ID.lower():
+                return self._generate_with_claude(prompt)
+            elif 'titan' in LLM_MODEL_ID.lower():
+                return self._generate_with_titan(prompt)
+            else:
+                raise ValueError(f"Unsupported LLM model: {LLM_MODEL_ID}")
+                
+        except Exception as e:
+            logger.error(f"Error generating answer: {str(e)}")
+            raise
+    
+    def _build_answer_prompt(self, query: str, context: str) -> str:
+        """回答生成用プロンプトの構築"""
+        return f"""あなたは知識豊富なAIアシスタントです。提供されたコンテキストに基づいて、ユーザーの質問に正確で有用な回答を提供してください。
+
+指示:
+1. 提供されたコンテキストの情報のみを使用して回答してください
+2. 情報源を明示し、引用を含めてください
+3. コンテキストに情報がない場合は、その旨を明確に述べてください
+4. 回答は丁寧で分かりやすく、構造化されたものにしてください
+5. 日本語で回答してください
+
+コンテキスト:
+{context}
+
+質問: {query}
+
+回答:"""
+    
+    def _generate_with_claude(self, prompt: str) -> str:
+        """Claude 3での回答生成"""
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1500,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.1,  # 事実に基づく回答のため低めに設定
+            "top_p": 0.9
+        }
+        
+        response = bedrock_runtime.invoke_model(
+            modelId=LLM_MODEL_ID,
+            body=json.dumps(request_body),
+            contentType='application/json'
+        )
+        
+        response_body = json.loads(response['body'].read())
+        return response_body['content'][0]['text']
+    
+    def _generate_with_titan(self, prompt: str) -> str:
+        """Titan での回答生成"""
+        request_body = {
+            "inputText": prompt,
+            "textGenerationConfig": {
+                "maxTokenCount": 1500,
+                "temperature": 0.1,
+                "topP": 0.9,
+                "stopSequences": []
+            }
+        }
+        
+        response = bedrock_runtime.invoke_model(
+            modelId=LLM_MODEL_ID,
+            body=json.dumps(request_body),
+            contentType='application/json'
+        )
+        
+        response_body = json.loads(response['body'].read())
+        return response_body['results'][0]['outputText']
+    
+    def _extract_citations(self, results: List[Dict]) -> List[Dict]:
+        """引用情報の抽出"""
+        citations = []
+        
+        for i, result in enumerate(results[:5]):  # 上位5件のみ
+            metadata = result['metadata']
+            citation = {
+                'source_number': i + 1,
+                'title': metadata.get('title', 'Unknown Title'),
+                'author': metadata.get('author', ''),
+                'file_type': metadata.get('file_type', ''),
+                'chunk_id': result['chunk_id'],
+                'relevance_score': result.get('relevance_score', result['score'])
+            }
+            
+            # 追加情報
+            if 'page_count' in metadata:
+                citation['page_count'] = metadata['page_count']
+            if 'processed_at' in metadata:
+                citation['processed_at'] = metadata['processed_at']
+            
+            citations.append(citation)
+        
+        return citations
+    
+    def _save_search_history(self, user_id: str, query: str, answer: str, citations: List[Dict]) -> None:
+        """検索履歴の保存"""
+        try:
+            if not SEARCH_HISTORY_TABLE:
+                return
+                
+            table = dynamodb.Table(SEARCH_HISTORY_TABLE)
+            
+            item = {
+                'search_id': f"{user_id}_{int(datetime.now().timestamp())}",
+                'user_id': user_id,
+                'query': query,
+                'answer': answer[:1000],  # 長さ制限
+                'citations_count': len(citations),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'ttl': int(datetime.now(timezone.utc).timestamp()) + (30 * 24 * 60 * 60)  # 30日
+            }
+            
+            table.put_item(Item=item)
+            logger.info(f"Saved search history for user: {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Error saving search history: {str(e)}")
+
+def lambda_handler(event, context):
+    """
+    メインのLambda ハンドラー関数
+    """
+    try:
+        # リクエストボディの解析
+        if 'body' in event:
+            request_body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+        else:
+            request_body = event
+        
+        # パラメータの取得
+        query = request_body.get('query', '')
+        user_id = request_body.get('user_id', 'anonymous')
+        search_type = request_body.get('search_type', 'hybrid')
+        include_sources = request_body.get('include_sources', True)
+        
+        # 入力検証
+        if not query.strip():
+            return {
+                'statusCode': 400,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({
+                    'error': 'Query parameter is required'
+                })
+            }
+        
+        # RAG検索エンジンの初期化と実行
+        rag_engine = RAGSearchEngine()
+        result = rag_engine.search_and_generate(
+            query=query,
+            user_id=user_id,
+            search_type=search_type,
+            include_sources=include_sources
+        )
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'success': True,
+                'data': result
+            })
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in RAG search: {str(e)}")
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'success': False,
+                'error': str(e)
+            })
+        }
+```
+
+### ステップ4: フロントエンド実装
+
+#### 4.1 React RAG検索インターフェース
+
+```tsx
+// frontend/rag-search-ui/src/components/RAGSearchInterface.tsx
+'use client';
+
+import React, { useState, useRef, useEffect } from 'react';
+import { Search, FileText, Clock, User, ThumbsUp, ThumbsDown, Copy, Download } from 'lucide-react';
+
+interface SearchResult {
+  answer: string;
+  citations: Citation[];
+  context_used: number;
+  search_type: string;
+  query_processed: string;
+  timestamp: string;
+}
+
+interface Citation {
+  source_number: number;
+  title: string;
+  author: string;
+  file_type: string;
+  chunk_id: string;
+  relevance_score: number;
+  page_count?: number;
+  processed_at?: string;
+}
+
+interface SearchHistory {
+  query: string;
+  answer: string;
+  timestamp: string;
+  citations_count: number;
+}
+
+export default function RAGSearchInterface({ apiEndpoint }: { apiEndpoint: string }) {
+  const [query, setQuery] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [result, setResult] = useState<SearchResult | null>(null);
+  const [searchHistory, setSearchHistory] = useState<SearchHistory[]>([]);
+  const [searchType, setSearchType] = useState<'hybrid' | 'vector' | 'keyword'>('hybrid');
+  const [showSources, setShowSources] = useState(true);
+  const [feedback, setFeedback] = useState<'positive' | 'negative' | null>(null);
+  
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const resultRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    // 検索履歴をローカルストレージから読み込み
+    const savedHistory = localStorage.getItem('ragSearchHistory');
+    if (savedHistory) {
+      setSearchHistory(JSON.parse(savedHistory));
+    }
+  }, []);
+
+  const executeSearch = async () => {
+    if (!query.trim()) return;
+
+    setIsLoading(true);
+    setResult(null);
+    setFeedback(null);
+
+    try {
+      const requestBody = {
+        query: query.trim(),
+        user_id: 'web-user-' + Date.now(),
+        search_type: searchType,
+        include_sources: showSources
+      };
+
+      const response = await fetch(apiEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody)
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (data.success) {
+        setResult(data.data);
+        
+        // 検索履歴を更新
+        const historyItem: SearchHistory = {
+          query: query,
+          answer: data.data.answer.substring(0, 200) + '...',
+          timestamp: data.data.timestamp,
+          citations_count: data.data.citations.length
+        };
+        
+        const updatedHistory = [historyItem, ...searchHistory.slice(0, 9)]; // 最新10件を保持
+        setSearchHistory(updatedHistory);
+        localStorage.setItem('ragSearchHistory', JSON.stringify(updatedHistory));
+        
+        // 結果までスクロール
+        setTimeout(() => {
+          resultRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }, 100);
+      } else {
+        throw new Error(data.error || 'Search failed');
+      }
+
+    } catch (error) {
+      console.error('Search error:', error);
+      alert(`検索エラー: ${error instanceof Error ? error.message : '不明なエラー'}`);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      executeSearch();
+    }
+  };
+
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text);
+    alert('クリップボードにコピーしました');
+  };
+
+  const exportResult = () => {
+    if (!result) return;
+
+    const exportData = {
+      query: query,
+      answer: result.answer,
+      citations: result.citations,
+      timestamp: result.timestamp,
+      search_type: result.search_type
+    };
+
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `rag-search-result-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const submitFeedback = (feedbackType: 'positive' | 'negative') => {
+    setFeedback(feedbackType);
+    // フィードバックをAPIに送信する処理をここに追加
+    console.log(`Feedback submitted: ${feedbackType} for query: ${query}`);
+  };
+
+  return (
+    <div className="max-w-6xl mx-auto p-6 bg-gray-50 min-h-screen">
+      {/* ヘッダー */}
+      <div className="bg-white rounded-lg shadow-md p-6 mb-6">
+        <h1 className="text-3xl font-bold text-gray-800 mb-2">
+          RAG知識検索システム
+        </h1>
+        <p className="text-gray-600">
+          企業文書から正確な情報を検索し、AIが回答を生成します
+        </p>
+      </div>
+
+      {/* 検索インターフェース */}
+      <div className="bg-white rounded-lg shadow-md p-6 mb-6">
+        <div className="flex flex-col space-y-4">
+          {/* 検索設定 */}
+          <div className="flex flex-wrap gap-4 items-center">
+            <div className="flex items-center space-x-2">
+              <label className="text-sm font-medium text-gray-700">検索タイプ:</label>
+              <select
+                value={searchType}
+                onChange={(e) => setSearchType(e.target.value as any)}
+                className="border border-gray-300 rounded-md px-3 py-1 text-sm"
+              >
+                <option value="hybrid">ハイブリッド検索</option>
+                <option value="vector">ベクトル検索</option>
+                <option value="keyword">キーワード検索</option>
+              </select>
+            </div>
+            
+            <div className="flex items-center space-x-2">
+              <label className="text-sm font-medium text-gray-700">
+                <input
+                  type="checkbox"
+                  checked={showSources}
+                  onChange={(e) => setShowSources(e.target.checked)}
+                  className="mr-1"
+                />
+                ソース表示
+              </label>
+            </div>
+          </div>
+
+          {/* 検索入力 */}
+          <div className="flex space-x-2">
+            <div className="flex-1 relative">
+              <input
+                ref={searchInputRef}
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyPress={handleKeyPress}
+                placeholder="質問を入力してください（例：プロジェクトの予算はいくらですか？）"
+                className="w-full border border-gray-300 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={isLoading}
+              />
+              <Search className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={20} />
+            </div>
+            
+            <button
+              onClick={executeSearch}
+              disabled={isLoading || !query.trim()}
+              className="bg-blue-600 text-white px-6 py-3 rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center space-x-2"
+            >
+              {isLoading ? (
+                <>
+                  <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></div>
+                  <span>検索中...</span>
+                </>
+              ) : (
+                <>
+                  <Search size={16} />
+                  <span>検索</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* 検索結果 */}
+      {result && (
+        <div ref={resultRef} className="bg-white rounded-lg shadow-md p-6 mb-6">
+          <div className="flex justify-between items-start mb-4">
+            <h2 className="text-2xl font-semibold text-gray-800">検索結果</h2>
+            <div className="flex space-x-2">
+              <button
+                onClick={() => copyToClipboard(result.answer)}
+                className="p-2 text-gray-500 hover:text-gray-700"
+                title="回答をコピー"
+              >
+                <Copy size={16} />
+              </button>
+              <button
+                onClick={exportResult}
+                className="p-2 text-gray-500 hover:text-gray-700"
+                title="結果をエクスポート"
+              >
+                <Download size={16} />
+              </button>
+            </div>
+          </div>
+
+          {/* 回答 */}
+          <div className="prose max-w-none mb-6">
+            <div className="bg-blue-50 border-l-4 border-blue-400 p-4 rounded-md">
+              <h3 className="text-lg font-medium text-blue-800 mb-2">回答</h3>
+              <div className="text-gray-800 whitespace-pre-wrap">{result.answer}</div>
+            </div>
+          </div>
+
+          {/* メタデータ */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6 text-sm">
+            <div className="bg-gray-50 p-3 rounded-md">
+              <div className="font-medium text-gray-600">検索タイプ</div>
+              <div className="text-gray-800">{result.search_type}</div>
+            </div>
+            <div className="bg-gray-50 p-3 rounded-md">
+              <div className="font-medium text-gray-600">使用コンテキスト</div>
+              <div className="text-gray-800">{result.context_used}件</div>
+            </div>
+            <div className="bg-gray-50 p-3 rounded-md">
+              <div className="font-medium text-gray-600">検索時刻</div>
+              <div className="text-gray-800">
+                {new Date(result.timestamp).toLocaleString('ja-JP')}
+              </div>
+            </div>
+            <div className="bg-gray-50 p-3 rounded-md">
+              <div className="font-medium text-gray-600">ソース数</div>
+              <div className="text-gray-800">{result.citations.length}件</div>
+            </div>
+          </div>
+
+          {/* 引用ソース */}
+          {showSources && result.citations.length > 0 && (
+            <div>
+              <h3 className="text-lg font-semibold text-gray-800 mb-4">参照ソース</h3>
+              <div className="space-y-3">
+                {result.citations.map((citation, index) => (
+                  <div key={index} className="border border-gray-200 rounded-md p-4">
+                    <div className="flex justify-between items-start mb-2">
+                      <div className="flex items-center space-x-2">
+                        <FileText className="text-blue-500" size={16} />
+                        <h4 className="font-medium text-gray-800">
+                          [{citation.source_number}] {citation.title || 'Untitled Document'}
+                        </h4>
+                      </div>
+                      <div className="text-sm text-gray-500">
+                        関連度: {(citation.relevance_score * 100).toFixed(1)}%
+                      </div>
+                    </div>
+                    
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm text-gray-600">
+                      {citation.author && (
+                        <div>
+                          <User size={12} className="inline mr-1" />
+                          {citation.author}
+                        </div>
+                      )}
+                      <div>ファイル: {citation.file_type.toUpperCase()}</div>
+                      {citation.page_count && (
+                        <div>ページ数: {citation.page_count}</div>
+                      )}
+                      {citation.processed_at && (
+                        <div>
+                          <Clock size={12} className="inline mr-1" />
+                          {new Date(citation.processed_at).toLocaleDateString('ja-JP')}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* フィードバック */}
+          <div className="mt-6 pt-4 border-t border-gray-200">
+            <div className="flex items-center justify-between">
+              <div className="text-sm text-gray-600">この回答は役に立ちましたか？</div>
+              <div className="flex space-x-2">
+                <button
+                  onClick={() => submitFeedback('positive')}
+                  className={`p-2 rounded-md ${
+                    feedback === 'positive' 
+                      ? 'bg-green-100 text-green-600' 
+                      : 'text-gray-400 hover:text-green-600'
+                  }`}
+                >
+                  <ThumbsUp size={16} />
+                </button>
+                <button
+                  onClick={() => submitFeedback('negative')}
+                  className={`p-2 rounded-md ${
+                    feedback === 'negative' 
+                      ? 'bg-red-100 text-red-600' 
+                      : 'text-gray-400 hover:text-red-600'
+                  }`}
+                >
+                  <ThumbsDown size={16} />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 検索履歴 */}
+      {searchHistory.length > 0 && (
+        <div className="bg-white rounded-lg shadow-md p-6">
+          <h3 className="text-lg font-semibold text-gray-800 mb-4">最近の検索</h3>
+          <div className="space-y-2">
+            {searchHistory.slice(0, 5).map((item, index) => (
+              <div
+                key={index}
+                className="flex justify-between items-center p-3 bg-gray-50 rounded-md hover:bg-gray-100 cursor-pointer"
+                onClick={() => setQuery(item.query)}
+              >
+                <div className="flex-1">
+                  <div className="font-medium text-gray-800">{item.query}</div>
+                  <div className="text-sm text-gray-600 truncate">{item.answer}</div>
+                </div>
+                <div className="text-xs text-gray-500 ml-4">
+                  {new Date(item.timestamp).toLocaleDateString('ja-JP')}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+```
         for record in event['Records']:
             bucket = record['s3']['bucket']['name']
             key = unquote_plus(record['s3']['object']['key'])

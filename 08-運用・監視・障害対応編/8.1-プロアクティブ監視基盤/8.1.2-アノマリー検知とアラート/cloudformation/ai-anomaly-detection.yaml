@@ -1,0 +1,824 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  AI-Driven Anomaly Detection and Smart Alerting System
+  
+  Advanced monitoring solution leveraging machine learning for:
+  - Predictive anomaly detection using CloudWatch Anomaly Detector
+  - Pattern-based alert noise reduction
+  - Automated severity classification
+  - Context-aware incident correlation
+  - AI-powered root cause analysis with Amazon Bedrock
+  - Smart alert routing and escalation
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: enterprise-app
+    Description: Name of the application being monitored
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Environment name
+
+  # AI Configuration
+  BedrockModel:
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    AllowedValues: 
+      - anthropic.claude-3-sonnet-20240229-v1:0
+      - anthropic.claude-3-haiku-20240307-v1:0
+      - anthropic.claude-instant-v1
+    Description: Bedrock model for AI analysis
+
+  EnableAIAnalysis:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable AI-powered analysis and recommendations
+
+  # Notification Configuration
+  AlertEmail:
+    Type: String
+    Description: Email address for alerts
+
+  SlackWebhookUrl:
+    Type: String
+    Default: ''
+    Description: Slack webhook URL for notifications (optional)
+    NoEcho: true
+
+  PagerDutyRoutingKey:
+    Type: String
+    Default: ''
+    Description: PagerDuty routing key for critical incidents (optional)
+    NoEcho: true
+
+  # Detection Sensitivity
+  AnomalySensitivity:
+    Type: String
+    Default: medium
+    AllowedValues: [low, medium, high]
+    Description: |
+      Anomaly detection sensitivity
+      - low: Fewer false positives, may miss subtle anomalies
+      - medium: Balanced detection
+      - high: More sensitive, may increase noise
+
+  AlertSuppressionWindow:
+    Type: Number
+    Default: 300
+    Description: Alert suppression window in seconds to reduce noise
+
+  # Thresholds
+  CriticalAnomalyThreshold:
+    Type: Number
+    Default: 3
+    Description: Standard deviations for critical anomaly threshold
+
+  WarningAnomalyThreshold:
+    Type: Number
+    Default: 2
+    Description: Standard deviations for warning anomaly threshold
+
+Conditions:
+  EnableAICondition: !Equals [!Ref EnableAIAnalysis, 'true']
+  HasSlackWebhook: !Not [!Equals [!Ref SlackWebhookUrl, '']]
+  HasPagerDuty: !Not [!Equals [!Ref PagerDutyRoutingKey, '']]
+
+Resources:
+  # SNS Topics for Different Alert Types
+  AnomalyAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-anomaly-alerts'
+      DisplayName: 'AI Anomaly Detection Alerts'
+
+  NoiseReductionTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ApplicationName}-${Environment}-filtered-alerts'
+      DisplayName: 'Noise-Reduced Alerts'
+
+  # S3 Bucket for Anomaly Data and Models
+  AnomalyDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ApplicationName}-${Environment}-anomaly-data-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAnomalyData
+            Status: Enabled
+            ExpirationInDays: 90
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt AnomalyAnalysisLambda.Arn
+
+  # DynamoDB Table for Alert State Management
+  AlertStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ApplicationName}-${Environment}-alert-state'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: alert_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: metric_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: alert_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: MetricTimestampIndex
+          KeySchema:
+            - AttributeName: metric_name
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # Lambda Function for AI-Powered Anomaly Analysis
+  AnomalyAnalysisLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ApplicationName}-anomaly-analysis'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt AnomalyAnalysisRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          APPLICATION_NAME: !Ref ApplicationName
+          ENVIRONMENT: !Ref Environment
+          BEDROCK_MODEL: !Ref BedrockModel
+          ENABLE_AI_ANALYSIS: !Ref EnableAIAnalysis
+          ALERT_STATE_TABLE: !Ref AlertStateTable
+          ANOMALY_DATA_BUCKET: !Ref AnomalyDataBucket
+          CRITICAL_THRESHOLD: !Ref CriticalAnomalyThreshold
+          WARNING_THRESHOLD: !Ref WarningAnomalyThreshold
+          SUPPRESSION_WINDOW: !Ref AlertSuppressionWindow
+          FILTERED_ALERTS_TOPIC: !Ref NoiseReductionTopic
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          PAGERDUTY_ROUTING_KEY: !Ref PagerDutyRoutingKey
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import time
+          import hashlib
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          import statistics
+          import urllib.request
+          import urllib.error
+
+          # AWS clients
+          cloudwatch = boto3.client('cloudwatch')
+          dynamodb = boto3.resource('dynamodb')
+          bedrock = boto3.client('bedrock-runtime')
+          sns = boto3.client('sns')
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              """
+              Advanced anomaly detection and analysis system
+              """
+              try:
+                  # Determine event source
+                  if 'Records' in event:
+                      for record in event['Records']:
+                          if record.get('eventSource') == 'aws:cloudwatch':
+                              handle_cloudwatch_alarm(record)
+                          elif record.get('eventSource') == 'aws:s3':
+                              handle_s3_anomaly_data(record)
+                          elif record.get('eventSource') == 'aws:dynamodb':
+                              handle_alert_state_change(record)
+                  else:
+                      # Scheduled execution for proactive analysis
+                      perform_proactive_analysis()
+                  
+                  return {'statusCode': 200, 'body': 'Anomaly analysis completed'}
+                  
+              except Exception as e:
+                  print(f"Error in anomaly analysis: {str(e)}")
+                  send_error_notification(str(e))
+                  return {'statusCode': 500, 'body': str(e)}
+
+          def handle_cloudwatch_alarm(alarm_record):
+              """Process CloudWatch alarm and perform anomaly analysis"""
+              
+              alarm_data = json.loads(alarm_record['Sns']['Message'])
+              
+              # Extract alarm details
+              alarm_name = alarm_data['AlarmName']
+              metric_name = alarm_data['Trigger']['MetricName']
+              namespace = alarm_data['Trigger']['Namespace']
+              state = alarm_data['NewStateValue']
+              
+              # Skip if not in ALARM state
+              if state != 'ALARM':
+                  return
+              
+              # Check for alert suppression
+              if is_alert_suppressed(alarm_name, metric_name):
+                  print(f"Alert suppressed for {alarm_name}")
+                  return
+              
+              # Perform anomaly analysis
+              anomaly_analysis = analyze_anomaly(alarm_data)
+              
+              # AI-powered insights
+              if os.environ.get('ENABLE_AI_ANALYSIS') == 'true':
+                  ai_insights = get_ai_insights(alarm_data, anomaly_analysis)
+                  anomaly_analysis['ai_insights'] = ai_insights
+              
+              # Classify severity
+              severity = classify_anomaly_severity(anomaly_analysis)
+              
+              # Store alert state
+              store_alert_state(alarm_name, metric_name, anomaly_analysis, severity)
+              
+              # Send filtered alert
+              send_smart_alert(alarm_data, anomaly_analysis, severity)
+
+          def analyze_anomaly(alarm_data):
+              """Comprehensive anomaly analysis"""
+              
+              trigger = alarm_data['Trigger']
+              metric_name = trigger['MetricName']
+              namespace = trigger['Namespace']
+              
+              # Get historical data
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(days=7)
+              
+              historical_data = cloudwatch.get_metric_statistics(
+                  Namespace=namespace,
+                  MetricName=metric_name,
+                  Dimensions=trigger.get('Dimensions', []),
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=3600,  # 1 hour periods
+                  Statistics=['Average', 'Maximum', 'Minimum']
+              )
+              
+              if not historical_data['Datapoints']:
+                  return {'error': 'No historical data available'}
+              
+              # Statistical analysis
+              values = [dp['Average'] for dp in historical_data['Datapoints']]
+              
+              analysis = {
+                  'current_value': trigger.get('Value', 0),
+                  'historical_mean': statistics.mean(values),
+                  'historical_std': statistics.stdev(values) if len(values) > 1 else 0,
+                  'percentile_95': statistics.quantiles(values, n=20)[18] if len(values) > 1 else 0,
+                  'trend_analysis': analyze_trend(values),
+                  'seasonality_check': check_seasonality(historical_data['Datapoints']),
+                  'correlation_analysis': find_correlated_metrics(metric_name, namespace),
+                  'pattern_classification': classify_anomaly_pattern(values, trigger.get('Value', 0))
+              }
+              
+              # Calculate anomaly score
+              if analysis['historical_std'] > 0:
+                  z_score = abs((trigger.get('Value', 0) - analysis['historical_mean']) / analysis['historical_std'])
+                  analysis['anomaly_score'] = z_score
+              else:
+                  analysis['anomaly_score'] = 0
+              
+              return analysis
+
+          def get_ai_insights(alarm_data, anomaly_analysis):
+              """Get AI-powered insights using Amazon Bedrock"""
+              
+              try:
+                  prompt = f"""
+                  Analyze this system anomaly and provide actionable insights:
+
+                  Alarm Details:
+                  - Name: {alarm_data['AlarmName']}
+                  - Metric: {alarm_data['Trigger']['MetricName']}
+                  - Current Value: {alarm_data['Trigger'].get('Value', 'N/A')}
+                  - Threshold: {alarm_data['Trigger'].get('Threshold', 'N/A')}
+
+                  Statistical Analysis:
+                  - Anomaly Score (Z-Score): {anomaly_analysis.get('anomaly_score', 'N/A')}
+                  - Historical Mean: {anomaly_analysis.get('historical_mean', 'N/A')}
+                  - Pattern: {anomaly_analysis.get('pattern_classification', 'Unknown')}
+                  - Trend: {anomaly_analysis.get('trend_analysis', 'N/A')}
+
+                  Please provide:
+                  1. Root cause hypothesis (most likely causes)
+                  2. Immediate actions to take
+                  3. Prevention strategies
+                  4. Business impact assessment
+                  5. Similar historical incidents (if any patterns match)
+
+                  Format your response as a structured analysis with clear action items.
+                  """
+                  
+                  response = bedrock.invoke_model(
+                      modelId=os.environ['BEDROCK_MODEL'],
+                      body=json.dumps({
+                          'anthropic_version': 'bedrock-2023-05-31',
+                          'max_tokens': 1500,
+                          'messages': [{'role': 'user', 'content': prompt}]
+                      })
+                  )
+                  
+                  result = json.loads(response['body'].read())
+                  return result['content'][0]['text']
+                  
+              except Exception as e:
+                  print(f"Error getting AI insights: {e}")
+                  return "AI analysis unavailable"
+
+          def classify_anomaly_severity(analysis):
+              """AI-enhanced severity classification"""
+              
+              anomaly_score = analysis.get('anomaly_score', 0)
+              pattern = analysis.get('pattern_classification', 'unknown')
+              trend = analysis.get('trend_analysis', {})
+              
+              # Base severity on anomaly score
+              if anomaly_score >= float(os.environ.get('CRITICAL_THRESHOLD', 3)):
+                  base_severity = 'CRITICAL'
+              elif anomaly_score >= float(os.environ.get('WARNING_THRESHOLD', 2)):
+                  base_severity = 'WARNING'
+              else:
+                  base_severity = 'INFO'
+              
+              # Adjust based on pattern and context
+              severity_modifiers = {
+                  'spike': 1.2,      # Sudden spikes are more concerning
+                  'gradual': 0.8,    # Gradual changes are less urgent
+                  'oscillating': 0.9, # Oscillations might be normal
+                  'sustained': 1.3    # Sustained anomalies are critical
+              }
+              
+              modifier = severity_modifiers.get(pattern, 1.0)
+              adjusted_score = anomaly_score * modifier
+              
+              # Business hours consideration
+              if is_business_hours():
+                  business_impact_multiplier = 1.5
+              else:
+                  business_impact_multiplier = 1.0
+              
+              final_score = adjusted_score * business_impact_multiplier
+              
+              # Final severity determination
+              if final_score >= 4.0:
+                  return 'CRITICAL'
+              elif final_score >= 2.5:
+                  return 'HIGH'
+              elif final_score >= 1.5:
+                  return 'MEDIUM'
+              else:
+                  return 'LOW'
+
+          def is_alert_suppressed(alarm_name, metric_name):
+              """Check if alert should be suppressed to reduce noise"""
+              
+              table = dynamodb.Table(os.environ['ALERT_STATE_TABLE'])
+              suppression_window = int(os.environ.get('SUPPRESSION_WINDOW', 300))
+              
+              # Check for recent similar alerts
+              current_time = int(time.time())
+              cutoff_time = current_time - suppression_window
+              
+              try:
+                  response = table.query(
+                      IndexName='MetricTimestampIndex',
+                      KeyConditionExpression='metric_name = :metric AND #ts > :cutoff',
+                      ExpressionAttributeNames={'#ts': 'timestamp'},
+                      ExpressionAttributeValues={
+                          ':metric': metric_name,
+                          ':cutoff': cutoff_time
+                      }
+                  )
+                  
+                  # If we have recent alerts for this metric, suppress
+                  return len(response['Items']) > 0
+                  
+              except Exception as e:
+                  print(f"Error checking alert suppression: {e}")
+                  return False
+
+          def store_alert_state(alarm_name, metric_name, analysis, severity):
+              """Store alert state for noise reduction and tracking"""
+              
+              table = dynamodb.Table(os.environ['ALERT_STATE_TABLE'])
+              
+              current_time = int(time.time())
+              alert_id = hashlib.md5(f"{alarm_name}_{current_time}".encode()).hexdigest()
+              
+              item = {
+                  'alert_id': alert_id,
+                  'alarm_name': alarm_name,
+                  'metric_name': metric_name,
+                  'timestamp': current_time,
+                  'severity': severity,
+                  'anomaly_score': Decimal(str(analysis.get('anomaly_score', 0))),
+                  'pattern': analysis.get('pattern_classification', 'unknown'),
+                  'ttl': current_time + (7 * 24 * 3600)  # 7 days TTL
+              }
+              
+              # Add AI insights if available
+              if 'ai_insights' in analysis:
+                  item['ai_insights'] = analysis['ai_insights'][:1000]  # Truncate for DynamoDB
+              
+              table.put_item(Item=item)
+
+          def send_smart_alert(alarm_data, analysis, severity):
+              """Send intelligent, context-aware alerts"""
+              
+              # Create enhanced alert message
+              message = create_enhanced_alert_message(alarm_data, analysis, severity)
+              
+              # Send to appropriate channels based on severity
+              if severity in ['CRITICAL', 'HIGH']:
+                  # Send to all channels
+                  send_sns_notification(message, severity)
+                  if os.environ.get('SLACK_WEBHOOK_URL'):
+                      send_slack_notification(message, severity)
+                  if os.environ.get('PAGERDUTY_ROUTING_KEY') and severity == 'CRITICAL':
+                      send_pagerduty_notification(message, severity)
+              elif severity == 'MEDIUM':
+                  # Send to SNS and Slack only
+                  send_sns_notification(message, severity)
+                  if os.environ.get('SLACK_WEBHOOK_URL'):
+                      send_slack_notification(message, severity)
+              else:
+                  # Low severity - just log
+                  print(f"Low severity alert: {message['title']}")
+
+          def create_enhanced_alert_message(alarm_data, analysis, severity):
+              """Create rich, actionable alert message"""
+              
+              return {
+                  'title': f"🚨 {severity} Anomaly: {alarm_data['AlarmName']}",
+                  'metric': alarm_data['Trigger']['MetricName'],
+                  'current_value': alarm_data['Trigger'].get('Value', 'N/A'),
+                  'threshold': alarm_data['Trigger'].get('Threshold', 'N/A'),
+                  'anomaly_score': round(analysis.get('anomaly_score', 0), 2),
+                  'pattern': analysis.get('pattern_classification', 'Unknown'),
+                  'ai_insights': analysis.get('ai_insights', 'No AI insights available'),
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'severity': severity,
+                  'runbook_url': generate_runbook_url(alarm_data['AlarmName']),
+                  'dashboard_url': f"https://console.aws.amazon.com/cloudwatch/home#alarmsV2:alarm/{alarm_data['AlarmName']}"
+              }
+
+          # Helper functions
+          def analyze_trend(values):
+              """Analyze trend in metric values"""
+              if len(values) < 3:
+                  return {'trend': 'insufficient_data'}
+              
+              # Simple linear regression
+              n = len(values)
+              x = list(range(n))
+              
+              slope = (n * sum(x[i] * values[i] for i in range(n)) - sum(x) * sum(values)) / (n * sum(x[i]**2 for i in range(n)) - sum(x)**2)
+              
+              if slope > 0.1:
+                  return {'trend': 'increasing', 'slope': slope}
+              elif slope < -0.1:
+                  return {'trend': 'decreasing', 'slope': slope}
+              else:
+                  return {'trend': 'stable', 'slope': slope}
+
+          def check_seasonality(datapoints):
+              """Check for seasonal patterns in the data"""
+              # Simple day-of-week seasonality check
+              day_values = {}
+              for dp in datapoints:
+                  day = dp['Timestamp'].weekday()
+                  if day not in day_values:
+                      day_values[day] = []
+                  day_values[day].append(dp['Average'])
+              
+              if len(day_values) >= 7:
+                  day_means = {day: statistics.mean(values) for day, values in day_values.items()}
+                  variance = statistics.variance(day_means.values()) if len(day_means) > 1 else 0
+                  return {'seasonal_pattern': variance > 0.1, 'day_variance': variance}
+              
+              return {'seasonal_pattern': False}
+
+          def find_correlated_metrics(metric_name, namespace):
+              """Find correlated metrics that might explain the anomaly"""
+              # This is a simplified implementation
+              # In practice, you'd maintain a correlation matrix
+              correlations = {
+                  'CPUUtilization': ['NetworkIn', 'NetworkOut', 'DiskReadOps'],
+                  'TargetResponseTime': ['CPUUtilization', 'MemoryUtilization'],
+                  'HTTPCode_Target_5XX_Count': ['TargetResponseTime', 'HealthyHostCount']
+              }
+              
+              return correlations.get(metric_name, [])
+
+          def classify_anomaly_pattern(historical_values, current_value):
+              """Classify the type of anomaly pattern"""
+              if not historical_values:
+                  return 'unknown'
+              
+              mean_val = statistics.mean(historical_values)
+              std_val = statistics.stdev(historical_values) if len(historical_values) > 1 else 0
+              
+              if std_val == 0:
+                  return 'constant'
+              
+              z_score = abs(current_value - mean_val) / std_val
+              
+              # Check recent trend
+              recent_values = historical_values[-5:] if len(historical_values) >= 5 else historical_values
+              if all(recent_values[i] < recent_values[i+1] for i in range(len(recent_values)-1)):
+                  return 'gradual_increase'
+              elif all(recent_values[i] > recent_values[i+1] for i in range(len(recent_values)-1)):
+                  return 'gradual_decrease'
+              elif z_score > 3:
+                  return 'spike'
+              elif z_score > 2:
+                  return 'elevated'
+              else:
+                  return 'normal_variation'
+
+          def is_business_hours():
+              """Check if current time is during business hours (JST)"""
+              import pytz
+              jst = pytz.timezone('Asia/Tokyo')
+              now = datetime.now(jst)
+              
+              # Business hours: 9 AM to 6 PM, Monday to Friday
+              if now.weekday() < 5 and 9 <= now.hour < 18:
+                  return True
+              return False
+
+          def generate_runbook_url(alarm_name):
+              """Generate runbook URL based on alarm name"""
+              base_url = "https://your-company.wiki.com/runbooks/"
+              # Simple mapping - in practice, this would be more sophisticated
+              runbook_mapping = {
+                  'HighLatency': 'performance-troubleshooting',
+                  'HighErrorRate': 'error-investigation',
+                  'LowAvailability': 'availability-restoration'
+              }
+              
+              for key, runbook in runbook_mapping.items():
+                  if key in alarm_name:
+                      return f"{base_url}{runbook}"
+              
+              return f"{base_url}general-incident-response"
+
+          def send_sns_notification(message, severity):
+              """Send notification via SNS"""
+              topic_arn = os.environ['FILTERED_ALERTS_TOPIC']
+              
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Subject=message['title'],
+                  Message=json.dumps(message, indent=2)
+              )
+
+          def send_slack_notification(message, severity):
+              """Send formatted notification to Slack"""
+              webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
+              if not webhook_url:
+                  return
+              
+              color_map = {
+                  'CRITICAL': '#FF0000',
+                  'HIGH': '#FF8800',
+                  'MEDIUM': '#FFCC00',
+                  'LOW': '#36A64F'
+              }
+              
+              slack_message = {
+                  'attachments': [{
+                      'color': color_map.get(severity, '#36A64F'),
+                      'title': message['title'],
+                      'fields': [
+                          {'title': 'Metric', 'value': message['metric'], 'short': True},
+                          {'title': 'Current Value', 'value': str(message['current_value']), 'short': True},
+                          {'title': 'Threshold', 'value': str(message['threshold']), 'short': True},
+                          {'title': 'Anomaly Score', 'value': str(message['anomaly_score']), 'short': True},
+                          {'title': 'Pattern', 'value': message['pattern'], 'short': True},
+                          {'title': 'Severity', 'value': severity, 'short': True},
+                          {'title': 'AI Insights', 'value': message['ai_insights'][:500] + '...', 'short': False}
+                      ],
+                      'actions': [
+                          {'type': 'button', 'text': 'View Dashboard', 'url': message['dashboard_url']},
+                          {'type': 'button', 'text': 'Runbook', 'url': message['runbook_url']}
+                      ]
+                  }]
+              }
+              
+              try:
+                  req = urllib.request.Request(
+                      webhook_url,
+                      data=json.dumps(slack_message).encode(),
+                      headers={'Content-Type': 'application/json'}
+                  )
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  print(f"Error sending Slack notification: {e}")
+
+          def send_pagerduty_notification(message, severity):
+              """Send high-priority notification to PagerDuty"""
+              # PagerDuty integration would go here
+              print(f"PagerDuty notification: {message['title']}")
+
+          def send_error_notification(error_message):
+              """Send error notification when the Lambda itself fails"""
+              try:
+                  sns.publish(
+                      TopicArn=os.environ['FILTERED_ALERTS_TOPIC'],
+                      Subject='Anomaly Detection System Error',
+                      Message=f"Error in anomaly detection system: {error_message}"
+                  )
+              except Exception:
+                  print(f"Failed to send error notification: {error_message}")
+
+          def perform_proactive_analysis():
+              """Perform proactive analysis of system metrics"""
+              # This would run on a schedule to proactively identify potential issues
+              print("Performing proactive anomaly analysis...")
+              
+              # Get recent metrics and analyze for early warning signs
+              # Implementation would include predictive analysis
+              pass
+
+          def handle_s3_anomaly_data(s3_record):
+              """Process new anomaly data uploaded to S3"""
+              bucket = s3_record['s3']['bucket']['name']
+              key = s3_record['s3']['object']['key']
+              
+              # Process anomaly model updates or training data
+              print(f"Processing anomaly data: s3://{bucket}/{key}")
+
+          def handle_alert_state_change(dynamodb_record):
+              """Handle changes in alert state for correlation analysis"""
+              if dynamodb_record['eventName'] in ['INSERT', 'MODIFY']:
+                  # Analyze alert patterns and correlations
+                  print("Analyzing alert correlations...")
+
+  # IAM Role for Anomaly Analysis Lambda
+  AnomalyAnalysisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AnomalyAnalysisPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:DescribeAlarms
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModel}'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: 
+                  - !GetAtt AlertStateTable.Arn
+                  - !Sub '${AlertStateTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${AnomalyDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: 
+                  - !Ref AnomalyAlertsTopic
+                  - !Ref NoiseReductionTopic
+
+  # Permission for S3 to invoke Lambda
+  AnomalyAnalysisS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnomalyAnalysisLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${AnomalyDataBucket}/*'
+
+  # CloudWatch Anomaly Detectors for Key Metrics
+  CPUAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      MetricName: 'CPUUtilization'
+      Namespace: 'AWS/EC2'
+      Stat: Average
+
+  LatencyAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      MetricName: 'TargetResponseTime'
+      Namespace: 'AWS/ApplicationELB'
+      Stat: Average
+
+  ErrorRateAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      MetricName: 'HTTPCode_Target_5XX_Count'
+      Namespace: 'AWS/ApplicationELB'
+      Stat: Sum
+
+  # Composite Alarms for Complex Scenarios
+  SystemHealthCompositeAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: !Sub '${ApplicationName}-${Environment}-SystemHealth'
+      AlarmDescription: 'Composite alarm for overall system health'
+      AlarmRule: !Sub |
+        ALARM("${ApplicationName}-${Environment}-HighLatency") OR 
+        ALARM("${ApplicationName}-${Environment}-HighErrorRate") OR 
+        ALARM("${ApplicationName}-${Environment}-LowAvailability")
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref AnomalyAlertsTopic
+
+  # SNS Subscription to trigger Lambda
+  AnomalyAnalysisSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AnomalyAlertsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt AnomalyAnalysisLambda.Arn
+
+  # Permission for SNS to invoke Lambda
+  AnomalyAnalysisLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnomalyAnalysisLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AnomalyAlertsTopic
+
+Outputs:
+  AnomalyAnalysisLambdaArn:
+    Description: ARN of the anomaly analysis Lambda function
+    Value: !GetAtt AnomalyAnalysisLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AnomalyAnalysisLambda'
+
+  AnomalyAlertsTopicArn:
+    Description: ARN of the anomaly alerts SNS topic
+    Value: !Ref AnomalyAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AnomalyAlertsTopic'
+
+  NoiseReductionTopicArn:
+    Description: ARN of the noise-reduced alerts SNS topic
+    Value: !Ref NoiseReductionTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NoiseReductionTopic'
+
+  AlertStateTableName:
+    Description: Name of the alert state DynamoDB table
+    Value: !Ref AlertStateTable
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertStateTable'
+
+  AnomalyDataBucketName:
+    Description: Name of the anomaly data S3 bucket
+    Value: !Ref AnomalyDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AnomalyDataBucket'

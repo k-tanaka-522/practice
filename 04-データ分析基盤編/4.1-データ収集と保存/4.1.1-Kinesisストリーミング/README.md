@@ -1167,3 +1167,657 @@ partition_key = f"{user_id}#{session_id}"  # より細かい単位での順序�
 2. **ログ分析基盤**: アプリケーションログ集約・分析
 3. **リアルタイム推奨**: ユーザー行動ベース推奨システム
 4. **異常検知**: リアルタイム異常検知・アラート
+
+## 🚀 高度な実装パターン
+
+### エンタープライズ級データパイプライン
+複数のデータソースからの統合ストリーミング処理を実装します。
+
+```python
+# src/advanced/enterprise_pipeline.py
+import boto3
+import json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional
+import logging
+
+class EnterpriseKinesisHandler:
+    """エンタープライズ級Kinesisハンドラー"""
+    
+    def __init__(self, config: Dict):
+        self.kinesis = boto3.client('kinesis')
+        self.cloudwatch = boto3.client('cloudwatch')
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        self.executor = ThreadPoolExecutor(max_workers=10)
+    
+    async def multi_source_ingestion(self, sources: List[Dict]):
+        """複数ソースからの並列データ取り込み"""
+        tasks = []
+        for source in sources:
+            task = asyncio.create_task(
+                self._process_source(source)
+            )
+            tasks.append(task)
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return self._aggregate_results(results)
+    
+    async def _process_source(self, source: Dict):
+        """個別ソースの処理"""
+        source_type = source['type']
+        
+        if source_type == 'database':
+            return await self._process_database_source(source)
+        elif source_type == 'api':
+            return await self._process_api_source(source)
+        elif source_type == 'file':
+            return await self._process_file_source(source)
+        else:
+            raise ValueError(f"Unsupported source type: {source_type}")
+    
+    def advanced_partitioning_strategy(self, record: Dict) -> str:
+        """高度なパーティショニング戦略"""
+        # ビジネス要件に基づいた複合パーティションキー
+        user_tier = record.get('user_tier', 'standard')
+        geo_region = record.get('geo_region', 'unknown')
+        event_priority = record.get('priority', 'normal')
+        
+        # 負荷分散とデータ局所性を考慮
+        partition_components = [
+            user_tier[:3],  # ユーザー階層
+            geo_region[:2], # 地理的リージョン
+            str(hash(record.get('user_id', '')) % 1000).zfill(3)  # 分散ハッシュ
+        ]
+        
+        return '-'.join(partition_components)
+    
+    def intelligent_batching(self, records: List[Dict]) -> List[List[Dict]]:
+        """インテリジェントバッチング"""
+        batches = []
+        current_batch = []
+        current_size = 0
+        max_batch_size = self.config.get('max_batch_size', 500)
+        max_payload_size = self.config.get('max_payload_size', 1024 * 1024)  # 1MB
+        
+        for record in records:
+            record_size = len(json.dumps(record).encode('utf-8'))
+            
+            # サイズまたは件数の制限チェック
+            if (current_size + record_size > max_payload_size or 
+                len(current_batch) >= max_batch_size):
+                if current_batch:
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_size = 0
+            
+            current_batch.append(record)
+            current_size += record_size
+        
+        if current_batch:
+            batches.append(current_batch)
+        
+        return batches
+    
+    def circuit_breaker_pattern(self, func, max_failures=5, timeout=60):
+        """サーキットブレーカーパターンの実装"""
+        failure_count = 0
+        last_failure_time = 0
+        
+        def wrapper(*args, **kwargs):
+            nonlocal failure_count, last_failure_time
+            
+            # サーキットブレーカーが開いている場合
+            if failure_count >= max_failures:
+                if time.time() - last_failure_time < timeout:
+                    raise Exception("Circuit breaker is OPEN")
+                else:
+                    # タイムアウト後にリセット
+                    failure_count = 0
+            
+            try:
+                result = func(*args, **kwargs)
+                failure_count = 0  # 成功時にリセット
+                return result
+            except Exception as e:
+                failure_count += 1
+                last_failure_time = time.time()
+                raise e
+        
+        return wrapper
+
+# 使用例
+async def main():
+    config = {
+        'max_batch_size': 500,
+        'max_payload_size': 1024 * 1024,
+        'stream_name': 'enterprise-data-stream'
+    }
+    
+    handler = EnterpriseKinesisHandler(config)
+    
+    sources = [
+        {'type': 'database', 'connection': 'postgres://...'},
+        {'type': 'api', 'endpoint': 'https://api.example.com/data'},
+        {'type': 'file', 'path': 's3://bucket/data/'}
+    ]
+    
+    results = await handler.multi_source_ingestion(sources)
+    print(f"Processed {len(results)} sources")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### データ品質監視システム
+
+```python
+# src/advanced/data_quality_monitor.py
+import boto3
+import pandas as pd
+from datetime import datetime, timedelta
+import numpy as np
+from typing import Dict, List, Tuple
+import logging
+
+class DataQualityMonitor:
+    """データ品質リアルタイム監視"""
+    
+    def __init__(self, stream_name: str):
+        self.stream_name = stream_name
+        self.kinesis = boto3.client('kinesis')
+        self.cloudwatch = boto3.client('cloudwatch')
+        self.logger = logging.getLogger(__name__)
+        
+        # 品質メトリクス閾値
+        self.quality_thresholds = {
+            'completeness': 0.95,      # 完全性: 95%以上
+            'uniqueness': 0.98,        # 一意性: 98%以上
+            'validity': 0.99,          # 妥当性: 99%以上
+            'consistency': 0.97,       # 一貫性: 97%以上
+            'timeliness': 300          # 適時性: 5分以内
+        }
+    
+    def evaluate_data_quality(self, records: List[Dict]) -> Dict:
+        """データ品質評価の実行"""
+        if not records:
+            return self._empty_quality_report()
+        
+        df = pd.DataFrame(records)
+        
+        quality_metrics = {
+            'completeness': self._check_completeness(df),
+            'uniqueness': self._check_uniqueness(df),
+            'validity': self._check_validity(df),
+            'consistency': self._check_consistency(df),
+            'timeliness': self._check_timeliness(df),
+            'sample_size': len(records),
+            'evaluation_time': datetime.utcnow().isoformat()
+        }
+        
+        # 総合品質スコア計算
+        quality_metrics['overall_score'] = self._calculate_overall_score(quality_metrics)
+        
+        # 異常検知
+        anomalies = self._detect_anomalies(quality_metrics)
+        quality_metrics['anomalies'] = anomalies
+        
+        # CloudWatchメトリクス送信
+        self._send_quality_metrics(quality_metrics)
+        
+        return quality_metrics
+    
+    def _check_completeness(self, df: pd.DataFrame) -> float:
+        """完全性チェック: 必須フィールドの欠損率"""
+        required_fields = ['user_id', 'timestamp', 'event_type']
+        
+        if df.empty:
+            return 0.0
+        
+        total_cells = len(df) * len(required_fields)
+        missing_cells = 0
+        
+        for field in required_fields:
+            if field in df.columns:
+                missing_cells += df[field].isna().sum()
+            else:
+                missing_cells += len(df)  # フィールド自体が存在しない
+        
+        completeness = 1 - (missing_cells / total_cells)
+        return max(0.0, completeness)
+    
+    def _check_uniqueness(self, df: pd.DataFrame) -> float:
+        """一意性チェック: 重複レコードの検出"""
+        if df.empty or 'user_id' not in df.columns:
+            return 1.0
+        
+        unique_combinations = df.drop_duplicates(
+            subset=['user_id', 'timestamp', 'event_type']
+        )
+        
+        uniqueness = len(unique_combinations) / len(df)
+        return uniqueness
+    
+    def _check_validity(self, df: pd.DataFrame) -> float:
+        """妥当性チェック: データ形式・範囲の検証"""
+        if df.empty:
+            return 1.0
+        
+        valid_count = 0
+        total_checks = 0
+        
+        # タイムスタンプの妥当性
+        if 'timestamp' in df.columns:
+            valid_timestamps = pd.to_datetime(df['timestamp'], errors='coerce').notna()
+            valid_count += valid_timestamps.sum()
+            total_checks += len(df)
+        
+        # 数値フィールドの妥当性
+        if 'amount' in df.columns:
+            valid_amounts = (
+                pd.to_numeric(df['amount'], errors='coerce').notna() &
+                (pd.to_numeric(df['amount'], errors='coerce') >= 0)
+            )
+            valid_count += valid_amounts.sum()
+            total_checks += len(df)
+        
+        # イベントタイプの妥当性
+        if 'event_type' in df.columns:
+            valid_event_types = [
+                'login', 'logout', 'purchase', 'view', 'click', 'search'
+            ]
+            valid_events = df['event_type'].isin(valid_event_types)
+            valid_count += valid_events.sum()
+            total_checks += len(df)
+        
+        return valid_count / total_checks if total_checks > 0 else 1.0
+    
+    def _check_consistency(self, df: pd.DataFrame) -> float:
+        """一貫性チェック: ビジネスルールの検証"""
+        if df.empty:
+            return 1.0
+        
+        consistent_count = 0
+        total_checks = 0
+        
+        # 購入イベントにはamountが必要
+        purchase_events = df[df['event_type'] == 'purchase'] if 'event_type' in df.columns else pd.DataFrame()
+        if not purchase_events.empty:
+            has_amount = purchase_events['amount'].notna() if 'amount' in purchase_events.columns else pd.Series([False] * len(purchase_events))
+            consistent_count += has_amount.sum()
+            total_checks += len(purchase_events)
+        
+        # ログインとログアウトの対応
+        user_sessions = df.groupby('user_id')['event_type'].apply(list) if 'user_id' in df.columns and 'event_type' in df.columns else pd.Series([])
+        for session_events in user_sessions:
+            login_count = session_events.count('login')
+            logout_count = session_events.count('logout')
+            if login_count > 0:
+                consistent_count += 1 if logout_count <= login_count else 0
+                total_checks += 1
+        
+        return consistent_count / total_checks if total_checks > 0 else 1.0
+    
+    def _check_timeliness(self, df: pd.DataFrame) -> float:
+        """適時性チェック: データの遅延時間"""
+        if df.empty or 'timestamp' in df.columns:
+            return 1.0
+        
+        current_time = datetime.utcnow()
+        timestamps = pd.to_datetime(df['timestamp'], errors='coerce')
+        
+        # 遅延時間計算（秒）
+        delays = [(current_time - ts).total_seconds() for ts in timestamps if pd.notna(ts)]
+        
+        if not delays:
+            return 1.0
+        
+        avg_delay = np.mean(delays)
+        timeliness_score = max(0, 1 - (avg_delay / 3600))  # 1時間を基準
+        
+        return timeliness_score
+    
+    def _detect_anomalies(self, metrics: Dict) -> List[Dict]:
+        """異常検知"""
+        anomalies = []
+        
+        for metric_name, threshold in self.quality_thresholds.items():
+            if metric_name in metrics:
+                value = metrics[metric_name]
+                
+                if metric_name == 'timeliness':
+                    if value < (1 - threshold / 3600):  # 遅延が閾値を超える
+                        anomalies.append({
+                            'type': 'timeliness_violation',
+                            'metric': metric_name,
+                            'value': value,
+                            'threshold': threshold,
+                            'severity': 'high' if value < 0.5 else 'medium'
+                        })
+                else:
+                    if value < threshold:
+                        anomalies.append({
+                            'type': 'quality_degradation',
+                            'metric': metric_name,
+                            'value': value,
+                            'threshold': threshold,
+                            'severity': 'high' if value < threshold * 0.8 else 'medium'
+                        })
+        
+        return anomalies
+
+# 実用的な品質監視Lambda関数
+def quality_monitor_lambda_handler(event, context):
+    """Kinesisストリーム品質監視Lambda"""
+    monitor = DataQualityMonitor('enterprise-data-stream')
+    
+    # Kinesisレコードからデータ抽出
+    records = []
+    for record in event['Records']:
+        try:
+            data = json.loads(base64.b64decode(record['kinesis']['data']))
+            records.append(data)
+        except Exception as e:
+            print(f"Error processing record: {e}")
+    
+    # 品質評価実行
+    quality_report = monitor.evaluate_data_quality(records)
+    
+    # 異常があればアラート送信
+    if quality_report['anomalies']:
+        send_quality_alert(quality_report)
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps(quality_report, default=str)
+    }
+```
+
+### 🔧 運用自動化スクリプト
+
+```bash
+#!/bin/bash
+# scripts/kinesis_operations.sh - Kinesis運用自動化スクリプト
+
+set -e
+
+STREAM_NAME="${1:-kinesis-streaming-dev-data-stream}"
+ENVIRONMENT="${2:-dev}"
+
+# カラー出力
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# ストリーム健全性チェック
+check_stream_health() {
+    print_status "Checking stream health for: $STREAM_NAME"
+    
+    # ストリーム存在確認
+    if ! aws kinesis describe-stream --stream-name "$STREAM_NAME" >/dev/null 2>&1; then
+        print_error "Stream $STREAM_NAME does not exist!"
+        return 1
+    fi
+    
+    # ストリーム状態確認
+    status=$(aws kinesis describe-stream --stream-name "$STREAM_NAME" \
+        --query 'StreamDescription.StreamStatus' --output text)
+    
+    if [ "$status" != "ACTIVE" ]; then
+        print_warning "Stream status is $status (expected: ACTIVE)"
+        return 1
+    fi
+    
+    print_status "Stream $STREAM_NAME is healthy (status: $status)"
+    return 0
+}
+
+# メトリクス収集と分析
+collect_metrics() {
+    print_status "Collecting metrics for stream: $STREAM_NAME"
+    
+    end_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    start_time=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+    
+    # 受信レコード数
+    incoming_records=$(aws cloudwatch get-metric-statistics \
+        --namespace AWS/Kinesis \
+        --metric-name IncomingRecords \
+        --dimensions Name=StreamName,Value="$STREAM_NAME" \
+        --start-time "$start_time" \
+        --end-time "$end_time" \
+        --period 3600 \
+        --statistics Sum \
+        --query 'Datapoints[0].Sum' \
+        --output text)
+    
+    # 送信レコード数
+    outgoing_records=$(aws cloudwatch get-metric-statistics \
+        --namespace AWS/Kinesis \
+        --metric-name OutgoingRecords \
+        --dimensions Name=StreamName,Value="$STREAM_NAME" \
+        --start-time "$start_time" \
+        --end-time "$end_time" \
+        --period 3600 \
+        --statistics Sum \
+        --query 'Datapoints[0].Sum' \
+        --output text)
+    
+    echo "=== Stream Metrics (Last 1 Hour) ==="
+    echo "Incoming Records: ${incoming_records:-0}"
+    echo "Outgoing Records: ${outgoing_records:-0}"
+    
+    # スロットリングチェック
+    throttled_records=$(aws cloudwatch get-metric-statistics \
+        --namespace AWS/Kinesis \
+        --metric-name WriteProvisionedThroughputExceeded \
+        --dimensions Name=StreamName,Value="$STREAM_NAME" \
+        --start-time "$start_time" \
+        --end-time "$end_time" \
+        --period 3600 \
+        --statistics Sum \
+        --query 'Datapoints[0].Sum' \
+        --output text)
+    
+    if [ "$throttled_records" != "None" ] && [ "$throttled_records" -gt 0 ]; then
+        print_warning "Throttling detected: $throttled_records throttled requests"
+    fi
+}
+
+# 自動スケーリング
+auto_scale_stream() {
+    current_shards=$(aws kinesis describe-stream --stream-name "$STREAM_NAME" \
+        --query 'StreamDescription.Shards | length(@)' --output text)
+    
+    print_status "Current shard count: $current_shards"
+    
+    # スロットリングメトリクスに基づくスケーリング判定
+    end_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    start_time=$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+    
+    throttled_records=$(aws cloudwatch get-metric-statistics \
+        --namespace AWS/Kinesis \
+        --metric-name WriteProvisionedThroughputExceeded \
+        --dimensions Name=StreamName,Value="$STREAM_NAME" \
+        --start-time "$start_time" \
+        --end-time "$end_time" \
+        --period 600 \
+        --statistics Sum \
+        --query 'Datapoints[0].Sum' \
+        --output text)
+    
+    if [ "$throttled_records" != "None" ] && [ "$throttled_records" -gt 100 ]; then
+        new_shard_count=$((current_shards + 1))
+        print_status "Scaling up: $current_shards -> $new_shard_count shards"
+        
+        aws kinesis update-shard-count \
+            --stream-name "$STREAM_NAME" \
+            --target-shard-count "$new_shard_count" \
+            --scaling-type UNIFORM_SCALING
+    fi
+}
+
+# データ品質レポート生成
+generate_quality_report() {
+    print_status "Generating data quality report..."
+    
+    # 最新のレコードサンプルを取得して品質分析
+    python3 << EOF
+import boto3
+import json
+from datetime import datetime
+
+kinesis = boto3.client('kinesis')
+
+# ストリーム情報取得
+response = kinesis.describe_stream(StreamName='$STREAM_NAME')
+shards = response['StreamDescription']['Shards']
+
+sample_records = []
+for shard in shards[:2]:  # 最初の2シャードのみサンプリング
+    try:
+        iterator_response = kinesis.get_shard_iterator(
+            StreamName='$STREAM_NAME',
+            ShardId=shard['ShardId'],
+            ShardIteratorType='LATEST'
+        )
+        
+        records_response = kinesis.get_records(
+            ShardIterator=iterator_response['ShardIterator'],
+            Limit=100
+        )
+        
+        for record in records_response['Records']:
+            try:
+                data = json.loads(record['Data'])
+                sample_records.append(data)
+            except:
+                pass
+    except:
+        pass
+
+print(f"=== Data Quality Report ===")
+print(f"Sample Size: {len(sample_records)}")
+
+if sample_records:
+    # フィールド完全性チェック
+    required_fields = ['user_id', 'timestamp', 'event_type']
+    completeness = {}
+    
+    for field in required_fields:
+        present = sum(1 for record in sample_records if field in record and record[field])
+        completeness[field] = (present / len(sample_records)) * 100
+        print(f"{field} completeness: {completeness[field]:.1f}%")
+    
+    # イベントタイプ分布
+    event_types = {}
+    for record in sample_records:
+        event_type = record.get('event_type', 'unknown')
+        event_types[event_type] = event_types.get(event_type, 0) + 1
+    
+    print("Event Type Distribution:")
+    for event_type, count in sorted(event_types.items()):
+        percentage = (count / len(sample_records)) * 100
+        print(f"  {event_type}: {count} ({percentage:.1f}%)")
+else:
+    print("No records found for analysis")
+EOF
+}
+
+# メイン実行
+main() {
+    case "${3:-health}" in
+        "health")
+            check_stream_health
+            ;;
+        "metrics")
+            collect_metrics
+            ;;
+        "scale")
+            auto_scale_stream
+            ;;
+        "quality")
+            generate_quality_report
+            ;;
+        "full")
+            check_stream_health && \
+            collect_metrics && \
+            generate_quality_report
+            ;;
+        *)
+            echo "Usage: $0 <stream-name> <environment> <action>"
+            echo "Actions: health, metrics, scale, quality, full"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
+```
+
+## 📊 高度な監視・分析テンプレート
+
+### カスタムダッシュボード定義
+
+```json
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "x": 0, "y": 0,
+      "width": 12, "height": 6,
+      "properties": {
+        "metrics": [
+          ["AWS/Kinesis", "IncomingRecords", "StreamName", "kinesis-streaming-dev-data-stream"],
+          [".", "OutgoingRecords", ".", "."],
+          [".", "WriteProvisionedThroughputExceeded", ".", "."]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "Kinesis Stream Throughput",
+        "period": 300
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 0,
+      "width": 12, "height": 6,
+      "properties": {
+        "metrics": [
+          ["DataPlatform/Kinesis", "ProcessedRecords"],
+          [".", "ErrorRecords"],
+          [".", "DataQualityScore"]
+        ],
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "title": "Processing Metrics",
+        "period": 300
+      }
+    }
+  ]
+}
+```
+
+この拡張により、以下の高度な機能が追加されました：
+
+1. **エンタープライズ級データパイプライン**: 複数ソース統合、高度なパーティショニング、インテリジェントバッチング
+2. **データ品質監視システム**: リアルタイム品質評価、異常検知、メトリクス送信
+3. **運用自動化スクリプト**: 健全性チェック、自動スケーリング、品質レポート生成
+4. **高度な監視**: カスタムダッシュボード、詳細メトリクス
+
+これらの実装により、実際のエンタープライズ環境でも使用できる高品質なストリーミングデータ基盤の構築スキルを習得できます。

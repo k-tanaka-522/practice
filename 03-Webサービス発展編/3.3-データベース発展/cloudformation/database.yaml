@@ -1,0 +1,603 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SNS風アプリケーション - PostgreSQLデータベース環境'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: 'デプロイ環境'
+  
+  ProjectName:
+    Type: String
+    Default: sns-app
+    Description: 'プロジェクト名'
+
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 128
+    Description: 'データベースマスターパスワード (8-128文字)'
+    ConstraintDescription: 'パスワードは8-128文字である必要があります'
+
+  DatabaseUsername:
+    Type: String
+    Default: snsadmin
+    MinLength: 4
+    MaxLength: 63
+    Description: 'データベースマスターユーザー名'
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # インターネットゲートウェイ
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # パブリックサブネット
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-1-${Environment}'
+        - Key: Type
+          Value: Public
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-2-${Environment}'
+        - Key: Type
+          Value: Public
+
+  # プライベートサブネット
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.11.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-1-${Environment}'
+        - Key: Type
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.12.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet-2-${Environment}'
+        - Key: Type
+          Value: Private
+
+  # NAT ゲートウェイ用 Elastic IP
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-eip-1-${Environment}'
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-eip-2-${Environment}'
+
+  # NAT ゲートウェイ
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-1-${Environment}'
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-2-${Environment}'
+
+  # ルートテーブル - パブリック
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-routes-${Environment}'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # ルートテーブル - プライベート
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-routes-1-${Environment}'
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-routes-2-${Environment}'
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # データベースサブネットグループ
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnet-group-${Environment}'
+      DBSubnetGroupDescription: 'Subnet group for RDS database'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # セキュリティグループ - データベース
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-database-sg-${Environment}'
+      GroupDescription: 'Security group for RDS PostgreSQL database'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: 'PostgreSQL access from Lambda functions'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-database-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # セキュリティグループ - Lambda
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-lambda-sg-${Environment}'
+      GroupDescription: 'Security group for Lambda functions'
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-sg-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS パラメータグループ
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Family: postgres15
+      Description: 'Parameter group for PostgreSQL 15'
+      Parameters:
+        shared_preload_libraries: 'pg_stat_statements'
+        log_statement: 'all'
+        log_min_duration_statement: 1000
+        log_checkpoints: 1
+        log_connections: 1
+        log_disconnections: 1
+        log_lock_waits: 1
+        log_temp_files: 0
+        max_connections: 200
+        work_mem: '4MB'
+        maintenance_work_mem: '64MB'
+        effective_cache_size: '1GB'
+        random_page_cost: 1.1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-params-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS クラスターパラメータグループ（Aurora用、将来的な拡張）
+  # DatabaseClusterParameterGroup:
+  #   Type: AWS::RDS::DBClusterParameterGroup
+  #   Properties:
+  #     Family: aurora-postgresql15
+  #     Description: 'Cluster parameter group for Aurora PostgreSQL 15'
+  #     Parameters:
+  #       shared_preload_libraries: 'pg_stat_statements'
+
+  # RDS インスタンス
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: !If [IsProduction, Snapshot, Delete]
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-db-${Environment}'
+      DBInstanceClass: !If [IsProduction, 'db.t3.medium', 'db.t3.micro']
+      Engine: postgres
+      EngineVersion: '15.4'
+      AllocatedStorage: !If [IsProduction, 100, 20]
+      MaxAllocatedStorage: !If [IsProduction, 1000, 100]
+      StorageType: gp2
+      StorageEncrypted: true
+      
+      DBName: !Sub '${ProjectName}_${Environment}'
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      
+      BackupRetentionPeriod: !If [IsProduction, 7, 1]
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      
+      MultiAZ: !If [IsProduction, true, false]
+      PubliclyAccessible: false
+      
+      MonitoringInterval: !If [IsProduction, 60, 0]
+      MonitoringRoleArn: !If [IsProduction, !GetAtt DatabaseMonitoringRole.Arn, !Ref 'AWS::NoValue']
+      EnablePerformanceInsights: !If [IsProduction, true, false]
+      PerformanceInsightsRetentionPeriod: !If [IsProduction, 7, !Ref 'AWS::NoValue']
+      
+      DeletionProtection: !If [IsProduction, true, false]
+      
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-database-${Environment}'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # RDS監視用IAMロール
+  DatabaseMonitoringRole:
+    Type: AWS::IAM::Role
+    Condition: IsProduction
+    Properties:
+      RoleName: !Sub '${ProjectName}-rds-monitoring-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # Secrets Manager - データベース認証情報
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/database/${Environment}'
+      Description: 'Database credentials for SNS application'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DatabaseUsername}"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Secrets Manager - RDSアタッチメント
+  DatabaseSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DatabaseSecret
+      TargetId: !Ref DatabaseInstance
+      TargetType: AWS::RDS::DBInstance
+
+  # Lambda実行ロール - データベースアクセス用
+  DatabaseLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-database-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DatabaseSecret
+        - PolicyName: RDSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                Resource: '*'
+
+  # Lambda関数 - データベースマイグレーション
+  DatabaseMigrationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-db-migration-${Environment}'
+      Runtime: nodejs18.x
+      Handler: migration.handler
+      Role: !GetAtt DatabaseLambdaRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log('Database migration triggered:', event);
+            return {
+              statusCode: 200,
+              body: JSON.stringify({ message: 'Migration completed' })
+            };
+          };
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !Ref DatabaseSecret
+          DB_HOST: !GetAtt DatabaseInstance.Endpoint.Address
+          DB_PORT: !GetAtt DatabaseInstance.Endpoint.Port
+          DB_NAME: !Sub '${ProjectName}_${Environment}'
+          ENVIRONMENT: !Ref Environment
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Timeout: 300
+      MemorySize: 512
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Logs グループ
+  DatabaseMigrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-db-migration-${Environment}'
+      RetentionInDays: 14
+
+  # CloudWatch アラーム - データベース接続数
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-db-connections-${Environment}'
+      AlarmDescription: 'Database connections high'
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+
+  # CloudWatch アラーム - CPU使用率
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub '${ProjectName}-db-cpu-${Environment}'
+      AlarmDescription: 'Database CPU utilization high'
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      TreatMissingData: notBreaching
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, 'prod']
+
+Outputs:
+  # VPC情報
+  VPCId:
+    Description: 'VPC ID'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectName}-vpc-id-${Environment}'
+
+  # サブネット情報
+  PrivateSubnet1Id:
+    Description: 'Private Subnet 1 ID'
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${ProjectName}-private-subnet-1-${Environment}'
+
+  PrivateSubnet2Id:
+    Description: 'Private Subnet 2 ID'
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-private-subnet-2-${Environment}'
+
+  PublicSubnet1Id:
+    Description: 'Public Subnet 1 ID'
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${ProjectName}-public-subnet-1-${Environment}'
+
+  PublicSubnet2Id:
+    Description: 'Public Subnet 2 ID'
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-public-subnet-2-${Environment}'
+
+  # セキュリティグループ
+  LambdaSecurityGroupId:
+    Description: 'Lambda Security Group ID'
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-lambda-sg-${Environment}'
+
+  DatabaseSecurityGroupId:
+    Description: 'Database Security Group ID'
+    Value: !Ref DatabaseSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-database-sg-${Environment}'
+
+  # データベース情報
+  DatabaseEndpoint:
+    Description: 'RDS PostgreSQL Endpoint'
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-db-endpoint-${Environment}'
+
+  DatabasePort:
+    Description: 'RDS PostgreSQL Port'
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${ProjectName}-db-port-${Environment}'
+
+  DatabaseName:
+    Description: 'Database Name'
+    Value: !Sub '${ProjectName}_${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-db-name-${Environment}'
+
+  DatabaseSecretArn:
+    Description: 'Database Secret ARN'
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub '${ProjectName}-db-secret-arn-${Environment}'
+
+  # Lambda情報
+  DatabaseLambdaRoleArn:
+    Description: 'Database Lambda Execution Role ARN'
+    Value: !GetAtt DatabaseLambdaRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-db-lambda-role-arn-${Environment}'
+
+  DatabaseMigrationFunctionArn:
+    Description: 'Database Migration Function ARN'
+    Value: !GetAtt DatabaseMigrationFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-db-migration-function-arn-${Environment}'
