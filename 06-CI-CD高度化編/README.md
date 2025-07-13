@@ -4,7 +4,20 @@
 
 **学習時間**: 10時間 | **レベル**: 中級〜上級 | **前提モジュール**: 02-03完了
 
-このモジュールでは、モジュール02-03で構築したWebアプリケーションに対して、エンタープライズレベルのCI/CDパイプラインと運用監視システムを実装します。実践的なDevOpsスキルを身につけ、本番環境での継続的デリバリーを実現します。
+このモジュールでは、**Infrastructure as Code (IaC) ファースト**のアプローチで、Webアプリケーションの構築からCI/CDパイプライン、運用監視まですべてをCloudFormationで自動化します。モジュール02-03の知識をベースに、実践的なDevOpsスキルを身につけ、本番環境での継続的デリバリーを実現します。
+
+## 🔄 IaC ファーストアプローチ
+
+従来の「手動構築→自動化」ではなく、**最初からすべてをコードで定義**します：
+
+```yaml
+学習フロー:
+  1. IaCでWebアプリケーション構築
+  2. CI/CDパイプラインの統合
+  3. テスト自動化の実装
+  4. 監視・運用の自動化
+  5. すべてがコードで管理される状態
+```
 
 ## 🎯 学習目標
 
@@ -99,10 +112,37 @@
 ## 🏗️ 前提条件
 
 ### 必須要件
-- ✅ **モジュール02-03完了**: Webアプリケーションが構築済み
-- ✅ **AWSアカウント**: CodePipeline、CodeBuild等のアクセス権限
+- ✅ **モジュール02-03の知識**: Webアプリケーションの概念理解（実際の構築は不要）
+- ✅ **AWSアカウント**: Administrator権限（学習用）
 - ✅ **GitHubアカウント**: リポジトリとActions使用権限
 - ✅ **開発環境**: Docker、Node.js、Python3インストール済み
+
+### 🚀 IaC ファーストの利点
+
+```yaml
+従来のアプローチ（手動構築 → 自動化）:
+  問題点:
+    - モジュール02-03を先に手動構築 (4-6時間)
+    - 手動作業のミス・不整合
+    - 環境差異が発生しやすい
+    - 学習時間の無駄
+
+IaCファーストアプローチ（このモジュール）:
+  利点:
+    - すべてをコードで定義 (1-2時間)
+    - ワンクリックデプロイ (10分)
+    - 完全な再現性と一貫性
+    - 本番レベルの品質を最初から
+    - 真のDevOps/SREスキル習得
+```
+
+### 💡 学習の価値
+
+このアプローチで学ぶことで：
+- **即戦力**: 企業で求められる現代的なスキル
+- **効率性**: 手動作業を排除した真の自動化
+- **品質**: Infrastructure as Codeによる高品質な構築
+- **実用性**: そのまま本番環境に適用可能
 
 ### 環境確認
 
@@ -126,22 +166,292 @@ gh --version
 gh auth status
 ```
 
-## 🚀 クイックスタート
+## 🚀 実践的ハンズオン: リアルなチーム開発体験
 
-### Step 1: 基盤セットアップ
+### 🎯 実践シナリオ
 
-```bash
-# モジュール02-03のアプリケーションスタック確認
-aws cloudformation describe-stacks \
-  --stack-name web-app-stack \
-  --query 'Stacks[0].Outputs'
+**このリポジトリを自分のGitHubアカウントでforkし、実際のチーム開発環境を構築します**
 
-# CI/CD用のパラメータ設定
-cp parameters/example.json parameters/my-config.json
-# parameters/my-config.jsonを編集して環境に合わせる
+```yaml
+学習内容:
+  - GitHub Actions完全実装
+  - ブランチ戦略 (Git Flow)
+  - マルチ環境デプロイ (dev/staging/prod)
+  - プルリクエストベースのワークフロー
+  - 自動テスト・承認フロー
+  - 本番デプロイの承認制御
 ```
 
-### Step 2: CI/CDパイプライン構築
+### Step 1: リポジトリセットアップ
+
+```bash
+# 1. このリポジトリをfork（GitHubのWebUIで）
+# Fork: https://github.com/original-repo/ai-driven-development-practice
+
+# 2. 自分のリポジトリをclone
+git clone https://github.com/YOUR_USERNAME/ai-driven-development-practice.git
+cd ai-driven-development-practice
+
+# 3. ブランチ戦略セットアップ
+git checkout -b develop
+git push origin develop
+
+git checkout -b staging  
+git push origin staging
+
+# main = production環境
+# staging = ステージング環境  
+# develop = 開発環境
+```
+
+### Step 2: GitHub環境とシークレット設定
+
+```bash
+# GitHub CLI使用
+gh auth login
+
+# AWS認証情報をシークレットに設定
+gh secret set AWS_ACCESS_KEY_ID --body "YOUR_ACCESS_KEY"
+gh secret set AWS_SECRET_ACCESS_KEY --body "YOUR_SECRET_KEY"
+gh secret set AWS_REGION --body "ap-northeast-1"
+gh secret set AWS_ACCOUNT_ID --body "$(aws sts get-caller-identity --query Account --output text)"
+
+# 環境別シークレット設定
+gh secret set DEV_STACK_NAME --body "my-app-dev"
+gh secret set STAGING_STACK_NAME --body "my-app-staging"  
+gh secret set PROD_STACK_NAME --body "my-app-prod"
+
+# Slack通知用（オプション）
+gh secret set SLACK_WEBHOOK --body "YOUR_SLACK_WEBHOOK_URL"
+```
+
+### Step 3: GitHub Actions ワークフロー作成
+
+```bash
+# .github/workflows/ディレクトリ作成
+mkdir -p .github/workflows
+
+# メインのCI/CDワークフローを作成
+cat > .github/workflows/cicd.yml << 'EOF'
+name: 🚀 CI/CD Pipeline
+
+on:
+  push:
+    branches: [develop, staging, main]
+  pull_request:
+    branches: [develop, staging, main]
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  # 🧪 テスト・品質チェック
+  test:
+    name: 🧪 Test & Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      
+      - name: Install dependencies
+        run: npm ci
+        working-directory: 02-Webサービス基礎編/web
+      
+      - name: 🔍 Lint check
+        run: npm run lint
+        working-directory: 02-Webサービス基礎編/web
+      
+      - name: 🧪 Unit tests
+        run: npm run test:unit -- --coverage
+        working-directory: 02-Webサービス基礎編/web
+      
+      - name: 📊 Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./02-Webサービス基礎編/web/coverage/lcov.info
+
+  # 🔒 セキュリティスキャン
+  security:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: 🛡️ Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # 🏗️ ビルド・デプロイ（develop環境）
+  deploy-dev:
+    name: 🏗️ Deploy to DEV
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment: development
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: 🚀 Deploy CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --template-file 02-Webサービス基礎編/cloudformation/main-stack.yaml \
+            --stack-name ${{ secrets.DEV_STACK_NAME }} \
+            --parameter-overrides \
+              Environment=dev \
+              ProjectName=my-web-app \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --tags Environment=dev Project=learning
+      
+      - name: 📋 Get deployment info
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name ${{ secrets.DEV_STACK_NAME }} \
+            --query 'Stacks[0].Outputs'
+
+  # 🎭 ステージング環境デプロイ
+  deploy-staging:
+    name: 🎭 Deploy to STAGING
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.ref == 'refs/heads/staging' && github.event_name == 'push'
+    environment: staging
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: 🧪 Integration tests first
+        run: |
+          # ステージング環境特有の統合テスト
+          echo "Running integration tests..."
+          npm run test:integration
+        working-directory: 02-Webサービス基礎編/web
+      
+      - name: 🚀 Deploy to Staging
+        run: |
+          aws cloudformation deploy \
+            --template-file 02-Webサービス基礎編/cloudformation/main-stack.yaml \
+            --stack-name ${{ secrets.STAGING_STACK_NAME }} \
+            --parameter-overrides \
+              Environment=staging \
+              ProjectName=my-web-app \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --tags Environment=staging Project=learning
+
+  # 🏭 本番環境デプロイ（手動承認必須）
+  deploy-production:
+    name: 🏭 Deploy to PRODUCTION
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production  # GitHub環境保護ルール適用
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: 🔍 Pre-deployment checks
+        run: |
+          echo "🔍 Performing pre-deployment safety checks..."
+          # 本番前の最終チェック
+          npm run test:e2e
+        working-directory: 02-Webサービス基礎編/web
+      
+      - name: 🚀 Deploy to Production
+        run: |
+          aws cloudformation deploy \
+            --template-file 02-Webサービス基礎編/cloudformation/main-stack.yaml \
+            --stack-name ${{ secrets.PROD_STACK_NAME }} \
+            --parameter-overrides \
+              Environment=prod \
+              ProjectName=my-web-app \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --tags Environment=prod Project=learning
+      
+      - name: 🎉 Success notification
+        if: success()
+        run: |
+          echo "🎉 Production deployment successful!"
+          # Slack通知など
+EOF
+```
+
+### Step 4: ブランチ保護とレビュールール設定
+
+```bash
+# GitHub環境保護設定（本番環境）
+gh api repos/:owner/:repo/environments/production -X PUT --input - << 'EOF'
+{
+  "protection_rules": [
+    {
+      "type": "required_reviewers",
+      "reviewers": [
+        {"type": "User", "id": YOUR_USER_ID}
+      ]
+    },
+    {
+      "type": "wait_timer",
+      "minutes": 5
+    }
+  ],
+  "deployment_branch_policy": {
+    "protected_branches": true,
+    "custom_branch_policies": false
+  }
+}
+EOF
+
+# ブランチ保護ルール設定
+gh api repos/:owner/:repo/branches/main/protection -X PUT --input - << 'EOF'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": ["test", "security"]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 1,
+    "dismiss_stale_reviews": true
+  },
+  "restrictions": null
+}
+EOF
+```
 
 ```bash
 # GitHub連携設定
