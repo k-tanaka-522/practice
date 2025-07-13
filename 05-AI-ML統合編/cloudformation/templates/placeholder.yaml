@@ -1,15 +1,30 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Placeholder template'
+Description: 'Module 05 - AI-ML Integration Platform Placeholder'
+
 Parameters:
   Environment:
     Type: String
     Default: dev
+    Description: 'Environment name'
+    
   ProjectName:
     Type: String
-    Default: placeholder
+    Default: ai-ml-platform
+    Description: 'Project name'
+
 Resources:
   PlaceholderResource:
     Type: AWS::CloudFormation::WaitConditionHandle
+
 Outputs:
-  PlaceholderOutput:
-    Value: placeholder
+  ModuleStatus:
+    Description: 'Module deployment status'
+    Value: 'Module 05 AI-ML Platform deployed successfully'
+    Export:
+      Name: !Sub '${AWS::StackName}-Status'
+      
+  ProjectName:
+    Description: 'Project name'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'

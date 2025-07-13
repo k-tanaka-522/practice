@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'MODULE_NAME - 統合メインスタック'
+Description: 'Module 05 - AI-ML Integration Platform - Main Stack'
 
 Parameters:
   Environment:
@@ -14,17 +14,17 @@ Parameters:
     
   ProjectName:
     Type: String
-    Default: MODULE_PROJECT
+    Default: ai-ml-platform
     Description: 'プロジェクト名（リソース命名用）'
 
 Resources:
   PlaceholderStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: \!Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/placeholder.yaml'
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/placeholder.yaml'
       Parameters:
-        Environment: \!Ref Environment
-        ProjectName: \!Ref ProjectName
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
 
 Outputs:
   StackStatus:

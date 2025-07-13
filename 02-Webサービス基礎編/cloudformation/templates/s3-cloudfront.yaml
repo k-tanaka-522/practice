@@ -69,23 +69,65 @@ Resources:
         SigningProtocol: sigv4
         Description: !Sub '${ProjectName} ${Environment} Origin Access Control'
 
-  # S3 Bucket Policy for CloudFront Access
-  WebsiteBucketPolicy:
-    Type: AWS::S3::BucketPolicy
+  # CloudFront Distribution (moved before bucket policy)
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
     Properties:
-      Bucket: !Ref WebsiteBucket
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Sid: AllowCloudFrontServicePrincipal
-            Effect: Allow
-            Principal:
-              Service: cloudfront.amazonaws.com
-            Action: s3:GetObject
-            Resource: !Sub '${WebsiteBucket}/*'
-            Condition:
-              StringEquals:
-                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+      DistributionConfig:
+        Aliases: !If
+          - UseCustomDomain
+          - [!Ref DomainName]
+          - !Ref 'AWS::NoValue'
+        Comment: !Sub '${ProjectName} ${Environment} distribution'
+        DefaultCacheBehavior:
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+          MinTTL: 0
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          TargetOriginId: !Sub '${WebsiteBucket}-origin'
+          ViewerProtocolPolicy: redirect-to-https
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        Origins:
+          - DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            Id: !Sub '${WebsiteBucket}-origin'
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref OriginAccessControl
+        PriceClass: PriceClass_100
+        ViewerCertificate: !If
+          - UseCustomDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        WebACLId: !If [IsUSEast1, !GetAtt WebACL.Arn, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: '2.1-StaticSite'
+
 
   # Security Headers Policy
   SecurityHeadersPolicy:
@@ -146,64 +188,6 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # CloudFront Distribution
-  CloudFrontDistribution:
-    Type: AWS::CloudFront::Distribution
-    Properties:
-      DistributionConfig:
-        Aliases: !If
-          - UseCustomDomain
-          - [!Ref DomainName]
-          - !Ref 'AWS::NoValue'
-        Comment: !Sub '${ProjectName} ${Environment} distribution'
-        DefaultCacheBehavior:
-          AllowedMethods: [GET, HEAD, OPTIONS]
-          CachedMethods: [GET, HEAD, OPTIONS]
-          Compress: true
-          DefaultTTL: 86400
-          MaxTTL: 31536000
-          MinTTL: 0
-          ForwardedValues:
-            QueryString: false
-            Cookies:
-              Forward: none
-          TargetOriginId: !Sub '${WebsiteBucket}-origin'
-          ViewerProtocolPolicy: redirect-to-https
-          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
-        CustomErrorResponses:
-          - ErrorCode: 403
-            ResponseCode: 200
-            ResponsePagePath: /index.html
-            ErrorCachingMinTTL: 300
-          - ErrorCode: 404
-            ResponseCode: 200
-            ResponsePagePath: /index.html
-            ErrorCachingMinTTL: 300
-        DefaultRootObject: index.html
-        Enabled: true
-        HttpVersion: http2
-        IPV6Enabled: true
-        Origins:
-          - DomainName: !GetAtt WebsiteBucket.RegionalDomainName
-            Id: !Sub '${WebsiteBucket}-origin'
-            S3OriginConfig:
-              OriginAccessIdentity: ''
-            OriginAccessControlId: !Ref OriginAccessControl
-        PriceClass: PriceClass_100
-        ViewerCertificate: !If
-          - UseCustomDomain
-          - AcmCertificateArn: !Ref CertificateArn
-            SslSupportMethod: sni-only
-            MinimumProtocolVersion: TLSv1.2_2021
-          - CloudFrontDefaultCertificate: true
-        WebACLId: !If [IsUSEast1, !GetAtt WebACL.Arn, !Ref 'AWS::NoValue']
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Module
-          Value: '2.1-StaticSite'
 
   # Route53 Records (カスタムドメイン使用時)
   Route53Record:

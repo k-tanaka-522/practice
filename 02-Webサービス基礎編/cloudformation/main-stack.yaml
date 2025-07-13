@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Webサービス基礎編 - 統合メインスタック'
+Description: 'Module 02 - Basic Web Services Platform - Main Stack'
 
 Parameters:
   Environment:
@@ -93,9 +93,6 @@ Resources:
       Parameters:
         Environment: !Ref Environment
         ProjectName: !Ref ProjectName
-        PasswordMinLength: !FindInMap [EnvironmentMap, !Ref Environment, PasswordMinLength]
-        ApiGatewayId: !GetAtt ApiFoundationStack.Outputs.ApiGatewayId
-        ApiGatewayRootResourceId: !GetAtt ApiFoundationStack.Outputs.ApiGatewayRootResourceId
       Tags:
         - Key: Environment
           Value: !Ref Environment
@@ -121,30 +118,30 @@ Resources:
         - Key: Module
           Value: '2.4-Database'
 
-  # 2.5 統合・セキュリティ
-  IntegrationStack:
-    Type: AWS::CloudFormation::Stack
-    DependsOn: 
-      - StaticHostingStack
-      - ApiFoundationStack
-      - AuthenticationStack
-      - DatabaseStack
-    Properties:
-      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/integration.yaml'
-      Parameters:
-        Environment: !Ref Environment
-        ProjectName: !Ref ProjectName
-        CloudFrontDistributionId: !GetAtt StaticHostingStack.Outputs.CloudFrontDistributionId
-        ApiGatewayUrl: !GetAtt ApiFoundationStack.Outputs.ApiGatewayUrl
-        UserPoolId: !GetAtt AuthenticationStack.Outputs.UserPoolId
-        UserPoolClientId: !GetAtt AuthenticationStack.Outputs.UserPoolClientId
-        UsersTableName: !GetAtt DatabaseStack.Outputs.UsersTableName
-        ItemsTableName: !GetAtt DatabaseStack.Outputs.ItemsTableName
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Module
-          Value: '2.5-Integration'
+  # 2.5 統合・セキュリティ (一時的に無効化)
+  # IntegrationStack:
+  #   Type: AWS::CloudFormation::Stack
+  #   DependsOn: 
+  #     - StaticHostingStack
+  #     - ApiFoundationStack
+  #     - AuthenticationStack
+  #     - DatabaseStack
+  #   Properties:
+  #     TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/integration.yaml'
+  #     Parameters:
+  #       Environment: !Ref Environment
+  #       ProjectName: !Ref ProjectName
+  #       CloudFrontDistributionId: !GetAtt StaticHostingStack.Outputs.CloudFrontDistributionId
+  #       ApiGatewayUrl: !GetAtt ApiFoundationStack.Outputs.ApiGatewayUrl
+  #       UserPoolId: !GetAtt AuthenticationStack.Outputs.UserPoolId
+  #       UserPoolClientId: !GetAtt AuthenticationStack.Outputs.UserPoolClientId
+  #       UsersTableName: !GetAtt DatabaseStack.Outputs.UsersTableName
+  #       ItemsTableName: !GetAtt DatabaseStack.Outputs.ItemsTableName
+  #     Tags:
+  #       - Key: Environment
+  #         Value: !Ref Environment
+  #       - Key: Module
+  #         Value: '2.5-Integration'
 
 Outputs:
   # 静的サイト情報
@@ -193,12 +190,12 @@ Outputs:
     Export:
       Name: !Sub '${ProjectName}-${Environment}-items-table'
 
-  # 統合情報
-  ApplicationDashboard:
-    Description: 'アプリケーション統合ダッシュボード URL'
-    Value: !GetAtt IntegrationStack.Outputs.DashboardURL
-    Export:
-      Name: !Sub '${ProjectName}-${Environment}-dashboard-url'
+  # 統合情報 (一時的に無効化)
+  # ApplicationDashboard:
+  #   Description: 'アプリケーション統合ダッシュボード URL'
+  #   Value: !GetAtt IntegrationStack.Outputs.DashboardURL
+  #   Export:
+  #     Name: !Sub '${ProjectName}-${Environment}-dashboard-url'
 
   # 設定情報（フロントエンド用）
   ConfigurationJSON:

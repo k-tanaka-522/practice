@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'MODULE_NAME - 統合メインスタック'
+Description: 'Module 08 - Operations Monitoring and Incident Response Platform - Main Stack'
 
 Parameters:
   Environment:
@@ -14,17 +14,18 @@ Parameters:
     
   ProjectName:
     Type: String
-    Default: MODULE_PROJECT
+    Default: ops-monitoring-platform
     Description: 'プロジェクト名（リソース命名用）'
 
 Resources:
-  PlaceholderStack:
+  ObservabilityStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: \!Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/placeholder.yaml'
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/observability.yaml'
       Parameters:
-        Environment: \!Ref Environment
-        ProjectName: \!Ref ProjectName
+        Environment: !Ref Environment
+        ApplicationName: !Ref ProjectName
+        AlertEmail: admin@example.com
 
 Outputs:
   StackStatus:

@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'MODULE_NAME - 統合メインスタック'
+Description: 'Module 04 - Data Analytics Platform - Main Stack'
 
 Parameters:
   Environment:
@@ -14,17 +14,17 @@ Parameters:
     
   ProjectName:
     Type: String
-    Default: MODULE_PROJECT
+    Default: data-platform
     Description: 'プロジェクト名（リソース命名用）'
 
 Resources:
-  PlaceholderStack:
+  KinesisStreamingStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: \!Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/placeholder.yaml'
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/kinesis-streaming.yaml'
       Parameters:
-        Environment: \!Ref Environment
-        ProjectName: \!Ref ProjectName
+        EnvironmentName: !Ref Environment
+        ProjectName: !Ref ProjectName
 
 Outputs:
   StackStatus:
