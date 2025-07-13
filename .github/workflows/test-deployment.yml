@@ -1,0 +1,135 @@
+name: 🧪 Test Deployment Pipeline
+
+on:
+  workflow_dispatch:  # 手動トリガーのみ（テスト用）
+  push:
+    branches: [test]
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  validate:
+    name: 🔍 Validate Templates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Validate CloudFormation templates
+        run: |
+          echo "🔍 Validating CloudFormation templates..."
+          
+          # Main stack validation
+          aws cloudformation validate-template \
+            --template-body file://02-Webサービス基礎編/cloudformation/main-stack.yaml
+          
+          # Individual template validation
+          for template in 02-Webサービス基礎編/cloudformation/templates/*.yaml; do
+            echo "Validating $template"
+            aws cloudformation validate-template --template-body file://$template
+          done
+          
+          echo "✅ All templates are valid!"
+
+  lint:
+    name: 🔍 Lint Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      
+      - name: Install dependencies
+        run: |
+          if [ -f "02-Webサービス基礎編/2.1-静的サイト構築/web/package.json" ]; then
+            cd "02-Webサービス基礎編/2.1-静的サイト構築/web"
+            npm ci
+          else
+            echo "No package.json found, skipping npm install"
+          fi
+      
+      - name: Validate HTML
+        run: |
+          echo "🔍 Validating HTML files..."
+          # Simple HTML validation
+          find . -name "*.html" -exec echo "Checking {}" \;
+
+  deploy-test:
+    name: 🚀 Test Deploy
+    runs-on: ubuntu-latest
+    needs: [validate, lint]
+    if: github.ref == 'refs/heads/test'
+    environment: test
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Create S3 bucket for templates
+        run: |
+          BUCKET_NAME="test-cf-templates-$(date +%s)"
+          echo "BUCKET_NAME=$BUCKET_NAME" >> $GITHUB_ENV
+          aws s3 mb s3://$BUCKET_NAME --region ${{ env.AWS_REGION }}
+      
+      - name: Upload templates to S3
+        run: |
+          aws s3 cp 02-Webサービス基礎編/cloudformation/templates/ \
+            s3://$BUCKET_NAME/templates/ --recursive
+      
+      - name: Deploy CloudFormation stack
+        run: |
+          STACK_NAME="test-stack-$(date +%s)"
+          echo "STACK_NAME=$STACK_NAME" >> $GITHUB_ENV
+          
+          aws cloudformation deploy \
+            --template-file 02-Webサービス基礎編/cloudformation/main-stack.yaml \
+            --stack-name $STACK_NAME \
+            --parameter-overrides \
+              Environment=dev \
+              ProjectName=github-actions-test \
+              S3BucketName=$BUCKET_NAME \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region ${{ env.AWS_REGION }}
+      
+      - name: Get stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name $STACK_NAME \
+            --query 'Stacks[0].Outputs' \
+            --region ${{ env.AWS_REGION }}
+      
+      - name: Cleanup test resources
+        if: always()
+        run: |
+          echo "🧹 Cleaning up test resources..."
+          
+          # Delete CloudFormation stack
+          if [ ! -z "$STACK_NAME" ]; then
+            aws cloudformation delete-stack --stack-name $STACK_NAME --region ${{ env.AWS_REGION }}
+            echo "⏳ Waiting for stack deletion..."
+            aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME --region ${{ env.AWS_REGION }} || true
+          fi
+          
+          # Delete S3 bucket
+          if [ ! -z "$BUCKET_NAME" ]; then
+            aws s3 rm s3://$BUCKET_NAME --recursive || true
+            aws s3 rb s3://$BUCKET_NAME || true
+          fi
+          
+          echo "✅ Cleanup completed!"

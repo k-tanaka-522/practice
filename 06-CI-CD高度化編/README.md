@@ -144,26 +144,64 @@ IaCファーストアプローチ（このモジュール）:
 - **品質**: Infrastructure as Codeによる高品質な構築
 - **実用性**: そのまま本番環境に適用可能
 
+### 必須ツールのインストール
+
+#### 1. AWS CLI
+```bash
+# macOS
+brew install awscli
+
+# Windows
+winget install Amazon.AWSCLI
+
+# Linux
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+```
+
+#### 2. GitHub CLI
+```bash
+# macOS
+brew install gh
+
+# Windows
+winget install GitHub.cli
+
+# Linux (Ubuntu/Debian)
+sudo apt update
+sudo apt install gh
+
+# Linux (RHEL/CentOS)
+sudo yum install gh
+```
+
+#### 3. その他の必須ツール
+```bash
+# Docker（コンテナビルド用）
+# https://docs.docker.com/get-docker/
+
+# Node.js（テスト用）
+# https://nodejs.org/ - v16以上推奨
+
+# Python3（スクリプト用）
+# https://www.python.org/ - 3.8以上推奨
+```
+
 ### 環境確認
 
 ```bash
-# AWS CLI確認
+# すべてのツールが正しくインストールされているか確認
 aws --version
 aws sts get-caller-identity
 
-# Docker確認（コンテナビルド用）
-docker --version
-
-# Node.js確認（テスト用）
-node --version  # v16以上推奨
-npm --version
-
-# Python確認（スクリプト用）
-python3 --version  # 3.8以上推奨
-
-# GitHub CLI確認（リポジトリ連携用）
 gh --version
 gh auth status
+
+docker --version
+node --version
+npm --version
+python3 --version
 ```
 
 ## 🚀 実践的ハンズオン: リアルなチーム開発体験
@@ -204,11 +242,15 @@ git push origin staging
 # develop = 開発環境
 ```
 
-### Step 2: GitHub環境とシークレット設定
+### Step 2: GitHub認証とシークレット設定
 
 ```bash
-# GitHub CLI使用
+# GitHub CLI認証
 gh auth login
+# ブラウザが開いて認証フローが開始されます
+
+# 認証確認
+gh auth status
 
 # AWS認証情報をシークレットに設定
 gh secret set AWS_ACCESS_KEY_ID --body "YOUR_ACCESS_KEY"
@@ -222,7 +264,10 @@ gh secret set STAGING_STACK_NAME --body "my-app-staging"
 gh secret set PROD_STACK_NAME --body "my-app-prod"
 
 # Slack通知用（オプション）
-gh secret set SLACK_WEBHOOK --body "YOUR_SLACK_WEBHOOK_URL"
+# gh secret set SLACK_WEBHOOK --body "YOUR_SLACK_WEBHOOK_URL"
+
+# 設定確認
+gh secret list
 ```
 
 ### Step 3: GitHub Actions ワークフロー作成
@@ -411,21 +456,21 @@ jobs:
 EOF
 ```
 
-### Step 4: ブランチ保護とレビュールール設定
+### Step 4: GitHub環境保護とブランチルール設定
 
 ```bash
-# GitHub環境保護設定（本番環境）
+# 本番環境保護設定（手動承認必須）
 gh api repos/:owner/:repo/environments/production -X PUT --input - << 'EOF'
 {
   "protection_rules": [
     {
       "type": "required_reviewers",
       "reviewers": [
-        {"type": "User", "id": YOUR_USER_ID}
+        {"type": "User", "id": null}
       ]
     },
     {
-      "type": "wait_timer",
+      "type": "wait_timer", 
       "minutes": 5
     }
   ],
@@ -436,12 +481,31 @@ gh api repos/:owner/:repo/environments/production -X PUT --input - << 'EOF'
 }
 EOF
 
-# ブランチ保護ルール設定
+# mainブランチ保護ルール
 gh api repos/:owner/:repo/branches/main/protection -X PUT --input - << 'EOF'
 {
   "required_status_checks": {
     "strict": true,
-    "contexts": ["test", "security"]
+    "contexts": ["🧪 Test & Quality Check", "🔒 Security Scan"]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 1,
+    "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": false
+  },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+EOF
+
+# staging/developブランチも同様に保護（オプション）
+gh api repos/:owner/:repo/branches/staging/protection -X PUT --input - << 'EOF'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": ["🧪 Test & Quality Check", "🔒 Security Scan"]
   },
   "enforce_admins": false,
   "required_pull_request_reviews": {
