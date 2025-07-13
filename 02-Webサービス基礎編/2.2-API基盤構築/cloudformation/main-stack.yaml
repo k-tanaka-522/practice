@@ -34,7 +34,7 @@ Resources:
   LambdaStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/api-foundation/lambda-functions.yaml'
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/templates/lambda-functions.yaml'
       Parameters:
         Environment: !Ref Environment
         ProjectName: !Ref ProjectName
@@ -46,7 +46,7 @@ Resources:
     Type: AWS::CloudFormation::Stack
     DependsOn: LambdaStack
     Properties:
-      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/api-foundation/api-gateway.yaml'
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/templates/api-gateway.yaml'
       Parameters:
         Environment: !Ref Environment
         ProjectName: !Ref ProjectName

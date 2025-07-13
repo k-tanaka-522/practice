@@ -42,7 +42,7 @@ Resources:
   CognitoStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/auth-system/cognito-user-pool.yaml'
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/templates/cognito-user-pool.yaml'
       Parameters:
         Environment: !Ref Environment
         ProjectName: !Ref ProjectName

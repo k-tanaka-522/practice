@@ -1,0 +1,32 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'MODULE_NAME - 統合メインスタック'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: 'デプロイ環境'
+  
+  S3BucketName:
+    Type: String
+    Description: 'CloudFormationテンプレート格納用S3バケット名'
+    
+  ProjectName:
+    Type: String
+    Default: MODULE_PROJECT
+    Description: 'プロジェクト名（リソース命名用）'
+
+Resources:
+  PlaceholderStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: \!Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/placeholder.yaml'
+      Parameters:
+        Environment: \!Ref Environment
+        ProjectName: \!Ref ProjectName
+
+Outputs:
+  StackStatus:
+    Description: 'スタック状態'
+    Value: 'Created'

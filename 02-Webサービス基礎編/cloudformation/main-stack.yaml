@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Webサービス基礎編 - 統合メインスタック'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: 'デプロイ環境'
+  
+  S3BucketName:
+    Type: String
+    Description: 'CloudFormationテンプレート格納用S3バケット名'
+    
+  ProjectName:
+    Type: String
+    Default: webservice-basics
+    Description: 'プロジェクト名（リソース命名用）'
+    
+  DomainName:
+    Type: String
+    Default: ''
+    Description: 'カスタムドメイン名（オプション）'
+    
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: 'ACM証明書ARN（カスタムドメイン用、オプション）'
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      LogLevel: DEBUG
+      RetentionDays: 7
+      BillingMode: PAY_PER_REQUEST
+      PasswordMinLength: 8
+    staging:
+      LogLevel: INFO
+      RetentionDays: 14
+      BillingMode: PAY_PER_REQUEST
+      PasswordMinLength: 8
+    prod:
+      LogLevel: WARN
+      RetentionDays: 30
+      BillingMode: PROVISIONED
+      PasswordMinLength: 12
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, '']]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+  UseCustomDomain: !And [!Condition HasCustomDomain, !Condition HasCertificate]
+
+Resources:
+  # 2.1 静的サイト構築 (S3 + CloudFront)
+  StaticHostingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/s3-cloudfront.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        DomainName: !Ref DomainName
+        CertificateArn: !Ref CertificateArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '2.1-StaticSite'
+
+  # 2.2 API基盤構築 (Lambda + API Gateway)
+  ApiFoundationStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: StaticHostingStack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/lambda-apigateway.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        LogLevel: !FindInMap [EnvironmentMap, !Ref Environment, LogLevel]
+        LogRetentionDays: !FindInMap [EnvironmentMap, !Ref Environment, RetentionDays]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '2.2-APIFoundation'
+
+  # 2.3 認証システム (Cognito)
+  AuthenticationStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: ApiFoundationStack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/cognito.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        PasswordMinLength: !FindInMap [EnvironmentMap, !Ref Environment, PasswordMinLength]
+        ApiGatewayId: !GetAtt ApiFoundationStack.Outputs.ApiGatewayId
+        ApiGatewayRootResourceId: !GetAtt ApiFoundationStack.Outputs.ApiGatewayRootResourceId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '2.3-Authentication'
+
+  # 2.4 データベース基礎 (DynamoDB)
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: AuthenticationStack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/dynamodb.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        BillingMode: !FindInMap [EnvironmentMap, !Ref Environment, BillingMode]
+        UserPoolId: !GetAtt AuthenticationStack.Outputs.UserPoolId
+        LogLevel: !FindInMap [EnvironmentMap, !Ref Environment, LogLevel]
+        LogRetentionDays: !FindInMap [EnvironmentMap, !Ref Environment, RetentionDays]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '2.4-Database'
+
+  # 2.5 統合・セキュリティ
+  IntegrationStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: 
+      - StaticHostingStack
+      - ApiFoundationStack
+      - AuthenticationStack
+      - DatabaseStack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/integration.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        CloudFrontDistributionId: !GetAtt StaticHostingStack.Outputs.CloudFrontDistributionId
+        ApiGatewayUrl: !GetAtt ApiFoundationStack.Outputs.ApiGatewayUrl
+        UserPoolId: !GetAtt AuthenticationStack.Outputs.UserPoolId
+        UserPoolClientId: !GetAtt AuthenticationStack.Outputs.UserPoolClientId
+        UsersTableName: !GetAtt DatabaseStack.Outputs.UsersTableName
+        ItemsTableName: !GetAtt DatabaseStack.Outputs.ItemsTableName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '2.5-Integration'
+
+Outputs:
+  # 静的サイト情報
+  WebsiteURL:
+    Description: 'Webサイト URL'
+    Value: !GetAtt StaticHostingStack.Outputs.WebsiteURL
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-website-url'
+
+  CloudFrontDomainName:
+    Description: 'CloudFront ドメイン名'
+    Value: !GetAtt StaticHostingStack.Outputs.CloudFrontDomainName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-cloudfront-domain'
+
+  # API情報
+  ApiGatewayUrl:
+    Description: 'API Gateway URL'
+    Value: !GetAtt ApiFoundationStack.Outputs.ApiGatewayUrl
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-url'
+
+  # 認証情報
+  UserPoolId:
+    Description: 'Cognito User Pool ID'
+    Value: !GetAtt AuthenticationStack.Outputs.UserPoolId
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-user-pool-id'
+
+  UserPoolClientId:
+    Description: 'Cognito User Pool Client ID'
+    Value: !GetAtt AuthenticationStack.Outputs.UserPoolClientId
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-user-pool-client-id'
+
+  # データベース情報
+  UsersTableName:
+    Description: 'Users DynamoDB テーブル名'
+    Value: !GetAtt DatabaseStack.Outputs.UsersTableName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-users-table'
+
+  ItemsTableName:
+    Description: 'Items DynamoDB テーブル名'
+    Value: !GetAtt DatabaseStack.Outputs.ItemsTableName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-items-table'
+
+  # 統合情報
+  ApplicationDashboard:
+    Description: 'アプリケーション統合ダッシュボード URL'
+    Value: !GetAtt IntegrationStack.Outputs.DashboardURL
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-dashboard-url'
+
+  # 設定情報（フロントエンド用）
+  ConfigurationJSON:
+    Description: 'フロントエンド設定 JSON'
+    Value: !Sub |
+      {
+        "region": "${AWS::Region}",
+        "websiteUrl": "${StaticHostingStack.Outputs.WebsiteURL}",
+        "apiUrl": "${ApiFoundationStack.Outputs.ApiGatewayUrl}",
+        "userPoolId": "${AuthenticationStack.Outputs.UserPoolId}",
+        "userPoolClientId": "${AuthenticationStack.Outputs.UserPoolClientId}",
+        "environment": "${Environment}"
+      }
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-config'
+
+  StackName:
+    Description: '現在のスタック名'
+    Value: !Ref 'AWS::StackName'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-main-stack-name'

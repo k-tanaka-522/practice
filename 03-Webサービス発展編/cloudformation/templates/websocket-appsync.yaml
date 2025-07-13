@@ -1,0 +1,15 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Module 03 - websocket-appsync.yaml placeholder'
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: webservice-advanced
+Resources:
+  PlaceholderResource:
+    Type: AWS::CloudFormation::WaitConditionHandle
+Outputs:
+  PlaceholderOutput:
+    Value: placeholder

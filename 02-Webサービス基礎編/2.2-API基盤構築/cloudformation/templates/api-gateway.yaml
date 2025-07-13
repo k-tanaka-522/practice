@@ -74,10 +74,10 @@ Resources:
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HelloFunctionArn}/invocations'
       MethodResponses:
         - StatusCode: 200
-          ResponseHeaders:
-            Access-Control-Allow-Origin: true
-            Access-Control-Allow-Headers: true
-            Access-Control-Allow-Methods: true
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
 
   # Hello OPTIONS Method (CORS)
   HelloOptionsMethod:
@@ -121,10 +121,10 @@ Resources:
         Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataFunctionArn}/invocations'
       MethodResponses:
         - StatusCode: 200
-          ResponseHeaders:
-            Access-Control-Allow-Origin: true
-            Access-Control-Allow-Headers: true
-            Access-Control-Allow-Methods: true
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
 
   # Data OPTIONS Method (CORS)
   DataOptionsMethod:

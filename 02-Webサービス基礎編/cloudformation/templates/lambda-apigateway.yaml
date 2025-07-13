@@ -1,0 +1,471 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: '2.2 API基盤構築 - Lambda + API Gateway'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: 'デプロイ環境'
+    
+  ProjectName:
+    Type: String
+    Default: webservice-basics
+    Description: 'プロジェクト名'
+    
+  LogLevel:
+    Type: String
+    Default: DEBUG
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
+    Description: 'Lambda関数ログレベル'
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: 'CloudWatch Logs保持期間（日）'
+
+Resources:
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: '2.2-APIFoundation'
+
+  # Hello Lambda Function
+  HelloFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-hello'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              const response = {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+                  },
+                  body: JSON.stringify({
+                      message: 'Hello from Lambda!',
+                      timestamp: new Date().toISOString(),
+                      requestId: event.requestContext ? event.requestContext.requestId : 'unknown',
+                      environment: process.env.ENVIRONMENT,
+                      version: '2.0'
+                  })
+              };
+              
+              return response;
+          };
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: '2.2-APIFoundation'
+
+  # Data Lambda Function
+  DataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-data'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          LOG_LEVEL: !Ref LogLevel
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              try {
+                  // Parse request body
+                  const body = JSON.parse(event.body || '{}');
+                  
+                  // Basic validation
+                  if (!body.name) {
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          body: JSON.stringify({
+                              error: 'Name is required',
+                              code: 'VALIDATION_ERROR'
+                          })
+                      };
+                  }
+                  
+                  // Process data
+                  const processedData = {
+                      id: Math.random().toString(36).substr(2, 9),
+                      name: body.name,
+                      message: body.message || 'No message provided',
+                      processedAt: new Date().toISOString(),
+                      environment: process.env.ENVIRONMENT,
+                      version: '2.0'
+                  };
+                  
+                  return {
+                      statusCode: 200,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({
+                          success: true,
+                          data: processedData
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error:', error);
+                  
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          code: 'INTERNAL_ERROR'
+                      })
+                  };
+              }
+          };
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: '2.2-APIFoundation'
+
+  # CloudWatch Log Groups
+  HelloFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${HelloFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  DataFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DataFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # API Gateway REST API
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      Description: !Sub 'REST API for ${ProjectName} ${Environment}'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: '2.2-APIFoundation'
+
+  # API Gateway Resources
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: api
+
+  HelloResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ApiResource
+      PathPart: hello
+
+  DataResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ApiResource
+      PathPart: data
+
+  # Hello GET Method
+  HelloGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref HelloResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HelloFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # Hello OPTIONS Method (CORS)
+  HelloOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref HelloResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # Data POST Method
+  DataPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref DataResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DataFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # Data OPTIONS Method (CORS)
+  DataOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref DataResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - HelloGetMethod
+      - HelloOptionsMethod
+      - DataPostMethod
+      - DataOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      Description: !Sub '${ProjectName} ${Environment} API deployment'
+
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub '${ProjectName} API ${Environment} stage'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Variables:
+        environment: !Ref Environment
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: '2.2-APIFoundation'
+
+  # Lambda Permissions
+  HelloLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HelloFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  DataLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+Outputs:
+  # API Gateway情報
+  ApiGatewayId:
+    Description: 'API Gateway ID'
+    Value: !Ref ApiGateway
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayId'
+
+  ApiGatewayRootResourceId:
+    Description: 'API Gateway Root Resource ID'
+    Value: !GetAtt ApiGateway.RootResourceId
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayRootResourceId'
+
+  ApiGatewayUrl:
+    Description: 'API Gateway URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiGatewayUrl'
+
+  ApiResource:
+    Description: 'API リソース ID'
+    Value: !Ref ApiResource
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiResource'
+
+  # Lambda関数情報
+  HelloFunctionArn:
+    Description: 'Hello Lambda関数 ARN'
+    Value: !GetAtt HelloFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HelloFunctionArn'
+
+  HelloFunctionName:
+    Description: 'Hello Lambda関数名'
+    Value: !Ref HelloFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-HelloFunctionName'
+
+  DataFunctionArn:
+    Description: 'Data Lambda関数 ARN'
+    Value: !GetAtt DataFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataFunctionArn'
+
+  DataFunctionName:
+    Description: 'Data Lambda関数名'
+    Value: !Ref DataFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-DataFunctionName'
+
+  LambdaExecutionRoleArn:
+    Description: 'Lambda実行ロール ARN'
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  # API URL例
+  HelloApiUrl:
+    Description: 'Hello API URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/api/hello'
+
+  DataApiUrl:
+    Description: 'Data API URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/api/data'

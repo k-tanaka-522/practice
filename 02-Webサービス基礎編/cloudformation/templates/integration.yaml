@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: '2.5 統合・セキュリティ - モニタリング + 設定統合'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: 'デプロイ環境'
+    
+  ProjectName:
+    Type: String
+    Default: webservice-basics
+    Description: 'プロジェクト名'
+
+  CloudFrontDistributionId:
+    Type: String
+    Description: 'CloudFront Distribution ID'
+
+  ApiGatewayUrl:
+    Type: String
+    Description: 'API Gateway URL'
+
+  UserPoolId:
+    Type: String
+    Description: 'Cognito User Pool ID'
+
+  UserPoolClientId:
+    Type: String
+    Description: 'Cognito User Pool Client ID'
+
+  UsersTableName:
+    Type: String
+    Description: 'Users DynamoDB Table Name'
+
+  ItemsTableName:
+    Type: String
+    Description: 'Items DynamoDB Table Name'
+
+Resources:
+  # CloudWatch Dashboard
+  ApplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/CloudFront", "Requests", "DistributionId", "${CloudFrontDistributionId}" ],
+                  [ ".", "BytesDownloaded", ".", "." ],
+                  [ ".", "OriginLatency", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "us-east-1",
+                "title": "CloudFront メトリクス"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-${Environment}-api" ],
+                  [ ".", "Latency", ".", "." ],
+                  [ ".", "4XXError", ".", "." ],
+                  [ ".", "5XXError", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway メトリクス"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${UsersTableName}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "ConsumedReadCapacityUnits", ".", "${ItemsTableName}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB メトリクス"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${Environment}-hello" ],
+                  [ ".", "Duration", ".", "." ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "${ProjectName}-${Environment}-data" ],
+                  [ ".", "Duration", ".", "." ],
+                  [ ".", "Errors", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda メトリクス"
+              }
+            }
+          ]
+        }
+
+  # アプリケーション設定保存用S3バケット
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-config-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: '2.5-Integration'
+
+  # 設定ファイル生成Lambda
+  ConfigGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-config-generator'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ConfigGeneratorRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          CONFIG_BUCKET: !Ref ConfigBucket
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  config = {
+                      "aws": {
+                          "region": "${AWS::Region}",
+                          "cloudfront": {
+                              "distributionId": "${CloudFrontDistributionId}"
+                          },
+                          "apiGateway": {
+                              "url": "${ApiGatewayUrl}"
+                          },
+                          "cognito": {
+                              "userPoolId": "${UserPoolId}",
+                              "userPoolClientId": "${UserPoolClientId}",
+                              "region": "${AWS::Region}"
+                          },
+                          "dynamodb": {
+                              "region": "${AWS::Region}",
+                              "tables": {
+                                  "users": "${UsersTableName}",
+                                  "items": "${ItemsTableName}"
+                              }
+                          }
+                      },
+                      "app": {
+                          "name": "${ProjectName}",
+                          "environment": "${Environment}",
+                          "version": "1.0.0"
+                      }
+                  }
+                  
+                  # S3に設定ファイルを保存
+                  s3.put_object(
+                      Bucket=os.environ['CONFIG_BUCKET'],
+                      Key='config.json',
+                      Body=json.dumps(config, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Configuration generated successfully',
+                          'config': config
+                      })
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+
+  # Lambda実行ロール
+  ConfigGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${ConfigBucket}/*'
+
+  # 設定生成のカスタムリソース
+  ConfigGeneration:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ConfigGeneratorFunction.Arn
+
+Outputs:
+  DashboardURL:
+    Description: 'CloudWatch ダッシュボード URL'
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-${Environment}-dashboard'
+
+  ConfigBucketName:
+    Description: '設定ファイル保存用 S3 バケット名'
+    Value: !Ref ConfigBucket
+
+  ApplicationConfig:
+    Description: 'アプリケーション設定（JSON）'
+    Value: !Sub |
+      {
+        "aws": {
+          "region": "${AWS::Region}",
+          "cloudfront": {
+            "distributionId": "${CloudFrontDistributionId}"
+          },
+          "apiGateway": {
+            "url": "${ApiGatewayUrl}"
+          },
+          "cognito": {
+            "userPoolId": "${UserPoolId}",
+            "userPoolClientId": "${UserPoolClientId}",
+            "region": "${AWS::Region}"
+          },
+          "dynamodb": {
+            "region": "${AWS::Region}",
+            "tables": {
+              "users": "${UsersTableName}",
+              "items": "${ItemsTableName}"
+            }
+          }
+        },
+        "app": {
+          "name": "${ProjectName}",
+          "environment": "${Environment}",
+          "version": "1.0.0"
+        }
+      }

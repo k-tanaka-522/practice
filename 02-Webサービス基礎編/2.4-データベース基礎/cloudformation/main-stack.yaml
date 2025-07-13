@@ -42,7 +42,7 @@ Resources:
   DynamoDBStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/database-basics/dynamodb-tables.yaml'
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/templates/dynamodb-tables.yaml'
       Parameters:
         Environment: !Ref Environment
         ProjectName: !Ref ProjectName

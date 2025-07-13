@@ -26,6 +26,7 @@ Conditions:
   HasCustomDomain: !Not [!Equals [!Ref DomainName, '']]
   HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
   UseCustomDomain: !And [!Condition HasCustomDomain, !Condition HasCertificate]
+  IsUSEast1: !Equals [!Ref 'AWS::Region', 'us-east-1']
 
 Resources:
   # S3 Bucket for Website Hosting
@@ -65,21 +66,26 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: PublicReadGetObject
+          - Sid: AllowCloudFrontServicePrincipal
             Effect: Allow
-            Principal: '*'
+            Principal:
+              Service: cloudfront.amazonaws.com
             Action: s3:GetObject
             Resource: !Sub '${WebsiteBucket}/*'
             Condition:
               StringEquals:
-                'aws:Referer': !Sub '${WebsiteBucket}-referrer'
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
 
-  # CloudFront Origin Access Identity
-  OriginAccessIdentity:
-    Type: AWS::CloudFront::OriginAccessIdentity
+  # CloudFront Origin Access Control
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
     Properties:
-      OriginAccessIdentityConfig:
-        Comment: !Sub 'OAI for ${ProjectName}-${Environment}'
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${Environment}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        Description: !Sub 'OAC for ${ProjectName}-${Environment}'
 
   # CloudFront Distribution
   CloudFrontDistribution:
@@ -126,7 +132,8 @@ Resources:
           - DomainName: !GetAtt WebsiteBucket.RegionalDomainName
             Id: !Sub '${WebsiteBucket}-origin'
             S3OriginConfig:
-              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${OriginAccessIdentity}'
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref OriginAccessControl
         PriceClass: PriceClass_100
         ViewerCertificate: !If
           - UseCustomDomain
@@ -134,7 +141,7 @@ Resources:
             SslSupportMethod: sni-only
             MinimumProtocolVersion: TLSv1.2_2021
           - CloudFrontDefaultCertificate: true
-        WebACLId: !Ref WebACL
+        WebACLId: !If [IsUSEast1, !Ref WebACL, !Ref 'AWS::NoValue']
       Tags:
         - Key: Environment
           Value: !Ref Environment
@@ -170,9 +177,10 @@ Resources:
               Value: "geolocation=(), microphone=(), camera=()"
               Override: false
 
-  # WAF Web ACL for Basic Protection
+  # WAF Web ACL for Basic Protection (us-east-1 only)
   WebACL:
     Type: AWS::WAFv2::WebACL
+    Condition: IsUSEast1
     Properties:
       Name: !Sub '${ProjectName}-${Environment}-web-acl'
       Description: Basic web protection for React app
@@ -309,6 +317,7 @@ Outputs:
     Value: !Sub 'https://${DomainName}'
     
   WebACLId:
+    Condition: IsUSEast1
     Description: WAF Web ACL ID
     Value: !GetAtt WebACL.Id
     

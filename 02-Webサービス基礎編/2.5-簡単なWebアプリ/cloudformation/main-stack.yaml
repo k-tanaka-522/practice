@@ -36,7 +36,7 @@ Resources:
   HostingStack:
     Type: AWS::CloudFormation::Stack
     Properties:
-      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/simple-webapp/s3-hosting.yaml'
+      TemplateURL: !Sub 'https://${CFBucket}.s3.amazonaws.com/templates/s3-hosting.yaml'
       Parameters:
         Environment: !Ref Environment
         ProjectName: !Ref ProjectName

@@ -1,0 +1,15 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Placeholder template'
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: placeholder
+Resources:
+  PlaceholderResource:
+    Type: AWS::CloudFormation::WaitConditionHandle
+Outputs:
+  PlaceholderOutput:
+    Value: placeholder

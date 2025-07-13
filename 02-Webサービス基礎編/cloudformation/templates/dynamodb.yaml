@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: '2.4 データベース基礎 - DynamoDB + CRUD Lambda Functions'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: 'デプロイ環境'
+    
+  ProjectName:
+    Type: String
+    Default: webservice-basics
+    Description: 'プロジェクト名'
+    
+  BillingMode:
+    Type: String
+    Default: PAY_PER_REQUEST
+    AllowedValues: [PAY_PER_REQUEST, PROVISIONED]
+    Description: 'DynamoDB課金モード'
+
+  UserPoolId:
+    Type: String
+    Description: 'Cognito User Pool ID (認証済みユーザー用)'
+
+  LogLevel:
+    Type: String
+    Default: DEBUG
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
+    Description: 'Lambda関数ログレベル'
+    
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: 'CloudWatch Logs保持期間（日）'
+
+Conditions:
+  IsProvisionedBilling: !Equals [!Ref BillingMode, PROVISIONED]
+
+Resources:
+  # Users Table
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-users'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisionedBilling
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+            - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref 'AWS::NoValue'
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: '2.4-Database'
+
+  # Items Table
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-items'
+      BillingMode: !Ref BillingMode
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput: !If
+            - IsProvisionedBilling
+            - ReadCapacityUnits: 5
+              WriteCapacityUnits: 5
+            - !Ref 'AWS::NoValue'
+      ProvisionedThroughput: !If
+        - IsProvisionedBilling
+        - ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+        - !Ref 'AWS::NoValue'
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: '2.4-Database'
+
+  # Lambda実行ロール（DynamoDB操作用）
+  CrudLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-crud-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !Sub '${UsersTable.Arn}/index/*'
+                  - !GetAtt ItemsTable.Arn
+                  - !Sub '${ItemsTable.Arn}/index/*'
+
+Outputs:
+  # テーブル情報
+  UsersTableName:
+    Description: 'Users テーブル名'
+    Value: !Ref UsersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UsersTableName'
+    
+  UsersTableArn:
+    Description: 'Users テーブル ARN'
+    Value: !GetAtt UsersTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-UsersTableArn'
+    
+  ItemsTableName:
+    Description: 'Items テーブル名'
+    Value: !Ref ItemsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ItemsTableName'
+    
+  ItemsTableArn:
+    Description: 'Items テーブル ARN'
+    Value: !GetAtt ItemsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ItemsTableArn'
+
+  # インデックス情報
+  EmailIndexName:
+    Description: 'Email GSI 名'
+    Value: EmailIndex
+    
+  StatusIndexName:
+    Description: 'Status GSI 名'
+    Value: StatusIndex

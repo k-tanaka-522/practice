@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Webサービス発展編 - 統合メインスタック'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: 'デプロイ環境'
+  
+  S3BucketName:
+    Type: String
+    Description: 'CloudFormationテンプレート格納用S3バケット名'
+    
+  ProjectName:
+    Type: String
+    Default: webservice-advanced
+    Description: 'プロジェクト名（リソース命名用）'
+
+  # Module 02からの参照
+  BasicStackName:
+    Type: String
+    Default: webservice-basics
+    Description: '基礎編スタック名（Module 02）'
+
+Mappings:
+  EnvironmentMap:
+    dev:
+      LogLevel: DEBUG
+      RetentionDays: 7
+      ShardCount: 1
+    staging:
+      LogLevel: INFO
+      RetentionDays: 14
+      ShardCount: 2
+    prod:
+      LogLevel: WARN
+      RetentionDays: 30
+      ShardCount: 4
+
+Resources:
+  # 3.1 CRUD機能実装
+  CrudApiStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/crud-api.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        UserPoolId: !ImportValue
+          Fn::Sub: '${BasicStackName}-${Environment}-user-pool-id'
+        ApiGatewayId: !ImportValue
+          Fn::Sub: '${BasicStackName}-${Environment}-api-gateway-id'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '3.1-CRUD'
+
+  # 3.2 ファイルアップロード
+  FileUploadStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: CrudApiStack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/s3-fileupload.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        ApiGatewayId: !ImportValue
+          Fn::Sub: '${BasicStackName}-${Environment}-api-gateway-id'
+        PostsTableName: !GetAtt CrudApiStack.Outputs.PostsTableName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '3.2-FileUpload'
+
+  # 3.3 データベース発展
+  AdvancedDatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: FileUploadStack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/rds-elasticsearch.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        VpcId: !ImportValue
+          Fn::Sub: '${BasicStackName}-${Environment}-vpc-id'
+        PrivateSubnetIds: !ImportValue
+          Fn::Sub: '${BasicStackName}-${Environment}-private-subnet-ids'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '3.3-AdvancedDB'
+
+  # 3.4 リアルタイム機能
+  RealtimeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: AdvancedDatabaseStack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/websocket-appsync.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        UserPoolId: !ImportValue
+          Fn::Sub: '${BasicStackName}-${Environment}-user-pool-id'
+        PostsTableName: !GetAtt CrudApiStack.Outputs.PostsTableName
+        ShardCount: !FindInMap [EnvironmentMap, !Ref Environment, ShardCount]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '3.4-Realtime'
+
+  # 3.5 統合・モニタリング
+  AdvancedIntegrationStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: 
+      - CrudApiStack
+      - FileUploadStack
+      - AdvancedDatabaseStack
+      - RealtimeStack
+    Properties:
+      TemplateURL: !Sub 'https://${S3BucketName}.s3.amazonaws.com/templates/advanced-integration.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        CloudFrontDistributionId: !ImportValue
+          Fn::Sub: '${BasicStackName}-${Environment}-cloudfront-distribution'
+        ApiGatewayUrl: !ImportValue
+          Fn::Sub: '${BasicStackName}-${Environment}-api-url'
+        WebSocketApiUrl: !GetAtt RealtimeStack.Outputs.WebSocketApiUrl
+        AppSyncApiUrl: !GetAtt RealtimeStack.Outputs.AppSyncApiUrl
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Module
+          Value: '3.5-Integration'
+
+Outputs:
+  # CRUD API情報
+  PostsTableName:
+    Description: '投稿テーブル名'
+    Value: !GetAtt CrudApiStack.Outputs.PostsTableName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-posts-table'
+
+  # ファイルアップロード情報
+  FileUploadBucket:
+    Description: 'ファイルアップロードバケット'
+    Value: !GetAtt FileUploadStack.Outputs.UploadBucketName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-upload-bucket'
+
+  # RDS情報
+  RdsEndpoint:
+    Description: 'RDS エンドポイント'
+    Value: !GetAtt AdvancedDatabaseStack.Outputs.RdsEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-rds-endpoint'
+
+  # ElasticSearch情報
+  ElasticsearchDomain:
+    Description: 'ElasticSearch ドメイン'
+    Value: !GetAtt AdvancedDatabaseStack.Outputs.ElasticsearchDomain
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-elasticsearch-domain'
+
+  # WebSocket API情報
+  WebSocketApiUrl:
+    Description: 'WebSocket API URL'
+    Value: !GetAtt RealtimeStack.Outputs.WebSocketApiUrl
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-websocket-url'
+
+  # AppSync情報
+  AppSyncApiUrl:
+    Description: 'AppSync API URL'
+    Value: !GetAtt RealtimeStack.Outputs.AppSyncApiUrl
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-appsync-url'
+
+  # 統合ダッシュボード
+  AdvancedDashboardUrl:
+    Description: '発展編統合ダッシュボード URL'
+    Value: !GetAtt AdvancedIntegrationStack.Outputs.DashboardURL
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-dashboard-url'
+
+  # 設定情報（フロントエンド用）
+  AdvancedConfigurationJSON:
+    Description: '発展編設定 JSON'
+    Value: !GetAtt AdvancedIntegrationStack.Outputs.ApplicationConfig
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-config'
