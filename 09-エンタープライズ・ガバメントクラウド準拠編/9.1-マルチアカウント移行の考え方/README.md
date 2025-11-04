@@ -261,6 +261,24 @@ AWS Organizations は、複数のAWSアカウントを一元管理するサー�
   4. アカウントのグループ化（OU: Organizational Unit）
 ```
 
+### 💡 ガバメントクラウドでの実装
+
+GCAS（ガバメントクラウド）では、以下の構成が標準です：
+
+```yaml
+デジタル庁による管理:
+  - デジタル庁がOrganizationsを管理
+  - 各府省・自治体はメンバーアカウント
+  - デジタル庁が発行したOUに紐づく
+
+セキュリティ制御:
+  - SCPでセキュリティ違反操作を制限
+  - 統一されたポリシー適用
+  - コンプライアンス自動チェック
+```
+
+参考: [GCAS アカウント構造説明](https://guide.gcas.cloud.go.jp/aws/description-of-account-structure/)
+
 ### 組織構造の設計
 
 ```

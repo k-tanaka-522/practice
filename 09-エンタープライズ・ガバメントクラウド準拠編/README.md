@@ -320,6 +320,15 @@ Step 4-5: 実践（9.4, 9.5）
   - デジタル庁公式のAWS利用ガイドライン
   - セキュリティ要件、ネットワーク設計、運用指針
   - 本モジュールのベースとなる公式ドキュメント
+- [GCAS リファレンスアーキテクチャ(AWS)](https://guide.gcas.cloud.go.jp/general/reference-architecture-aws)
+  - 推奨されるシステム構成
+  - 閉域マルチアカウント構成の設計例
+- [GCAS セキュリティ要件(AWS)](https://guide.gcas.cloud.go.jp/aws/security-tech)
+  - 予防的統制と発見的統制の詳細
+- [GCAS ネットワーク接続方法(AWS)](https://guide.gcas.cloud.go.jp/aws/how-to-connect-network)
+  - Transit Gateway、Direct Connect の設計
+- [GCAS アカウント構造説明](https://guide.gcas.cloud.go.jp/aws/description-of-account-structure/)
+  - Organizations、OU、SCPの実装
 - [GCAS 全般的なガイド](https://guide.gcas.cloud.go.jp/)
 - [ISMAP ガイドライン](https://www.ipa.go.jp/security/ismap/)
 

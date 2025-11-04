@@ -453,6 +453,29 @@ ping $APP1_PRIVATE_IP
   - データ転送（アウト）: $0.024/GB
 ```
 
+### 💡 ガバメントクラウドでの実装
+
+GCAS環境では、閉域接続が標準です：
+
+```yaml
+ネットワーク構成:
+  接続方式:
+    - Direct Connect（専用線）
+    - Transit Gateway経由でVPC接続
+    - 閉域ネットワークで完結
+
+重要な設計ポイント:
+  - CIDR重複を避ける
+    → 異なるVPCやオンプレで同じIPアドレス範囲は使えない
+    → 必要に応じてNAT変換
+
+  - Transit Gateway共有
+    → Resource Access Managerでアカウント間共有
+    → ネットワークアカウントで一元管理
+
+参考: [GCAS ネットワーク接続方法](https://guide.gcas.cloud.go.jp/aws/how-to-connect-network)
+```
+
 ### Transit Gateway との統合
 
 ```

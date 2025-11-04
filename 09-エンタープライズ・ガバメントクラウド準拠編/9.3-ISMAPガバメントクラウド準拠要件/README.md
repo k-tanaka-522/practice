@@ -189,6 +189,32 @@ IAM:
   - インシデント対応手順
 ```
 
+### 💡 ガバメントクラウドでのセキュリティ統制
+
+GCAS環境では、2種類のセキュリティ統制が実装されています：
+
+```yaml
+1. 予防的統制（Preventive Controls）:
+   目的: セキュリティ違反を事前に防ぐ
+   実装:
+     - Service Control Policies (SCP)
+     - IAMポリシー制限
+     - セキュリティグループ設定
+     - リソース作成制限
+
+   参考: [予防的統制内容説明](https://guide.gcas.cloud.go.jp/aws/description-of-preventive-controls)
+
+2. 発見的統制（Detective Controls）:
+   目的: セキュリティ問題を検知・監視
+   実装:
+     - CloudTrail（全操作ログ）
+     - GuardDuty（脅威検知）
+     - Security Hub（統合監視）
+     - Config（コンプライアンス監視）
+
+   参考: [発見的統制内容説明](https://guide.gcas.cloud.go.jp/aws/description-of-detective-controls)
+```
+
 ### 5. バックアップと事業継続
 
 ```yaml
