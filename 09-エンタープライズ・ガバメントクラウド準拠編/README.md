@@ -307,10 +307,18 @@ Step 4-5: 実践（9.4, 9.5）
 
 ### 参考資料
 
-- 📖 [AWS Organizations ベストプラクティス](https://docs.aws.amazon.com/organizations/)
-- 🔧 [Transit Gateway デザインガイド](https://docs.aws.amazon.com/vpc/latest/tgw/)
-- 🏛️ [ISMAP ガイドライン](https://www.ipa.go.jp/security/ismap/)
-- 🏛️ [デジタル庁 GCASガイド](https://guide.gcas.cloud.go.jp/)
+#### 🏛️ ガバメントクラウド公式ガイド
+- **[GCAS AWS利用ガイド](https://guide.gcas.cloud.go.jp/aws)** ⭐最重要
+  - デジタル庁公式のAWS利用ガイドライン
+  - セキュリティ要件、ネットワーク設計、運用指針
+  - 本モジュールのベースとなる公式ドキュメント
+- [GCAS 全般的なガイド](https://guide.gcas.cloud.go.jp/)
+- [ISMAP ガイドライン](https://www.ipa.go.jp/security/ismap/)
+
+#### 📖 AWS公式ドキュメント
+- [AWS Organizations ベストプラクティス](https://docs.aws.amazon.com/organizations/)
+- [Transit Gateway デザインガイド](https://docs.aws.amazon.com/vpc/latest/tgw/)
+- [AWS Well-Architected Framework](https://aws.amazon.com/architecture/well-architected/)
 
 ## 🎯 次のステップ
 

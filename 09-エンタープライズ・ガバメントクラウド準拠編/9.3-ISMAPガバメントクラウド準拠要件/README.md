@@ -361,9 +361,21 @@ ISMAP準拠の追加コスト: 約$20-50/月
 
 ## 📚 参考資料
 
+### 🏛️ ガバメントクラウド公式ガイド（必読）
+- **[GCAS AWS利用ガイド](https://guide.gcas.cloud.go.jp/aws)** ⭐最重要
+  - デジタル庁公式のAWS利用ガイドライン
+  - セキュリティ技術要件の詳細
+  - ネットワーク設計、監査ログ、暗号化の実装指針
+- [GCAS 全般的なガイド](https://guide.gcas.cloud.go.jp/)
 - [ISMAP公式サイト](https://www.ipa.go.jp/security/ismap/)
-- [デジタル庁 GCASガイド](https://guide.gcas.cloud.go.jp/)
 - [政府情報システムのためのセキュリティ評価制度](https://www.nisc.go.jp/)
+
+### 💡 活用のヒント
+Claude Codeで実装を進める際は、以下のように指示すると効果的です：
+```
+「https://guide.gcas.cloud.go.jp/aws のガイドラインに準拠して、
+ CloudTrailとSecurity Hubの設定を実装してください」
+```
 
 ---
 
